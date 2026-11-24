@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>VoxelMakers: Micro-Voxel Rig & Physics Sandbox</title>
+    <link rel="manifest" href="./manifest.json" />
+    <link rel="icon" type="image/svg+xml" href="./icon.svg" />
+    <link rel="apple-touch-icon" href="./icon.svg" />
+    <meta name="theme-color" content="#1a1a1a" />
+    <meta name="description" content="A multiplayer voxel vehicle sandbox in 791 KB. Custom physics, real destruction, mobile and desktop." />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black" />
+    <meta name="apple-mobile-web-app-title" content="VoxelMakers" />
+    <meta property="og:title" content="VoxelMakers: Micro-Voxel Rig & Physics Sandbox" />
+    <meta property="og:description" content="A multiplayer voxel vehicle sandbox in 791 KB. Custom physics, real destruction, mobile and desktop." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@600;700&family=JetBrains+Mono:wght@500;700;800&family=Space+Grotesk:wght@600;700&display=swap" rel="stylesheet">
+  </head>
+  <body class="bg-[#1a1a1a] text-[#e5e5e5] overflow-hidden select-none" data-state="title">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+    <script>
+      if ('caches' in window) {
+        caches.delete('voxelmakers-v1').catch(() => {});
+      }
+      if ('serviceWorker' in navigator) {
+        window.addEventListener('load', () => {
+          navigator.serviceWorker.register('./sw.js', { updateViaCache: 'none' })
+            .then(reg => {
+              reg.update().catch(() => {});
+              console.log('[PWA] ServiceWorker registered:', reg.scope);
+            })
+            .catch(err => console.log('[PWA] ServiceWorker failed:', err));
+        });
+      }
+    </script>
+  </body>
+</html>

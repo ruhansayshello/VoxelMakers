@@ -1,0 +1,6 @@
+{
+  "name": "VoxelMakers: Micro-Voxel Rig & Physics Sandbox",
+  "description": "A Trailmakers x TinyVoxels 3D engineering and destruction sandbox featuring 0.25m greedy-meshed micro-voxels, hover build mode, and 4-substep rigid-body vehicle physics.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
