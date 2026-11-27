@@ -51,6 +51,7 @@ export class ChunkBatchRenderer {
 
   private _posArray: Float32Array;
   private _normArray: Float32Array;
+  private _uvArray: Float32Array;
   private _colorArray: Float32Array;
   private _matIdArray: Int8Array;
   private _lodArray: Int8Array;
@@ -58,6 +59,7 @@ export class ChunkBatchRenderer {
 
   private _posAttr: BufferAttribute;
   private _normAttr: BufferAttribute;
+  private _uvAttr: BufferAttribute;
   private _colorAttr: BufferAttribute;
   private _matIdAttr: BufferAttribute;
   private _lodAttr: BufferAttribute;
@@ -74,6 +76,7 @@ export class ChunkBatchRenderer {
     // Pre-allocate all merged buffers ONCE at startup (zero per-frame heap allocations)
     this._posArray = new Float32Array(this.maxVertexCount * 3);
     this._normArray = new Float32Array(this.maxVertexCount * 3);
+    this._uvArray = new Float32Array(this.maxVertexCount * 2);
     this._colorArray = new Float32Array(this.maxVertexCount * 3);
     this._matIdArray = new Int8Array(this.maxVertexCount);
     this._lodArray = new Int8Array(this.maxVertexCount);
@@ -81,6 +84,7 @@ export class ChunkBatchRenderer {
 
     this._posAttr = new BufferAttribute(this._posArray, 3, false).setUsage(DynamicDrawUsage);
     this._normAttr = new BufferAttribute(this._normArray, 3, false).setUsage(DynamicDrawUsage);
+    this._uvAttr = new BufferAttribute(this._uvArray, 2, false).setUsage(DynamicDrawUsage);
     this._colorAttr = new BufferAttribute(this._colorArray, 3, false).setUsage(DynamicDrawUsage);
     this._matIdAttr = new BufferAttribute(this._matIdArray, 1, false).setUsage(DynamicDrawUsage);
     this._lodAttr = new BufferAttribute(this._lodArray, 1, false).setUsage(DynamicDrawUsage);
@@ -90,6 +94,7 @@ export class ChunkBatchRenderer {
     this.mergedGeometry.isVoxelGeometry = true;
     this.mergedGeometry.setAttribute('position', this._posAttr);
     this.mergedGeometry.setAttribute('normal', this._normAttr);
+    this.mergedGeometry.setAttribute('uv', this._uvAttr);
     this.mergedGeometry.setAttribute('color', this._colorAttr);
     this.mergedGeometry.setAttribute('voxelMaterial', this._matIdAttr);
     this.mergedGeometry.setAttribute('lodLevel', this._lodAttr);
@@ -230,6 +235,7 @@ export class ChunkBatchRenderer {
   private mergeVisibleChunks(): void {
     const posDst = this._posArray;
     const normDst = this._normArray;
+    const uvDst = this._uvArray;
     const colDst = this._colorArray;
     const matDst = this._matIdArray;
     const lodDst = this._lodArray;
@@ -305,6 +311,23 @@ export class ChunkBatchRenderer {
         }
       }
 
+      // 2b. Copy UVs if present
+      const uvAttr = geo.attributes.uv;
+      const baseUv = vOffset * 2;
+      if (uvAttr) {
+        if (!uvAttr.normalized && uvAttr.array instanceof Float32Array) {
+          uvDst.set(uvAttr.array.subarray(0, vCount * 2), baseUv);
+        } else {
+          for (let i = 0; i < vCount; i++) {
+            const di = baseUv + i * 2;
+            uvDst[di] = uvAttr.getX(i);
+            uvDst[di + 1] = uvAttr.getY(i);
+          }
+        }
+      } else {
+        uvDst.fill(0, baseUv, baseUv + vCount * 2);
+      }
+
       // 3. Copy vertex colors / baked AO (default white 1,1,1)
       const colAttr = geo.attributes.color;
       if (colAttr) {
@@ -371,6 +394,10 @@ export class ChunkBatchRenderer {
       this._normAttr.clearUpdateRanges();
       this._normAttr.addUpdateRange(0, vOffset * 3);
       this._normAttr.needsUpdate = true;
+
+      this._uvAttr.clearUpdateRanges();
+      this._uvAttr.addUpdateRange(0, vOffset * 2);
+      this._uvAttr.needsUpdate = true;
 
       this._colorAttr.clearUpdateRanges();
       this._colorAttr.addUpdateRange(0, vOffset * 3);

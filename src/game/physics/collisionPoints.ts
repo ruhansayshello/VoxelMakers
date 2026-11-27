@@ -6,6 +6,10 @@ import {
   PHYSICS_CONFIG,
   mapVoxelMatToMaterialType,
 } from './physicsConfig.ts';
+import {
+  FACE_MASK_ALL,
+  computeVoxelExposedFaceMask,
+} from '../unifiedVoxelEngine.ts';
 
 /**
  * Bit-packed int32 voxel coordinate helpers.
@@ -88,6 +92,10 @@ export interface SampledCollisionPoint {
   vz: number;
   /** Raw voxel material ID */
   rawMat: number;
+  /** 6-bit exposed-face normal mask shared with greedy mesher concept (+X=1, -X=2, +Y=4, -Y=8, +Z=16, -Z=32) */
+  exposedFaceMask?: number;
+  /** Normalized local outward surface normal computed from exposed faces */
+  localOutwardNormal?: Vec3;
   /** Step 2.3: Sticky material latch state */
   welded?: boolean;
   weldedTargetVehicleId?: string;
@@ -102,6 +110,8 @@ interface SurfaceVoxelCandidate {
   rawMat: number;
   material: MaterialType;
   exposedFaces: number;
+  exposedFaceMask: number;
+  localOutwardNormal: Vec3;
 }
 
 /**
@@ -184,24 +194,11 @@ export function sampleVehicleCollisionPoints(
     return [];
   }
 
-  const hasAirNeighbor = (vx: number, vy: number, vz: number): number => {
-    let airCount = 0;
+  const isAirNeighbor = (nx: number, ny: number, nz: number): boolean => {
     if (getVoxelFn) {
-      if (getVoxelFn(vx + 1, vy, vz) === MAT.AIR) airCount++;
-      if (getVoxelFn(vx - 1, vy, vz) === MAT.AIR) airCount++;
-      if (getVoxelFn(vx, vy + 1, vz) === MAT.AIR) airCount++;
-      if (getVoxelFn(vx, vy - 1, vz) === MAT.AIR) airCount++;
-      if (getVoxelFn(vx, vy, vz + 1) === MAT.AIR) airCount++;
-      if (getVoxelFn(vx, vy, vz - 1) === MAT.AIR) airCount++;
-      return airCount;
+      return getVoxelFn(nx, ny, nz) === MAT.AIR;
     }
-    if (!voxelMap.has(packVoxelKey(vx + 1, vy, vz))) airCount++;
-    if (!voxelMap.has(packVoxelKey(vx - 1, vy, vz))) airCount++;
-    if (!voxelMap.has(packVoxelKey(vx, vy + 1, vz))) airCount++;
-    if (!voxelMap.has(packVoxelKey(vx, vy - 1, vz))) airCount++;
-    if (!voxelMap.has(packVoxelKey(vx, vy, vz + 1))) airCount++;
-    if (!voxelMap.has(packVoxelKey(vx, vy, vz - 1))) airCount++;
-    return airCount;
+    return !voxelMap.has(packVoxelKey(nx, ny, nz));
   };
 
   const surfaceVoxels: SurfaceVoxelCandidate[] = [];
@@ -219,8 +216,8 @@ export function sampleVehicleCollisionPoints(
       [vx, vy, vz] = unpackVoxelKey(voxelKey);
     }
 
-    const exposedFaces = hasAirNeighbor(vx, vy, vz);
-    if (exposedFaces > 0) {
+    const faceAnalysis = computeVoxelExposedFaceMask(vx, vy, vz, isAirNeighbor);
+    if (faceAnalysis.exposedCount > 0) {
       surfaceVoxels.push({
         vx,
         vy,
@@ -228,7 +225,13 @@ export function sampleVehicleCollisionPoints(
         voxelKey,
         rawMat: mat,
         material: mapVoxelMatToMaterialType(mat),
-        exposedFaces,
+        exposedFaces: faceAnalysis.exposedCount,
+        exposedFaceMask: faceAnalysis.mask || FACE_MASK_ALL,
+        localOutwardNormal: {
+          x: faceAnalysis.normalX,
+          y: faceAnalysis.normalY,
+          z: faceAnalysis.normalZ,
+        },
       });
     }
   }
@@ -296,6 +299,8 @@ export function sampleVehicleCollisionPoints(
       vy: sv.vy,
       vz: sv.vz,
       rawMat: sv.rawMat,
+      exposedFaceMask: sv.exposedFaceMask,
+      localOutwardNormal: sv.localOutwardNormal,
     };
   }
 

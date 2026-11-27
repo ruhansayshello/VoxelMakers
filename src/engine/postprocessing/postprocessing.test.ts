@@ -263,7 +263,7 @@ function createCamera(): RenderCameraLike {
   return cam;
 }
 
-// Mirrors the game's HDR Bloom shader structure from src/game/graphicsPipeline.ts
+// Standalone HDR Bloom shader test structure for Voxl post-processing
 const VoxelBloomShader = {
   name: 'VoxelBloomShader',
   uniforms: {

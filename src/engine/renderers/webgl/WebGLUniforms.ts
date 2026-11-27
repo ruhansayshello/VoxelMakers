@@ -25,9 +25,30 @@ function copyInto(dst: number[], src: ArrayLike<number>): void {
   for (let i = 0; i < src.length; i++) dst[i] = src[i];
 }
 
+let _scratchFloat32 = new Float32Array(256);
+let _scratchInt32 = new Int32Array(32);
+
+function ensureScratchFloat32(len: number): Float32Array {
+  if (_scratchFloat32.length < len) {
+    let next = _scratchFloat32.length || 64;
+    while (next < len) next *= 2;
+    _scratchFloat32 = new Float32Array(next);
+  }
+  return _scratchFloat32.subarray(0, len);
+}
+
+function ensureScratchInt32(len: number): Int32Array {
+  if (_scratchInt32.length < len) {
+    let next = _scratchInt32.length || 16;
+    while (next < len) next *= 2;
+    _scratchInt32 = new Int32Array(next);
+  }
+  return _scratchInt32.subarray(0, len);
+}
+
 function flattenArray(values: unknown[], elemSize: number): Float32Array {
   const n = values.length;
-  const out = new Float32Array(n * elemSize);
+  const out = ensureScratchFloat32(n * elemSize);
   for (let i = 0; i < n; i++) {
     const v = values[i] as Record<string, number> | Color | Matrix3 | Matrix4;
     const base = i * elemSize;
@@ -257,6 +278,7 @@ class PureArrayUniform implements UniformNode {
   readonly addr: WebGLUniformLocation;
   readonly type: number;
   readonly size: number;
+  private cache: number[] = [];
 
   constructor(id: string, activeInfo: WebGLActiveInfo, addr: WebGLUniformLocation) {
     this.id = id;
@@ -268,17 +290,24 @@ class PureArrayUniform implements UniformNode {
   setValue(gl: WebGL2RenderingContext, value: unknown, textures?: TextureBinder): void {
     if (!value) return;
     const addr = this.addr;
+    const c = this.cache;
 
     switch (this.type) {
-      case 0x1406:
-        gl.uniform1fv(addr, value as Float32Array | number[]);
+      case 0x1406: {
+        const data = value as Float32Array | number[];
+        if (arrayEqual(c, data)) return;
+        gl.uniform1fv(addr, data);
+        copyInto(c, data);
         break;
+      }
       case 0x8b50: {
         const data =
           Array.isArray(value) && typeof value[0] === 'object'
             ? flattenArray(value, 2)
             : (value as Float32Array | number[]);
+        if (arrayEqual(c, data)) return;
         gl.uniform2fv(addr, data);
+        copyInto(c, data);
         break;
       }
       case 0x8b51: {
@@ -286,7 +315,9 @@ class PureArrayUniform implements UniformNode {
           Array.isArray(value) && typeof value[0] === 'object'
             ? flattenArray(value, 3)
             : (value as Float32Array | number[]);
+        if (arrayEqual(c, data)) return;
         gl.uniform3fv(addr, data);
+        copyInto(c, data);
         break;
       }
       case 0x8b52: {
@@ -294,7 +325,9 @@ class PureArrayUniform implements UniformNode {
           Array.isArray(value) && typeof value[0] === 'object'
             ? flattenArray(value, 4)
             : (value as Float32Array | number[]);
+        if (arrayEqual(c, data)) return;
         gl.uniform4fv(addr, data);
+        copyInto(c, data);
         break;
       }
       case 0x8b5b: {
@@ -302,7 +335,9 @@ class PureArrayUniform implements UniformNode {
           Array.isArray(value) && typeof value[0] === 'object'
             ? flattenArray(value, 9)
             : (value as Float32Array | number[]);
+        if (arrayEqual(c, data)) return;
         gl.uniformMatrix3fv(addr, false, data);
+        copyInto(c, data);
         break;
       }
       case 0x8b5c: {
@@ -310,22 +345,31 @@ class PureArrayUniform implements UniformNode {
           Array.isArray(value) && typeof value[0] === 'object'
             ? flattenArray(value, 16)
             : (value as Float32Array | number[]);
+        if (arrayEqual(c, data)) return;
         gl.uniformMatrix4fv(addr, false, data);
+        copyInto(c, data);
         break;
       }
       case 0x1404:
-      case 0x8b56:
-        gl.uniform1iv(addr, value as Int32Array | number[]);
+      case 0x8b56: {
+        const data = value as Int32Array | number[];
+        if (arrayEqual(c, data)) return;
+        gl.uniform1iv(addr, data);
+        copyInto(c, data);
         break;
+      }
       case 0x8b5e: {
         const arr = value as unknown[];
-        const units = new Int32Array(arr.length);
+        const units = ensureScratchInt32(arr.length);
         for (let i = 0; i < arr.length; i++) {
           const unit = textures ? textures.allocateTextureUnit() : i;
           units[i] = unit;
           textures?.setTexture2D(arr[i], unit);
         }
-        gl.uniform1iv(addr, units);
+        if (!arrayEqual(c, units)) {
+          gl.uniform1iv(addr, units);
+          copyInto(c, units);
+        }
         break;
       }
       default:

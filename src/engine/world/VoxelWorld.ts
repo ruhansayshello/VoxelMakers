@@ -159,6 +159,16 @@ export class VoxelWorld {
   public chunkWorldY: Int32Array;
   public chunkWorldZ: Int32Array;
 
+  /** Optional single zero-copy SharedArrayBuffer slabs for compact surface-only chunks */
+  public readonly surfaceSlabCapacity: number;
+  public readonly surfaceVoxelsStride: number;
+  public readonly surfaceHeightStride: number;
+  public readonly surfaceVoxelsSab: SharedArrayBuffer | null;
+  public readonly surfaceHeightSab: SharedArrayBuffer | null;
+  public readonly usesSharedSurfaceSlab: boolean;
+  private _surfaceVoxelsSlabView: Uint8Array | null = null;
+  private _surfaceHeightSlabView: Uint16Array | null = null;
+
   private _chunkIdToSlot = new Map<number, number>();
   private _chunkOriginToSlot = new Map<string, number>();
   private _freeChunkSlots: number[] = [];
@@ -241,6 +251,39 @@ export class VoxelWorld {
     this.chunkVolume = this.chunkX * this.chunkY * this.chunkZ;
     this.fixedDt = options.fixedDt ?? DEFAULT_FIXED_DT;
     this.callbacks = options.callbacks ? { ...options.callbacks } : {};
+
+    // Allocate a single zero-copy SharedArrayBuffer slab for surface-only chunks when crossOriginIsolated.
+    // Cap at 256 slots (15x15 = 225 chunks + headroom) to keep shared RAM compact (~6 MB instead of 12 MB).
+    this.surfaceSlabCapacity = Math.min(this.maxChunks, 256);
+    this.surfaceVoxelsStride = this.chunkX * 4 * this.chunkZ;
+    this.surfaceHeightStride = this.chunkX * this.chunkZ;
+    const canUseSharedSlab =
+      typeof SharedArrayBuffer !== 'undefined' &&
+      Boolean((globalThis as unknown as { crossOriginIsolated?: boolean }).crossOriginIsolated) &&
+      this.chunkX === DEFAULT_CHUNK_X &&
+      this.chunkZ === DEFAULT_CHUNK_Z;
+    if (canUseSharedSlab) {
+      let vSab: SharedArrayBuffer | null = null;
+      let hSab: SharedArrayBuffer | null = null;
+      try {
+        vSab = new SharedArrayBuffer(this.surfaceSlabCapacity * this.surfaceVoxelsStride);
+        hSab = new SharedArrayBuffer(this.surfaceSlabCapacity * this.surfaceHeightStride * 2);
+      } catch {
+        vSab = null;
+        hSab = null;
+      }
+      this.surfaceVoxelsSab = vSab;
+      this.surfaceHeightSab = hSab;
+      this.usesSharedSurfaceSlab = vSab !== null && hSab !== null;
+      if (this.usesSharedSurfaceSlab) {
+        this._surfaceVoxelsSlabView = new Uint8Array(vSab!);
+        this._surfaceHeightSlabView = new Uint16Array(hSab!);
+      }
+    } else {
+      this.surfaceVoxelsSab = null;
+      this.surfaceHeightSab = null;
+      this.usesSharedSurfaceSlab = false;
+    }
 
     // Section 1: Chunk Tables
     this.chunkIds = new Int32Array(this.maxChunks).fill(-1);
@@ -405,14 +448,29 @@ export class VoxelWorld {
     }
     const slotIndex = this._freeChunkSlots.pop()!;
 
+    const surfaceChunkY = options.surfaceChunkY ?? 4;
     const voxelLen = options.voxels
       ? options.voxels.length
       : options.surfaceOnly
-        ? this.chunkX * (options.surfaceChunkY ?? 4) * this.chunkZ
+        ? this.chunkX * surfaceChunkY * this.chunkZ
         : this.chunkVolume;
 
     this.chunkIds[slotIndex] = chunkId;
-    this.chunkVoxels[slotIndex] = options.voxels ?? new Uint8Array(voxelLen);
+    if (options.voxels) {
+      this.chunkVoxels[slotIndex] = options.voxels;
+    } else if (
+      options.surfaceOnly &&
+      this._surfaceVoxelsSlabView &&
+      slotIndex < this.surfaceSlabCapacity &&
+      voxelLen === this.surfaceVoxelsStride
+    ) {
+      const start = slotIndex * this.surfaceVoxelsStride;
+      const view = this._surfaceVoxelsSlabView.subarray(start, start + voxelLen);
+      view.fill(0);
+      this.chunkVoxels[slotIndex] = view;
+    } else {
+      this.chunkVoxels[slotIndex] = new Uint8Array(voxelLen);
+    }
 
     // Allocate damage table eagerly for small chunk volumes or when explicitly requested,
     // and lazily on first damageVoxel() for full 1.3MB game chunks to keep RAM footprint bounded.
@@ -430,8 +488,22 @@ export class VoxelWorld {
     this.chunkMeshVersion[slotIndex] = 0;
     this.chunkPhysicsVersion[slotIndex] = 0;
     this.chunkPendingRemovals[slotIndex].clear();
-    this.chunkSurfaceHeightMap[slotIndex] =
-      options.surfaceHeightMap ?? new Uint16Array(this.chunkX * this.chunkZ);
+    if (options.surfaceHeightMap) {
+      this.chunkSurfaceHeightMap[slotIndex] = options.surfaceHeightMap;
+    } else if (
+      this._surfaceHeightSlabView &&
+      slotIndex < this.surfaceSlabCapacity
+    ) {
+      const hStart = slotIndex * this.surfaceHeightStride;
+      const hView = this._surfaceHeightSlabView.subarray(
+        hStart,
+        hStart + this.surfaceHeightStride,
+      );
+      hView.fill(0);
+      this.chunkSurfaceHeightMap[slotIndex] = hView;
+    } else {
+      this.chunkSurfaceHeightMap[slotIndex] = new Uint16Array(this.chunkX * this.chunkZ);
+    }
     this.chunkCustomColors[slotIndex] = options.customColors ?? null;
     this.chunkWorldX[slotIndex] = worldX | 0;
     this.chunkWorldY[slotIndex] = worldY | 0;

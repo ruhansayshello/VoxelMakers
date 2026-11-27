@@ -277,13 +277,9 @@ async function startServer() {
   const useStaticDist =
     process.env.NODE_ENV === 'production' && fs.existsSync(distIndexPath);
 
-  // Bind port 3000 immediately so the container health check succeeds without waiting for Vite bundle warmup
-  server.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server listening on http://0.0.0.0:${PORT}`);
-  });
+  let viteInstance: any = null;
 
   if (!useStaticDist) {
-    let viteInstance: any = null;
     const viteReadyPromise = (async () => {
       const { createServer: createViteServer } = await import('vite');
       viteInstance = await createViteServer({
@@ -296,6 +292,11 @@ async function startServer() {
       });
       return viteInstance;
     })();
+
+    // Prevent unhandled rejection crashes if Vite startup fails transiently
+    viteReadyPromise.catch((err) => {
+      console.error('Failed to initialize Vite dev middleware:', err);
+    });
 
     app.use(async (req, res, next) => {
       try {
@@ -328,6 +329,24 @@ async function startServer() {
       res.sendFile(distIndexPath);
     });
   }
+
+  // Bind port 3000 immediately after routes are mounted so health checks succeed without waiting for Vite warmup
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`Server listening on http://0.0.0.0:${PORT}`);
+  });
+
+  const shutdown = () => {
+    wss.close();
+    if (viteInstance && typeof viteInstance.close === 'function') {
+      viteInstance.close().catch(() => {});
+    }
+    server.close(() => {
+      process.exit(0);
+    });
+    setTimeout(() => process.exit(0), 1500).unref();
+  };
+  process.once('SIGTERM', shutdown);
+  process.once('SIGINT', shutdown);
 }
 
 startServer().catch((err) => {

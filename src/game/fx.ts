@@ -25,6 +25,10 @@ import {
 } from './physics/destruction.ts';
 import { packVoxelKey } from './physics/collisionPoints.ts';
 import { areAITeamsHostile, type VehicleAITeam } from './aiPilot.ts';
+import {
+  unifiedEngineTelemetry,
+  writeInstanceMatrixEulerXYZFast,
+} from './unifiedVoxelEngine.ts';
 
 interface DebrisParticle {
   active: boolean;
@@ -1803,6 +1807,7 @@ export class VoxelFXSystem {
     }
 
     let anyUpdated = false;
+    const instArray = this.instanced.instanceMatrix.array as Float32Array;
     for (let i = 0; i < this.maxDebris; i++) {
       const p = this.debrisPool[i];
       if (!p.active) continue;
@@ -1821,19 +1826,13 @@ export class VoxelFXSystem {
 
       if (p.life <= 0 || outOfRange) {
         p.active = false;
-        _dummy.scale.set(0, 0, 0);
-        _dummy.updateMatrix();
-        this.instanced.setMatrixAt(i, _dummy.matrix);
+        writeInstanceMatrixEulerXYZFast(instArray, i, 0, -1000, 0, 0, 0, 0, 0);
         continue;
       }
 
       if (p.popOut) {
         const s = Math.max(0, p.life / 0.1) * p.scale;
-        _dummy.position.set(p.x, p.y, p.z);
-        _dummy.rotation.set(0, 0, 0);
-        _dummy.scale.set(s, s, s);
-        _dummy.updateMatrix();
-        this.instanced.setMatrixAt(i, _dummy.matrix);
+        writeInstanceMatrixEulerXYZFast(instArray, i, p.x, p.y, p.z, 0, 0, 0, s);
         continue;
       }
 
@@ -1851,11 +1850,15 @@ export class VoxelFXSystem {
         const ny = p.y + p.vy * dt;
         const nz = p.z + p.vz * dt;
 
-        if (this.world.isSolidAtWorld(nx, ny, nz)) {
+        // Zero-allocation O(1) shared heightmap probe from renderer chunk surfaceHeightMap
+        // (avoids allocating full 3D chunks when explosion sparks/debris fly into distant chunks)
+        const surfY = this.world.sampleSurfaceHeightFast(nx, nz);
+        unifiedEngineTelemetry.fastHeightmapDebrisProbes++;
+        if (ny <= surfY) {
           p.vy = -p.vy * 0.35;
           p.vx *= 0.65;
           p.vz *= 0.65;
-          p.y += 0.04;
+          p.y = surfY + 0.04;
         } else {
           p.x = nx;
           p.y = ny;
@@ -1871,11 +1874,7 @@ export class VoxelFXSystem {
         : p.fullVoxel
           ? (p.life > 1.0 ? p.scale : Math.max(0, p.life) * p.scale)
           : Math.min(1, p.life * 1.4) * p.scale;
-      _dummy.position.set(p.x, p.y, p.z);
-      _dummy.rotation.set(p.rx, p.ry, 0);
-      _dummy.scale.set(s, s, s);
-      _dummy.updateMatrix();
-      this.instanced.setMatrixAt(i, _dummy.matrix);
+      writeInstanceMatrixEulerXYZFast(instArray, i, p.x, p.y, p.z, p.rx, p.ry, 0, s);
     }
 
     if (anyUpdated) {

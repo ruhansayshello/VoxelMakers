@@ -2282,6 +2282,26 @@ export class KinematicMapHazard {
       biteRadiusVoxels,
       0,
     );
+    // Directly chip 1px micro-voxels off engines, thrusters, aero, & utility modules touching the shredder teeth!
+    const biteRadiusMeters = biteRadiusVoxels * VOXEL_SIZE * 1.15;
+    for (let mi = 0; mi < rig.modules.length; mi++) {
+      const m = rig.modules[mi];
+      rig.localVoxelToWorld(m.vx, m.vy, m.vz, _worldPt);
+      if (
+        _worldPt.distanceToSquared(
+          _subLocalPt.set(bestHitWorldX, bestHitWorldY, bestHitWorldZ),
+        ) <=
+        (biteRadiusMeters + 0.45) * (biteRadiusMeters + 0.45)
+      ) {
+        rig.applyMicroVoxelModuleDamage(
+          m,
+          bestHitWorldX,
+          bestHitWorldY,
+          bestHitWorldZ,
+          biteRadiusMeters,
+        );
+      }
+    }
     const shearedCount = Math.max(
       1,
       prevVoxelCount - (rig.voxelCount + rig.modules.length),
@@ -2799,8 +2819,15 @@ export function stepMapHazardsPhysics(
     }
     haz.stepVisuals(dt);
 
+    const maxBroadphaseR = haz.spec.bladeRadiusMeters + 10.5;
+    const maxBroadphaseRSq = maxBroadphaseR * maxBroadphaseR;
+
     for (let cIdx = 0; cIdx < creations.length; cIdx++) {
-      totalSheared += haz.checkAndShredRig(creations[cIdx], fx, dt);
+      const rig = creations[cIdx];
+      const dx = rig.position.x - haz.position.x;
+      const dz = rig.position.z - haz.position.z;
+      if (dx * dx + dz * dz > maxBroadphaseRSq) continue;
+      totalSheared += haz.checkAndShredRig(rig, fx, dt);
       if (haz.destroyed) break;
     }
     if (haz.destroyed) {
@@ -2809,7 +2836,11 @@ export function stepMapHazardsPhysics(
     }
 
     for (let eIdx = 0; eIdx < voxelEntities.length; eIdx++) {
-      totalSheared += haz.checkAndShredRig(voxelEntities[eIdx], fx, dt);
+      const ent = voxelEntities[eIdx];
+      const dx = ent.position.x - haz.position.x;
+      const dz = ent.position.z - haz.position.z;
+      if (dx * dx + dz * dz > maxBroadphaseRSq) continue;
+      totalSheared += haz.checkAndShredRig(ent, fx, dt);
       if (haz.destroyed) break;
     }
     if (haz.destroyed) {

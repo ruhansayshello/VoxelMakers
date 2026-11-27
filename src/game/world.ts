@@ -6,6 +6,7 @@ import {
   setActiveVoxelWorld,
 } from '../engine/world/VoxelWorld';
 import { perfProfiler } from '../engine/perf/PerfProfiler';
+import { unifiedEngineTelemetry } from './unifiedVoxelEngine.ts';
 import {
   VOXEL_SIZE,
   CHUNK_X,
@@ -49,14 +50,31 @@ import {
   type ChunkMeshJobResponse,
   type ChunkNeighborBoundarySlices,
   type LodSubMeshPayload,
+  type ModifiedChunkSurfaceStamp,
 } from './meshWorker.ts';
+import { DistantHorizonManager } from './distantHorizon.ts';
+import {
+  computeDynamicLodPlan,
+  computeNestedRingBoxesBigInt,
+  computeZoomedLod0BoxBigInt,
+  createBigSectorPosition,
+  DEFAULT_LOD_SPACING,
+  isChunkInsideBox,
+  MAX_RENDER_DISTANCE_CHUNKS,
+  sanitizeLodSpacing,
+  sanitizePositiveRenderDistanceBigInt,
+  type ChunkBox,
+  type ChunkBoxBigInt,
+} from './distantHorizonMath.ts';
 import {
   evaluateBiomeColumn,
   evaluateSubterraneanCaveColumn,
+  isWaterBasinArea,
   rotateObjectVoxels,
   PREBUILT_OBJECTS,
   type VoxelObjectPrefab,
 } from './worldObjects.ts';
+export { isWaterBasinArea };
 import {
   applyTrue3DParityInfill,
   classifyPhysicalLandMaterial,
@@ -64,6 +82,7 @@ import {
 import {
   computeRenderDistanceTuning,
   computeTacticalMapRenderRadiusChunks,
+  resolveChunkTargetLod,
 } from './touchControls.ts';
 import { TerrainEntity, terrainEntityManager } from './physics/terrainEntity.ts';
 import {
@@ -73,6 +92,8 @@ import {
 import {
   getSharedPotatoShaderMaterial,
   getSharedCartoonShaderMaterial,
+  getPotatoSolidColorMaterial,
+  getCartoonSolidColorMaterial,
   updateSharedPotatoShaderUniforms,
   attachGpuGerstnerOceanShader,
   type ActiveShaderMode,
@@ -92,7 +113,6 @@ export enum ChunkState {
 }
 
 export { SURFACE_CHUNK_Y };
-const _sharedSurfaceRebuildVoxels = new Uint8Array(CHUNK_X * CHUNK_Y * CHUNK_Z);
 
 let sharedCubeWireGeom: THREE.BoxGeometry | null = null;
 export function getSharedCubeWireframeGeometry(): THREE.BoxGeometry {
@@ -248,10 +268,11 @@ export class MicroVoxelChunk {
   public mesh: THREE.Mesh | null = null;
   public meshLOD1: THREE.Mesh | null = null;
   public meshLOD2: THREE.Mesh | null = null;
+  public meshLOD3: THREE.Mesh | null = null;
   public transMesh: THREE.Mesh | null = null;
   public transMeshLOD1: THREE.Mesh | null = null;
   public transMeshLOD2: THREE.Mesh | null = null;
-  public activeLodLevel: -1 | 0 | 1 | 2 = -1;
+  public activeLodLevel: -1 | 0 | 1 | 2 | 3 = -1;
 
   // Chunk State Machine & Diegetic Wireframe / Bloom Fill Properties
   public state: ChunkState = ChunkState.QUEUED;
@@ -269,6 +290,7 @@ export class MicroVoxelChunk {
   public mergedQuads = 0;
   public lod1Quads = 0;
   public lod2Quads = 0;
+  public lod3Quads = 0;
   public originX: number;
   public originZ: number;
   public centerWorld: THREE.Vector3;
@@ -327,8 +349,12 @@ export class MicroVoxelChunk {
       CHUNK_Y * VOXEL_SIZE * 0.5,
       this.originZ + halfSpan,
     );
-    // Generous bounding sphere so outer LOD rings, huge objects, and tall 3D peaks never get prematurely culled
-    this.boundingSphere = new THREE.Sphere(this.centerWorld, halfSpan * 8.5);
+    // Tight true bounding sphere of a 16m x 24m x 16m chunk (+2m safety margin) for accurate frustum culling
+    const halfY = CHUNK_Y * VOXEL_SIZE * 0.5;
+    this.boundingSphere = new THREE.Sphere(
+      this.centerWorld,
+      Math.hypot(halfSpan, halfY, halfSpan) + 2.0,
+    );
   }
 
   public get voxels(): Uint8Array {
@@ -793,12 +819,90 @@ export class MicroVoxelChunk {
   }
 }
 
+// Reusable GPU Mesh/BufferGeometry free-list pool so streaming chunks recycle VBOs/VAOs
+// via bufferSubData instead of causing gl.createBuffer / gl.deleteBuffer driver stalls!
+const _chunkOpaqueMeshPool: THREE.Mesh[] = [];
+const _chunkTranslucentMeshPool: THREE.Mesh[] = [];
+let _maxPooledOpaqueChunkMeshes = 64;
+let _maxPooledTranslucentChunkMeshes = 24;
+
+export function setChunkMeshPoolLimits(opaqueMax: number, translucentMax: number): void {
+  _maxPooledOpaqueChunkMeshes = Math.max(8, opaqueMax | 0);
+  _maxPooledTranslucentChunkMeshes = Math.max(4, translucentMax | 0);
+  while (_chunkOpaqueMeshPool.length > _maxPooledOpaqueChunkMeshes) {
+    _chunkOpaqueMeshPool.pop()?.geometry.dispose();
+  }
+  while (_chunkTranslucentMeshPool.length > _maxPooledTranslucentChunkMeshes) {
+    _chunkTranslucentMeshPool.pop()?.geometry.dispose();
+  }
+}
+
+function acquirePooledChunkMesh(
+  isTranslucent: boolean,
+  minVerts: number,
+  minIndices: number,
+  wantsAo: boolean,
+  wantsSpawnPop: boolean,
+): THREE.Mesh | null {
+  const pool = isTranslucent ? _chunkTranslucentMeshPool : _chunkOpaqueMeshPool;
+  let bestIdx = -1;
+  let bestCap = Infinity;
+  for (let i = 0; i < pool.length; i++) {
+    const m = pool[i];
+    const geo = m.geometry;
+    const vCap = (geo.userData.vertexCapacity as number) || 0;
+    const iCap = (geo.userData.indexCapacity as number) || 0;
+    const hasAo = Boolean(geo.getAttribute('ao'));
+    const hasSpawn = Boolean(geo.getAttribute('spawnTime'));
+    if (
+      vCap >= minVerts &&
+      iCap >= minIndices &&
+      hasAo === wantsAo &&
+      hasSpawn === wantsSpawnPop &&
+      vCap < bestCap
+    ) {
+      bestCap = vCap;
+      bestIdx = i;
+    }
+  }
+  if (bestIdx < 0) return null;
+  const picked = pool[bestIdx];
+  const last = pool.pop()!;
+  if (bestIdx < pool.length) {
+    pool[bestIdx] = last;
+  }
+  return picked;
+}
+
+function recycleChunkMeshToPool(mesh: THREE.Mesh, isTranslucent: boolean): boolean {
+  const pool = isTranslucent ? _chunkTranslucentMeshPool : _chunkOpaqueMeshPool;
+  const limit = isTranslucent
+    ? _maxPooledTranslucentChunkMeshes
+    : _maxPooledOpaqueChunkMeshes;
+  if (pool.length >= limit) return false;
+  mesh.visible = false;
+  mesh.geometry.setDrawRange(0, 0);
+  mesh.geometry.userData.activeVertCount = 0;
+  mesh.geometry.userData.activeIndexCount = 0;
+  mesh.userData.hasActiveVerts = false;
+  pool.push(mesh);
+  return true;
+}
+
+function drainChunkMeshPool(): void {
+  while (_chunkOpaqueMeshPool.length > 0) {
+    _chunkOpaqueMeshPool.pop()?.geometry.dispose();
+  }
+  while (_chunkTranslucentMeshPool.length > 0) {
+    _chunkTranslucentMeshPool.pop()?.geometry.dispose();
+  }
+}
+
 /**
  * In-Place GPU BufferAttribute Updater (#1):
- * Pre-allocates position / normal / color / index buffers once at worst-case capacity (`initialVertCapacity`),
- * and on every rebuild writes new data directly into the existing BufferAttribute `.array`,
+ * Pre-allocates or recycles pooled position / normal / color / index buffers,
+ * writes new data directly into the existing BufferAttribute `.array`,
  * sets `.needsUpdate = true` with `addUpdateRange`, and calls `geometry.setDrawRange(0, newIndexCount)`.
- * Never recreates `THREE.BufferGeometry` or `THREE.Mesh` on rebuilds!
  */
 export function updateOrCreateDynamicMeshBuffer(
   existingMesh: THREE.Mesh | null,
@@ -806,7 +910,7 @@ export function updateOrCreateDynamicMeshBuffer(
   material: THREE.Material,
   parent: THREE.Object3D,
   isTranslucent = false,
-  initialVertCapacity = 16384,
+  initialVertCapacity = 8192,
   fixedBoundingSphere?: THREE.Sphere,
 ): { mesh: THREE.Mesh | null; updatedInPlace: boolean } {
   const vertCount = payload ? payload.vertCount : 0;
@@ -838,55 +942,72 @@ export function updateOrCreateDynamicMeshBuffer(
   );
 
   if (!mesh) {
-    let capVerts = Math.max(1024, initialVertCapacity);
-    while (capVerts < vertCount) {
-      capVerts <<= 1;
-    }
-    const capIndices = Math.max((capVerts >> 2) * 6, indexCount);
-
-    const geo = new THREE.BufferGeometry();
-    const posAttr = new THREE.BufferAttribute(new Float32Array(capVerts * 3), 3);
-    const normAttr = new THREE.BufferAttribute(new Float32Array(capVerts * 3), 3);
-    const colAttr = new THREE.BufferAttribute(new Float32Array(capVerts * 3), 3);
-    const idxAttr = new THREE.BufferAttribute(new Uint32Array(capIndices), 1);
-
-    posAttr.setUsage(THREE.DynamicDrawUsage);
-    normAttr.setUsage(THREE.DynamicDrawUsage);
-    colAttr.setUsage(THREE.DynamicDrawUsage);
-    idxAttr.setUsage(THREE.DynamicDrawUsage);
-
-    geo.setAttribute('position', posAttr);
-    geo.setAttribute('normal', normAttr);
-    geo.setAttribute('color', colAttr);
-    if (wantsAo) {
-      const aoAttr = new THREE.BufferAttribute(new Float32Array(capVerts), 1);
-      aoAttr.setUsage(THREE.DynamicDrawUsage);
-      geo.setAttribute('ao', aoAttr);
-    }
-    if (wantsSpawnPop) {
-      const spawnAttr = new THREE.BufferAttribute(new Float32Array(capVerts), 1);
-      const centerAttr = new THREE.BufferAttribute(new Float32Array(capVerts * 3), 3);
-      spawnAttr.setUsage(THREE.DynamicDrawUsage);
-      centerAttr.setUsage(THREE.DynamicDrawUsage);
-      geo.setAttribute('spawnTime', spawnAttr);
-      geo.setAttribute('voxelCenter', centerAttr);
-    }
-    geo.setIndex(idxAttr);
-    geo.userData.vertexCapacity = capVerts;
-    geo.userData.indexCapacity = capIndices;
-
-    mesh = new THREE.Mesh(geo, material);
-    if (isTranslucent) {
-      mesh.renderOrder = 2;
+    const pooled = acquirePooledChunkMesh(
+      isTranslucent,
+      vertCount,
+      indexCount,
+      wantsAo,
+      wantsSpawnPop,
+    );
+    if (pooled) {
+      mesh = pooled;
+      mesh.material = material;
+      mesh.visible = true;
+      updatedInPlace = true;
+      if (mesh.parent !== parent) {
+        parent.add(mesh);
+      }
     } else {
-      (mesh as unknown as { isTerrainChunk?: boolean }).isTerrainChunk = true;
+      let capVerts = Math.max(1024, initialVertCapacity);
+      while (capVerts < vertCount) {
+        capVerts <<= 1;
+      }
+      const capIndices = Math.max((capVerts >> 2) * 6, indexCount);
+
+      const geo = new THREE.BufferGeometry();
+      const posAttr = new THREE.BufferAttribute(new Float32Array(capVerts * 3), 3);
+      const normAttr = new THREE.BufferAttribute(new Float32Array(capVerts * 3), 3);
+      const colAttr = new THREE.BufferAttribute(new Float32Array(capVerts * 3), 3);
+      const idxAttr = new THREE.BufferAttribute(new Uint32Array(capIndices), 1);
+
+      posAttr.setUsage(THREE.DynamicDrawUsage);
+      normAttr.setUsage(THREE.DynamicDrawUsage);
+      colAttr.setUsage(THREE.DynamicDrawUsage);
+      idxAttr.setUsage(THREE.DynamicDrawUsage);
+
+      geo.setAttribute('position', posAttr);
+      geo.setAttribute('normal', normAttr);
+      geo.setAttribute('color', colAttr);
+      if (wantsAo) {
+        const aoAttr = new THREE.BufferAttribute(new Float32Array(capVerts), 1);
+        aoAttr.setUsage(THREE.DynamicDrawUsage);
+        geo.setAttribute('ao', aoAttr);
+      }
+      if (wantsSpawnPop) {
+        const spawnAttr = new THREE.BufferAttribute(new Float32Array(capVerts), 1);
+        const centerAttr = new THREE.BufferAttribute(new Float32Array(capVerts * 3), 3);
+        spawnAttr.setUsage(THREE.DynamicDrawUsage);
+        centerAttr.setUsage(THREE.DynamicDrawUsage);
+        geo.setAttribute('spawnTime', spawnAttr);
+        geo.setAttribute('voxelCenter', centerAttr);
+      }
+      geo.setIndex(idxAttr);
+      geo.userData.vertexCapacity = capVerts;
+      geo.userData.indexCapacity = capIndices;
+
+      mesh = new THREE.Mesh(geo, material);
+      if (isTranslucent) {
+        mesh.renderOrder = 2;
+      } else {
+        (mesh as unknown as { isTerrainChunk?: boolean }).isTerrainChunk = true;
+      }
+      mesh.castShadow = false;
+      mesh.receiveShadow = !isTranslucent;
+      mesh.frustumCulled = true;
+      mesh.matrixAutoUpdate = false;
+      mesh.updateMatrix();
+      parent.add(mesh);
     }
-    mesh.castShadow = false;
-    mesh.receiveShadow = !isTranslucent;
-    mesh.frustumCulled = true;
-    mesh.matrixAutoUpdate = false;
-    mesh.updateMatrix();
-    parent.add(mesh);
   } else {
     updatedInPlace = true;
     if (mesh.parent !== parent) {
@@ -1127,6 +1248,7 @@ export function createAtmosphericSkyDome(): THREE.Mesh {
   dome.matrixAutoUpdate = false;
   dome.updateMatrix();
   dome.renderOrder = -1000;
+  dome.userData.isSkyDome = true;
   return dome;
 }
 
@@ -1147,14 +1269,19 @@ export function createMapHorizonSkirtMesh(): THREE.Mesh {
       uBiomeType: { value: 0.0 },
     },
     vertexShader: `
+      #include <common>
+      #include <logdepthbuf_pars_vertex>
       varying vec3 vWorldPos;
       void main() {
         vec4 wp = modelMatrix * vec4(position, 1.0);
         vWorldPos = wp.xyz;
         gl_Position = projectionMatrix * viewMatrix * wp;
+        #include <logdepthbuf_vertex>
       }
     `,
     fragmentShader: `
+      precision highp float;
+      #include <logdepthbuf_pars_fragment>
       varying vec3 vWorldPos;
       uniform float uBiomeType;
 
@@ -1163,6 +1290,7 @@ export function createMapHorizonSkirtMesh(): THREE.Mesh {
       }
 
       void main() {
+        #include <logdepthbuf_fragment>
         vec2 wxz = vWorldPos.xz;
         vec3 landCol = vec3(0.27, 0.47, 0.24);
         vec3 waterCol = vec3(0.02, 0.30, 0.62);
@@ -1214,7 +1342,7 @@ export function createMapHorizonSkirtMesh(): THREE.Mesh {
 }
 
 const _frustum = new THREE.Frustum();
-const _tmpChunkSphere = new THREE.Sphere(new THREE.Vector3(), 36);
+const _tmpChunkSphere = new THREE.Sphere(new THREE.Vector3(), 20);
 const _projScreenMat = new THREE.Matrix4();
 const _camDirTmp = new THREE.Vector3();
 const _rayHitWorldPos = new THREE.Vector3();
@@ -1267,26 +1395,7 @@ for (let i = 0; i < 1024; i++) {
   _cosLUT[i] = Math.cos((i * Math.PI * 2) / 1024);
 }
 
-/**
- * Determines whether world coordinate (wx, wz) lies within a designated ocean, pond, or river basin
- * so that subterranean caves and inland valleys below sea level remain dry.
- */
-export function isWaterBasinArea(
-  wx: number,
-  wz: number,
-  mode: WorldGenMode,
-): boolean {
-  if (mode === 'FLAT_BASEPLATE') return false;
-  if (mode === 'BIOME_ARCHIPELAGO' || mode === 'CUSTOM_GLB_MAP') return true;
-  if (mode === 'DEFAULT_PARK') {
-    // Include the entire coastal seabed & beach swash zone (wx <= -22, wz <= 36) so water meets the shoreline with zero gap!
-    return (wx <= -22 && wz <= 36) || Math.hypot(wx - 65, wz - -85) < 22;
-  }
-  if (mode === 'BIOME_CANYON') {
-    return Math.abs(wx - Math.sin(wz * 0.04) * 22) < 18;
-  }
-  return false;
-}
+// `isWaterBasinArea` is imported and re-exported from `./worldObjects.ts` so main thread & workers share one implementation.
 
 /**
  * Returns true if (wx, wz) is inside a small inland pond or river (0.75m gentle waves)
@@ -1352,6 +1461,7 @@ export class MicroVoxelWorld {
   }> = [];
   public sharedVoxelMaterial: THREE.MeshLambertMaterial;
   public sharedTranslucentMaterial: THREE.MeshPhongMaterial;
+  public sharedHorizonWaterMaterial: THREE.MeshPhongMaterial;
   public skyDome: THREE.Mesh;
   public mapHorizonSkirt: THREE.Mesh;
   public activeMapRenderRadiusChunks = 8;
@@ -1420,6 +1530,7 @@ export class MicroVoxelWorld {
   ];
   public radiusModeIdx = 2;
   public customRenderDistance = 4;
+  public customRenderDistanceBig: bigint = 4n;
 
   // 2D Terraced Voxel Heightfield & GPU Gerstner Ocean Waves
   public waveQuality: 'OFF' | 'LOW' | 'MEDIUM' | 'HIGH' = 'LOW';
@@ -1438,9 +1549,14 @@ export class MicroVoxelWorld {
 
   private lastFocusX = 0;
   private lastFocusZ = -4;
+  private _lastStreamCenterCX = Number.NaN;
+  private _lastStreamCenterCZ = Number.NaN;
+  private _lastStreamMaxRad = -1;
+  private _allChunksInRadiusPresent = false;
   private completedWorkerQueue: Array<{
     chunk: MicroVoxelChunk;
     res: ChunkMeshJobResponse;
+    jobRemovals?: Map<number, number>;
   }> = [];
 
   public visibleTris = 0;
@@ -1448,12 +1564,31 @@ export class MicroVoxelWorld {
   public lod0Chunks = 25;
   public lod1Chunks = 24;
   public lod2Chunks = 32;
+  public lod3Chunks = 0;
   public cpuThreads: number;
   public workerPool: MultiCoreMeshWorkerPool;
-  public lodSummary = 'L0:25 L1:24 L2:32 · 8 CORES';
+  public horizonManager!: DistantHorizonManager;
+  public lodSpacing = DEFAULT_LOD_SPACING;
+  public activeHorizonRings = 0;
+  public activeHorizonTiles = 0;
+  public activeTotalLodLayers = 1;
+  public activeScaleBands = 1;
+  private _horizonActive = false;
+  private _lastStreamLodSpacing = DEFAULT_LOD_SPACING;
+  private _lastStreamMaxRadBig: bigint = -1n;
+  private _cameraFwdScratch = new THREE.Vector3();
+  private _initialSpawnBubbleReady = false;
+  public lodSummary = 'L0:25 L1:24 L2:32 L3:0 · 8 CORES';
   public uncappedChunkLod = false;
+  /** Optional planetary curvature radius in meters (0 = flat world, > 0 = curved horizon frustum margin) */
+  public planetCurvatureRadius = 0;
   /** Strict per-frame chunk rebuild budget (#2: max N=2 chunks per frame) */
   public maxChunkRebuildsPerFrame = 2;
+  /** World-space (x, z) focus point of active optical camera zoom where distant terrain renders at full crisp LOD0 */
+  public zoomFocusWorld: { x: number; z: number } | null = null;
+  public activeZoomLod0Chunks = 0;
+  private _lastZoomCX = -999999;
+  private _lastZoomCZ = -999999;
 
   // Diegetic Loading State Machine & Priority Queueing
   public onSpawnChunkReady: (() => void) | null = null;
@@ -1481,7 +1616,7 @@ export class MicroVoxelWorld {
     return this.lod1Chunks;
   }
   get lodFarChunks(): number {
-    return this.lod2Chunks;
+    return this.lod2Chunks + this.lod3Chunks;
   }
 
   constructor(
@@ -1489,12 +1624,25 @@ export class MicroVoxelWorld {
     isHeadless = false,
     initialRenderDistance?: number,
     initialPotatoShader = false,
+    initialLodSpacing?: number,
   ) {
     setActiveVoxelWorld(this.voxelWorld);
     this.scene = scene;
     this.usePotatoShader = initialPotatoShader;
+    if (typeof initialLodSpacing === 'number') {
+      this.lodSpacing = sanitizeLodSpacing(initialLodSpacing, DEFAULT_LOD_SPACING);
+    }
     this.chunks = new Array(WORLD_CHUNKS_X * WORLD_CHUNKS_Z);
     this.workerPool = new MultiCoreMeshWorkerPool();
+    if (this.voxelWorld.usesSharedSurfaceSlab) {
+      this.workerPool.attachSharedSurfaceSlab(
+        this.voxelWorld.surfaceVoxelsSab,
+        this.voxelWorld.surfaceHeightSab,
+        this.voxelWorld.surfaceVoxelsStride,
+        this.voxelWorld.surfaceHeightStride,
+        this.voxelWorld.surfaceSlabCapacity,
+      );
+    }
     this.cpuThreads = this.workerPool.coreCount;
     this.lodSummary = `L0:25 L1:24 L2:32 · ${this.cpuThreads} CORES`;
 
@@ -1530,6 +1678,27 @@ export class MicroVoxelWorld {
     });
     this.gpuOceanWaveUniforms = attachGpuGerstnerOceanShader(
       this.sharedTranslucentMaterial,
+    );
+
+    // Static, opaque, FrontSide distant ocean material for LOD1..LOD8+ horizon mega-tiles:
+    // matches LOD0 ocean color & specular sheen while avoiding giant 4 km Gerstner vertex heaving.
+    this.sharedHorizonWaterMaterial = new THREE.MeshPhongMaterial({
+      color: new THREE.Color(0x0060d0),
+      vertexColors: true,
+      shininess: 90,
+      specular: new THREE.Color(0xbae6fd),
+      transparent: false,
+      opacity: 1.0,
+      depthWrite: true,
+      depthTest: true,
+      side: THREE.FrontSide,
+    });
+
+    this.horizonManager = new DistantHorizonManager(
+      this.scene,
+      this.workerPool,
+      this.getActiveOpaqueVoxelMaterial(),
+      this.getActiveHorizonWaterMaterial(),
     );
 
     // Instanced Mesh for dynamic fluid wave crests & vehicle wake foam (thin translucent crests)
@@ -1619,6 +1788,16 @@ export class MicroVoxelWorld {
     return this.sharedVoxelMaterial;
   }
 
+  public getActiveHorizonWaterMaterial(): THREE.Material {
+    if (this.useCartoonShader) {
+      return getCartoonSolidColorMaterial(new THREE.Color(0x0060d0), null, true);
+    }
+    if (this.usePotatoShader) {
+      return getPotatoSolidColorMaterial(new THREE.Color(0x0060d0), null, true);
+    }
+    return this.sharedHorizonWaterMaterial;
+  }
+
   public getActiveShaderMode(): ActiveShaderMode {
     if (this.useCartoonShader) return 'CARTOON';
     if (this.usePotatoShader) return 'POTATO';
@@ -1637,7 +1816,12 @@ export class MicroVoxelWorld {
       if (chunk.meshLOD2) {
         chunk.meshLOD2.material = targetMat;
       }
+      if (chunk.meshLOD3) {
+        chunk.meshLOD3.material = targetMat;
+      }
     });
+    this.horizonManager?.syncOpaqueMaterial(targetMat);
+    this.horizonManager?.syncWaterMaterial(this.getActiveHorizonWaterMaterial());
   }
 
   /**
@@ -1647,6 +1831,8 @@ export class MicroVoxelWorld {
   public setPotatoShaderMode(enabled: boolean): void {
     this.usePotatoShader = enabled;
     if (enabled) this.useCartoonShader = false;
+    // Trim GPU mesh pool aggressively on Pentium / Potato mode to cut VRAM & JS heap overhead
+    setChunkMeshPoolLimits(enabled ? 20 : 64, enabled ? 8 : 24);
     this.syncAllChunkOpaqueMaterials();
   }
 
@@ -1670,21 +1856,41 @@ export class MicroVoxelWorld {
     this.gpuOceanWaveUniforms.uWeatherWaveMult.value = this.weatherWaveMult;
   }
 
-  public setRenderDistanceChunks(radius: number, uncappedLod?: boolean): void {
-    const clamped = Math.max(2, Math.min(16, Math.round(radius)));
+  public setRenderDistanceChunks(
+    radius: number | bigint | string,
+    uncappedLod?: boolean,
+    lodSpacing?: number,
+  ): void {
+    const clampedBig = sanitizePositiveRenderDistanceBigInt(
+      radius,
+      this.customRenderDistanceBig > 0n ? this.customRenderDistanceBig : 6n,
+    );
+    const clamped =
+      clampedBig > BigInt(MAX_RENDER_DISTANCE_CHUNKS)
+        ? MAX_RENDER_DISTANCE_CHUNKS
+        : Number(clampedBig);
+    this.customRenderDistanceBig = clampedBig;
     this.customRenderDistance = clamped;
     if (typeof uncappedLod === 'boolean') {
       this.uncappedChunkLod = uncappedLod;
     }
-    const matchIdx = this.radiusModes.findIndex((m) => m.radius === clamped);
+    if (typeof lodSpacing === 'number') {
+      this.lodSpacing = sanitizeLodSpacing(lodSpacing, this.lodSpacing);
+    }
+    const matchIdx = this.radiusModes.findIndex((m) => BigInt(m.radius) === clampedBig);
     if (matchIdx >= 0) {
       this.radiusModeIdx = matchIdx;
     }
   }
 
+  public setLodSpacing(spacing: number): void {
+    this.lodSpacing = sanitizeLodSpacing(spacing, this.lodSpacing);
+  }
+
   public cycleRadiusMode(): number {
     this.radiusModeIdx = (this.radiusModeIdx + 1) % this.radiusModes.length;
     this.customRenderDistance = this.radiusModes[this.radiusModeIdx].radius;
+    this.customRenderDistanceBig = BigInt(this.customRenderDistance);
     return this.customRenderDistance;
   }
 
@@ -1881,48 +2087,85 @@ export class MicroVoxelWorld {
     return slices;
   }
 
+  /**
+   * Computes the highest continuous opaque voxel column height on a neighbor's boundary column.
+   * For surface-only unmodified chunks this is an O(1) heightmap lookup; for 3D or modified chunks
+   * it scans upward from vy = 1 so border cliff walls are NEVER culled across cave mouths or craters.
+   */
+  private getNeighborContinuousSolidTopVY(
+    neighbor: MicroVoxelChunk,
+    nlx: number,
+    nlz: number,
+  ): number {
+    const lx = nlx & 63;
+    const lz = nlz & 63;
+    const nSurfVY = neighbor.surfaceHeightMap[lx + (lz << 6)];
+    if (neighbor.isSurfaceOnlyTerrain && !neighbor.userModified) {
+      return nSurfVY;
+    }
+    const nVox = neighbor.voxels;
+    if (nVox.length < CHUNK_X * CHUNK_Y * CHUNK_Z) {
+      return nSurfVY;
+    }
+    const hasPending = neighbor.pendingRemovals.size > 0;
+    const colBase = lx + CHUNK_X * CHUNK_Y * lz;
+    let solidTop = 0;
+    const scanMax = Math.min(CHUNK_Y - 1, nSurfVY);
+    for (let vy = 1; vy <= scanMax; vy++) {
+      const flatIdx = colBase + vy * CHUNK_X;
+      const m =
+        hasPending && neighbor.pendingRemovals.has(flatIdx)
+          ? (neighbor.pendingRemovals.get(flatIdx) ?? MAT.AIR)
+          : nVox[flatIdx];
+      if (m === MAT.AIR || isTranslucentVoxelMat(m)) {
+        break;
+      }
+      solidTop = vy;
+    }
+    return solidTop;
+  }
+
   private extractNeighborSurfaceHeights(chunk: MicroVoxelChunk): {
-    west?: Uint8Array;
-    east?: Uint8Array;
-    north?: Uint8Array;
-    south?: Uint8Array;
+    west?: Uint16Array;
+    east?: Uint16Array;
+    north?: Uint16Array;
+    south?: Uint16Array;
   } {
     const res: {
-      west?: Uint8Array;
-      east?: Uint8Array;
-      north?: Uint8Array;
-      south?: Uint8Array;
+      west?: Uint16Array;
+      east?: Uint16Array;
+      north?: Uint16Array;
+      south?: Uint16Array;
     } = {};
     const wN = this.chunkMap.get(`${chunk.cx - 1},${chunk.cz}`);
     if (wN && wN.terrainPopulated) {
-      const arr = new Uint8Array(CHUNK_Z);
+      const arr = new Uint16Array(CHUNK_Z);
       for (let lz = 0; lz < CHUNK_Z; lz++) {
-        arr[lz] = wN.surfaceHeightMap[(CHUNK_X - 1) + (lz << 6)];
+        arr[lz] = this.getNeighborContinuousSolidTopVY(wN, CHUNK_X - 1, lz);
       }
       res.west = arr;
     }
     const eN = this.chunkMap.get(`${chunk.cx + 1},${chunk.cz}`);
     if (eN && eN.terrainPopulated) {
-      const arr = new Uint8Array(CHUNK_Z);
+      const arr = new Uint16Array(CHUNK_Z);
       for (let lz = 0; lz < CHUNK_Z; lz++) {
-        arr[lz] = eN.surfaceHeightMap[lz << 6];
+        arr[lz] = this.getNeighborContinuousSolidTopVY(eN, 0, lz);
       }
       res.east = arr;
     }
     const nN = this.chunkMap.get(`${chunk.cx},${chunk.cz - 1}`);
     if (nN && nN.terrainPopulated) {
-      const arr = new Uint8Array(CHUNK_X);
-      const zOff = (CHUNK_Z - 1) << 6;
+      const arr = new Uint16Array(CHUNK_X);
       for (let lx = 0; lx < CHUNK_X; lx++) {
-        arr[lx] = nN.surfaceHeightMap[lx + zOff];
+        arr[lx] = this.getNeighborContinuousSolidTopVY(nN, lx, CHUNK_Z - 1);
       }
       res.north = arr;
     }
     const sN = this.chunkMap.get(`${chunk.cx},${chunk.cz + 1}`);
     if (sN && sN.terrainPopulated) {
-      const arr = new Uint8Array(CHUNK_X);
+      const arr = new Uint16Array(CHUNK_X);
       for (let lx = 0; lx < CHUNK_X; lx++) {
-        arr[lx] = sN.surfaceHeightMap[lx];
+        arr[lx] = this.getNeighborContinuousSolidTopVY(sN, lx, 0);
       }
       res.south = arr;
     }
@@ -1996,14 +2239,25 @@ export class MicroVoxelWorld {
     return chunk;
   }
 
+  private canUseWorkerProceduralSurfaceGen(): boolean {
+    return (
+      this.workerPool.hasDedicatedWorkers &&
+      this.worldGenMode !== 'CUSTOM_GLB_MAP' &&
+      this.worldGenMode !== 'CUSTOM_HEIGHTMAP'
+    );
+  }
+
   /**
    * Retrieves an existing chunk at (cx, cz) or creates a lightweight Top-Visible-Layer-Only chunk
    * that only populates and meshes the top surface + cliff steps (skipping all 80 underground Y-layers & caves).
+   * When `deferTerrainGenToWorker` is true (default for outer streaming rings), skips main-thread
+   * noise evaluation and neighbor invalidation — the Web Worker computes the 66x66 padded surface apron off-thread!
    */
   getOrCreateChunkTopSurfaceOnly(
     cx: number,
     cz: number,
     buildMeshImmediately = true,
+    deferTerrainGenToWorker = false,
   ): MicroVoxelChunk {
     const inBounds =
       cx >= 0 && cx < WORLD_CHUNKS_X && cz >= 0 && cz < WORLD_CHUNKS_Z;
@@ -2011,9 +2265,9 @@ export class MicroVoxelWorld {
       ? this.chunks[cx + cz * WORLD_CHUNKS_X]
       : this.chunkMap.get(`${cx},${cz}`);
     if (existing) {
-      if (!existing.terrainPopulated) {
+      if (!existing.terrainPopulated && (!deferTerrainGenToWorker || buildMeshImmediately)) {
         this.populateChunkTopSurfaceOnly(existing);
-        this.invalidateAdjacentNeighborChunks(cx, cz);
+        this.invalidateModifiedAdjacentNeighbors(cx, cz);
       }
       if (buildMeshImmediately && !existing.hasBuiltMesh && !existing.workerPending) {
         this.rebuildChunkTopSurfaceOnly(existing);
@@ -2049,14 +2303,49 @@ export class MicroVoxelWorld {
       this.chunks[cx + cz * WORLD_CHUNKS_X] = chunk;
     }
 
+    if (deferTerrainGenToWorker && !buildMeshImmediately && this.canUseWorkerProceduralSurfaceGen()) {
+      // Zero main-thread terrain generation & zero neighbor remesh cascade!
+      // Worker will generate the 64x64 surface + 66x66 deterministic apron + LOD0/1/2 off-thread.
+      chunk.dirty = true;
+      this.invalidateModifiedAdjacentNeighbors(cx, cz);
+      return chunk;
+    }
+
     this.populateChunkTopSurfaceOnly(chunk);
-    this.invalidateAdjacentNeighborChunks(cx, cz);
+    // Procedural chunks use deterministic borders, so only invalidate neighbors if they are user-modified
+    if (this.worldGenMode === 'CUSTOM_GLB_MAP' || this.worldGenMode === 'CUSTOM_HEIGHTMAP') {
+      this.invalidateAdjacentNeighborChunks(cx, cz);
+    } else {
+      this.invalidateModifiedAdjacentNeighbors(cx, cz);
+    }
     if (buildMeshImmediately) {
       this.rebuildChunkTopSurfaceOnly(chunk);
     } else {
       chunk.dirty = true;
     }
     return chunk;
+  }
+
+  private invalidateModifiedAdjacentNeighbors(cx: number, cz: number): void {
+    const dirs = [
+      [cx - 1, cz],
+      [cx + 1, cz],
+      [cx, cz - 1],
+      [cx, cz + 1],
+    ];
+    for (let i = 0; i < 4; i++) {
+      const nChunk = this.chunkMap.get(`${dirs[i][0]},${dirs[i][1]}`);
+      if (
+        nChunk &&
+        nChunk.userModified &&
+        nChunk.terrainPopulated &&
+        (nChunk.hasBuiltMesh || nChunk.workerPending)
+      ) {
+        nChunk.cachedOpaqueBuckets = [null, null, null];
+        nChunk.dirtyBucketMask = MAT_BUCKET_ALL_MASK;
+        this.markChunkDirty(nChunk);
+      }
+    }
   }
 
   /**
@@ -2138,12 +2427,26 @@ export class MicroVoxelWorld {
     if (!chunk.isSurfaceOnlyTerrain) return;
     chunk.isSurfaceOnlyTerrain = false;
     chunk.isSurfaceOnlyMesh = false;
+    chunk.lod12Built = false;
     chunk.cachedOpaqueBuckets = [null, null, null];
     chunk.dirtyBucketMask = MAT_BUCKET_ALL_MASK;
+    if (chunk.meshLOD1) {
+      chunk.meshLOD1.visible = false;
+      chunk.meshLOD1.userData.hasActiveVerts = false;
+    }
+    if (chunk.meshLOD2) {
+      chunk.meshLOD2.visible = false;
+      chunk.meshLOD2.userData.hasActiveVerts = false;
+    }
+    if (chunk.meshLOD3) {
+      chunk.meshLOD3.visible = false;
+      chunk.meshLOD3.userData.hasActiveVerts = false;
+    }
     if (chunk.voxels.length !== CHUNK_X * CHUNK_Y * CHUNK_Z) {
       chunk.voxels = new Uint8Array(CHUNK_X * CHUNK_Y * CHUNK_Z);
     }
     this.populateChunkTerrain(chunk);
+    this.invalidateAdjacentNeighborChunks(chunk.cx, chunk.cz);
   }
 
   /**
@@ -2558,6 +2861,27 @@ export class MicroVoxelWorld {
       chunk = this.chunkMap.get(`${cx},${cz}`);
     }
     if (!chunk) return MAT.AIR;
+    if (!chunk.terrainPopulated) {
+      const wx = (vx - (TOTAL_VX >> 1)) * VOXEL_SIZE;
+      const wz = (vz - (TOTAL_VZ >> 1)) * VOXEL_SIZE;
+      const col = evaluateBiomeColumn(
+        wx,
+        wz,
+        vx,
+        vz,
+        this.worldGenMode,
+        this.flatBaseplateMat,
+        this.heightmapData,
+      );
+      if (vy > col.surfVY) {
+        return vy <= WATER_VY && isWaterBasinArea(wx, wz, this.worldGenMode)
+          ? MAT.WATER_VOX
+          : MAT.AIR;
+      }
+      if (vy === col.surfVY) return col.topMat;
+      if (vy === col.surfVY - 1) return col.subMat;
+      return MAT.ROCK;
+    }
     const lx = vx & 63;
     const lz = vz & 63;
     if (chunk.isSurfaceOnlyTerrain && !chunk.userModified) {
@@ -2578,6 +2902,19 @@ export class MicroVoxelWorld {
       chunk = this.chunkMap.get(`${cx},${cz}`);
     }
     if (!chunk) return WATER_VY + 2;
+    if (!chunk.terrainPopulated) {
+      const wx = (vx - (TOTAL_VX >> 1)) * VOXEL_SIZE;
+      const wz = (vz - (TOTAL_VZ >> 1)) * VOXEL_SIZE;
+      return evaluateBiomeColumn(
+        wx,
+        wz,
+        vx,
+        vz,
+        this.worldGenMode,
+        this.flatBaseplateMat,
+        this.heightmapData,
+      ).surfVY;
+    }
     return chunk.surfaceHeightMap[(vx & 63) + ((vz & 63) << 6)];
   }
 
@@ -2910,38 +3247,29 @@ export class MicroVoxelWorld {
     chunk.isBloomMaterialAttached = false;
   }
 
-  private disposeChunkMeshes(chunk: MicroVoxelChunk): void {
+  private disposeChunkMeshes(chunk: MicroVoxelChunk, recycleToPool = true): void {
     this.disposeChunkWireAndBloom(chunk);
-    if (chunk.mesh) {
-      this.scene.remove(chunk.mesh);
-      chunk.mesh.geometry.dispose();
-      chunk.mesh = null;
-    }
-    if (chunk.meshLOD1) {
-      this.scene.remove(chunk.meshLOD1);
-      chunk.meshLOD1.geometry.dispose();
-      chunk.meshLOD1 = null;
-    }
-    if (chunk.meshLOD2) {
-      this.scene.remove(chunk.meshLOD2);
-      chunk.meshLOD2.geometry.dispose();
-      chunk.meshLOD2 = null;
-    }
-    if (chunk.transMesh) {
-      this.scene.remove(chunk.transMesh);
-      chunk.transMesh.geometry.dispose();
-      chunk.transMesh = null;
-    }
-    if (chunk.transMeshLOD1) {
-      this.scene.remove(chunk.transMeshLOD1);
-      chunk.transMeshLOD1.geometry.dispose();
-      chunk.transMeshLOD1 = null;
-    }
-    if (chunk.transMeshLOD2) {
-      this.scene.remove(chunk.transMeshLOD2);
-      chunk.transMeshLOD2.geometry.dispose();
-      chunk.transMeshLOD2 = null;
-    }
+    const releaseMesh = (m: THREE.Mesh | null, isTranslucent: boolean) => {
+      if (!m) return;
+      this.scene.remove(m);
+      if (!recycleToPool || !recycleChunkMeshToPool(m, isTranslucent)) {
+        m.geometry.dispose();
+      }
+    };
+    releaseMesh(chunk.mesh, false);
+    chunk.mesh = null;
+    releaseMesh(chunk.meshLOD1, false);
+    chunk.meshLOD1 = null;
+    releaseMesh(chunk.meshLOD2, false);
+    chunk.meshLOD2 = null;
+    releaseMesh(chunk.meshLOD3, false);
+    chunk.meshLOD3 = null;
+    releaseMesh(chunk.transMesh, true);
+    chunk.transMesh = null;
+    releaseMesh(chunk.transMeshLOD1, true);
+    chunk.transMeshLOD1 = null;
+    releaseMesh(chunk.transMeshLOD2, true);
+    chunk.transMeshLOD2 = null;
     chunk.cachedOpaqueBuckets = [null, null, null];
     chunk.pendingRemovals.clear();
     chunk.activeLodLevel = -1;
@@ -2973,10 +3301,14 @@ export class MicroVoxelWorld {
     this.pendingTerrainStructures.length = 0;
     this.pendingCarvedDebris.length = 0;
     this._cachedAllLod0Ready = false;
+    this._allChunksInRadiusPresent = false;
+    this._lastStreamCenterCX = Number.NaN;
+    this._lastStreamCenterCZ = Number.NaN;
+    this._lastStreamMaxRad = -1;
 
     this.chunkMap.forEach((chunk) => {
       chunk.version++;
-      this.disposeChunkMeshes(chunk);
+      this.disposeChunkMeshes(chunk, true);
       this.voxelWorld.releaseChunkSlot(chunk.slotIndex);
     });
     this.modifiedChunkCache.forEach((chunk) => {
@@ -2985,6 +3317,7 @@ export class MicroVoxelWorld {
     this.chunkMap.clear();
     this.chunkSlotMap.clear();
     this.modifiedChunkCache.clear();
+    this.horizonManager?.clearAll(true);
     this.chunks = new Array(WORLD_CHUNKS_X * WORLD_CHUNKS_Z);
 
     this.generateAllVoxelTerrain();
@@ -3279,7 +3612,7 @@ export class MicroVoxelWorld {
     };
 
     const isSurfaceOnly =
-      (chunk.isSurfaceOnlyTerrain || chunk.minY >= 38) &&
+      chunk.isSurfaceOnlyTerrain &&
       !chunk.userModified &&
       this.worldGenMode !== 'CUSTOM_GLB_MAP';
 
@@ -3287,6 +3620,14 @@ export class MicroVoxelWorld {
       chunk.dirty = false;
       chunk.workerPending = true;
       chunk.dirtyBucketMask = 0;
+      const spawnPriorityScore = -950 + Math.round(ringDist * 25);
+      const useSharedSlab =
+        isSurfaceOnly &&
+        chunk.isSurfaceOnlyTerrain &&
+        chunk.voxels.length === CHUNK_X * SURFACE_CHUNK_Y * CHUNK_Z &&
+        this.voxelWorld.usesSharedSurfaceSlab &&
+        this.workerPool.hasSharedSurfaceSlab &&
+        chunk.slotIndex < this.voxelWorld.surfaceSlabCapacity;
       this.workerPool
         .enqueueChunkJob(
           chunk.cx,
@@ -3307,6 +3648,12 @@ export class MicroVoxelWorld {
           isSurfaceOnly,
           isSurfaceOnly ? chunk.surfaceHeightMap : undefined,
           isSurfaceOnly ? this.extractNeighborSurfaceHeights(chunk) : undefined,
+          {
+            priorityScore: spawnPriorityScore,
+            slotIndex: chunk.slotIndex,
+            useSharedSlab,
+            buildSurfaceLods: isSurfaceOnly && !this._horizonActive,
+          },
         )
         .then((workerRes) => {
           chunk.workerPending = false;
@@ -3371,8 +3718,8 @@ export class MicroVoxelWorld {
       return a.spiralAngle - b.spiralAngle;
     });
 
-    // Dispatch up to 4 chunks per frame on Potato mode (8 on standard) so initial rings complete rapidly without stalling dual-core CPUs
-    const processBatchSize = this.usePotatoShader ? 4 : 8;
+    // Dispatch spawn-area chunks aggressively so the entire spawn LOD0 bubble fills rapidly before outer horizon rings build
+    const processBatchSize = this.usePotatoShader ? 8 : 24;
     let processed = 0;
 
     while (this.priorityChunkQueue.length > 0 && processed < processBatchSize) {
@@ -3432,17 +3779,44 @@ export class MicroVoxelWorld {
     this.pendingWaterFlowSet.clear();
     this.waterFlowStepTimer = 0;
     this.isSpawnChunkLoaded = false;
+    this._initialSpawnBubbleReady = false;
 
     const activeRad =
       this.customRenderDistance || this.radiusModes[this.radiusModeIdx].radius;
+    const isLowEndMode = this.usePotatoShader || this.cpuThreads <= 2;
+    const supportsHorizonTiles =
+      this.worldGenMode !== 'CUSTOM_GLB_MAP' &&
+      this.worldGenMode !== 'CUSTOM_HEIGHTMAP';
+    const initialPlan = computeDynamicLodPlan({
+      renderDistanceChunks: this.customRenderDistanceBig || BigInt(activeRad),
+      lodSpacing: this.lodSpacing,
+      isLowEndMode,
+      uncappedChunkLod: this.uncappedChunkLod,
+      supportsHorizonTiles,
+    });
+    const initialNested = computeNestedRingBoxesBigInt(centerCX, centerCZ, initialPlan);
+    this._horizonActive = initialPlan.rings.length > 0;
+
     const ringRad = Math.min(3, Math.max(2, activeRad));
     const maxFull3DRad = this.usePotatoShader ? 1 : 3;
 
-    // PART 1: Pre-populate terrain across the arena & structure ring first so stamping structures never gets overwritten
-    for (let dz = -ringRad; dz <= ringRad; dz++) {
-      for (let dx = -ringRad; dx <= ringRad; dx++) {
-        const cx = centerCX + dx;
-        const cz = centerCZ + dz;
+    // Cover the union of the core structure ring AND the snapped initial LOD0 box so there is NEVER an uncreated rim gap!
+    const minInitCX = Math.min(centerCX - ringRad, Number(initialNested.lod0Box.minCX));
+    const maxInitCXExcl = Math.max(
+      centerCX + ringRad + 1,
+      Number(initialNested.lod0Box.maxCXExcl),
+    );
+    const minInitCZ = Math.min(centerCZ - ringRad, Number(initialNested.lod0Box.minCZ));
+    const maxInitCZExcl = Math.max(
+      centerCZ + ringRad + 1,
+      Number(initialNested.lod0Box.maxCZExcl),
+    );
+
+    // PART 1: Pre-populate terrain across the entire spawn LOD0 bubble so structures stamp cleanly and no edge rim is missing
+    for (let cz = minInitCZ; cz < maxInitCZExcl; cz++) {
+      for (let cx = minInitCX; cx < maxInitCXExcl; cx++) {
+        const dx = cx - centerCX;
+        const dz = cz - centerCZ;
         const key = `${cx},${cz}`;
         let chunk = this.chunkMap.get(key);
         const cheb = Math.max(Math.abs(dx), Math.abs(dz));
@@ -5452,6 +5826,88 @@ export class MicroVoxelWorld {
     jobRemovals?: Map<number, number>,
   ): void {
     const _tMesh0 = typeof performance !== 'undefined' ? performance.now() : 0;
+
+    // Discard stale surface-only worker results that finish AFTER a chunk was upgraded to full 3D or modified,
+    // so stale 2D surface meshes never overwrite active 3D terrain/caves/craters!
+    if (workerRes.isSurfaceOnly && (!chunk.isSurfaceOnlyTerrain || chunk.userModified)) {
+      chunk.dirty = true;
+      chunk.dirtyBucketMask = MAT_BUCKET_ALL_MASK;
+      if (!chunk.workerPending && !chunk.inDirtyQueue) {
+        chunk.inDirtyQueue = true;
+        this.dirtyQueue.push(chunk);
+      }
+      return;
+    }
+
+    const prevLod = chunk.activeLodLevel >= 0 ? chunk.activeLodLevel : 0;
+
+    // Fast path for deferred Phase-2 background LOD1/LOD2/LOD3 builds: upload only LOD1..3 without touching LOD0!
+    if (workerRes.lod12Only) {
+      const stdOpaqueMat = this.getActiveOpaqueVoxelMaterial();
+      const m1Res = updateOrCreateDynamicMeshBuffer(
+        chunk.meshLOD1,
+        workerRes.lod1,
+        stdOpaqueMat,
+        this.scene,
+        false,
+        4096,
+        chunk.boundingSphere,
+      );
+      chunk.meshLOD1 = m1Res.mesh;
+      if (chunk.meshLOD1) chunk.meshLOD1.castShadow = true;
+      chunk.lod1Quads = workerRes.lod1.mergedQuads;
+
+      const m2Res = updateOrCreateDynamicMeshBuffer(
+        chunk.meshLOD2,
+        workerRes.lod2,
+        stdOpaqueMat,
+        this.scene,
+        false,
+        2048,
+        chunk.boundingSphere,
+      );
+      chunk.meshLOD2 = m2Res.mesh;
+      if (chunk.meshLOD2) chunk.meshLOD2.castShadow = false;
+      chunk.lod2Quads = workerRes.lod2.mergedQuads;
+
+      const m3Res = updateOrCreateDynamicMeshBuffer(
+        chunk.meshLOD3,
+        workerRes.lod3,
+        stdOpaqueMat,
+        this.scene,
+        false,
+        1024,
+        chunk.boundingSphere,
+      );
+      chunk.meshLOD3 = m3Res.mesh;
+      if (chunk.meshLOD3) chunk.meshLOD3.castShadow = false;
+      chunk.lod3Quads = workerRes.lod3?.mergedQuads || 0;
+
+      chunk.lod12Built = true;
+      this.setChunkLodLevel(chunk, prevLod as 0 | 1 | 2 | 3);
+      if (_tMesh0 > 0) {
+        perfProfiler.recordChunkMeshing(performance.now() - _tMesh0);
+      }
+      return;
+    }
+
+    // Attach zero-copy worker-generated surface terrain buffers (non-SAB Transferable path)
+    // or metadata (both SAB and Transferable paths) to the single VoxelWorld chunk slot!
+    if (workerRes.generatedMinY !== undefined && chunk.isSurfaceOnlyTerrain && !chunk.userModified) {
+      if (workerRes.generatedSurfaceVoxels) {
+        chunk.voxels = workerRes.generatedSurfaceVoxels;
+      }
+      if (workerRes.generatedSurfaceHeightMap) {
+        chunk.surfaceHeightMap = workerRes.generatedSurfaceHeightMap;
+      }
+      chunk.minY = workerRes.generatedMinY;
+      chunk.maxY = workerRes.generatedMaxY ?? chunk.maxY;
+      chunk.hasTranslucent = workerRes.generatedHasTranslucent ?? chunk.hasTranslucent;
+      chunk.transMinY = workerRes.generatedTransMinY ?? chunk.transMinY;
+      chunk.transMaxY = workerRes.generatedTransMaxY ?? chunk.transMaxY;
+      chunk.terrainPopulated = true;
+    }
+
     // Commit the deferred large-destruction voxel removals that were snapshotted for this worker job
     // at the EXACT same moment the new worker mesh is swapped in so visual and physics always agree!
     if (jobRemovals && jobRemovals.size > 0) {
@@ -5460,7 +5916,6 @@ export class MicroVoxelWorld {
       chunk.commitPendingRemovals();
     }
 
-    const prevLod = chunk.activeLodLevel >= 0 ? chunk.activeLodLevel : 0;
     const isLod12Deferred = workerRes.lod12Deferred === true;
 
     // #8: Update only the rebuilt material bucket(s) in `chunk.cachedOpaqueBuckets`,
@@ -5493,18 +5948,19 @@ export class MicroVoxelWorld {
     chunk.rawFaces = mergedOpaquePayload.rawFaces + transRawFaces;
     chunk.mergedQuads = mergedOpaquePayload.mergedQuads + transMergedQuads;
 
-    // #1: Update existing GPU BufferAttributes in-place via setDrawRange(0, newIndexCount) — never recreate BufferGeometry!
+    // #1: Update existing / pooled GPU BufferAttributes in-place via setDrawRange(0, newIndexCount)!
     if ((workerRes.dirtyBucketMask & 0b0111) !== 0) {
       const activeOpaqueMat = chunk.isBloomMaterialAttached && chunk.mesh
         ? (chunk.mesh.material as THREE.Material)
         : this.getActiveOpaqueVoxelMaterial();
+      const lod0Cap = workerRes.isSurfaceOnly ? 8192 : 16384;
       const m0Res = updateOrCreateDynamicMeshBuffer(
         chunk.mesh,
         mergedOpaquePayload,
         activeOpaqueMat,
         this.scene,
         false,
-        24576,
+        lod0Cap,
         chunk.boundingSphere,
       );
       chunk.mesh = m0Res.mesh;
@@ -5519,13 +5975,12 @@ export class MicroVoxelWorld {
           stdOpaqueMat,
           this.scene,
           false,
-          8192,
+          4096,
           chunk.boundingSphere,
         );
         chunk.meshLOD1 = m1Res.mesh;
         if (chunk.meshLOD1) chunk.meshLOD1.castShadow = true;
-        chunk.lod1Quads =
-          workerRes.lod1.mergedQuads + (workerRes.transLod1?.mergedQuads || 0);
+        chunk.lod1Quads = workerRes.lod1.mergedQuads;
 
         const m2Res = updateOrCreateDynamicMeshBuffer(
           chunk.meshLOD2,
@@ -5533,13 +5988,25 @@ export class MicroVoxelWorld {
           stdOpaqueMat,
           this.scene,
           false,
-          4096,
+          2048,
           chunk.boundingSphere,
         );
         chunk.meshLOD2 = m2Res.mesh;
         if (chunk.meshLOD2) chunk.meshLOD2.castShadow = false;
-        chunk.lod2Quads =
-          workerRes.lod2.mergedQuads + (workerRes.transLod2?.mergedQuads || 0);
+        chunk.lod2Quads = workerRes.lod2.mergedQuads;
+
+        const m3Res = updateOrCreateDynamicMeshBuffer(
+          chunk.meshLOD3,
+          workerRes.lod3,
+          stdOpaqueMat,
+          this.scene,
+          false,
+          1024,
+          chunk.boundingSphere,
+        );
+        chunk.meshLOD3 = m3Res.mesh;
+        if (chunk.meshLOD3) chunk.meshLOD3.castShadow = false;
+        chunk.lod3Quads = workerRes.lod3?.mergedQuads || 0;
       }
     }
 
@@ -5559,41 +6026,10 @@ export class MicroVoxelWorld {
         chunk.transMesh.userData.mergedQuads = workerRes.transLod0?.mergedQuads || 0;
       }
       if (tm0Res.updatedInPlace) chunk.inPlaceBufferUpdates++;
-
-      if (!isLod12Deferred) {
-        const tm1Res = updateOrCreateDynamicMeshBuffer(
-          chunk.transMeshLOD1,
-          workerRes.transLod1,
-          this.sharedTranslucentMaterial,
-          this.scene,
-          true,
-          4096,
-          chunk.boundingSphere,
-        );
-        chunk.transMeshLOD1 = tm1Res.mesh;
-
-        const tm2Res = updateOrCreateDynamicMeshBuffer(
-          chunk.transMeshLOD2,
-          workerRes.transLod2,
-          this.sharedTranslucentMaterial,
-          this.scene,
-          true,
-          2048,
-          chunk.boundingSphere,
-        );
-        chunk.transMeshLOD2 = tm2Res.mesh;
-      }
     }
 
-    if (!isLod12Deferred) {
-      chunk.lod12Built = true;
-    }
-    if (workerRes.isSurfaceOnly) {
-      chunk.isSurfaceOnlyMesh = true;
-      chunk.lod12Built = true;
-    } else {
-      chunk.isSurfaceOnlyMesh = false;
-    }
+    chunk.lod12Built = !isLod12Deferred;
+    chunk.isSurfaceOnlyMesh = Boolean(workerRes.isSurfaceOnly);
 
     // If progressive water flow placed water voxels into this chunk while the worker was running,
     // immediately sync the live translucent water mesh so worker snapshots never overwrite flowing water!
@@ -5601,7 +6037,7 @@ export class MicroVoxelWorld {
       this.rebuildChunkWaterOnly(chunk);
     }
 
-    this.setChunkLodLevel(chunk, prevLod as 0 | 1 | 2);
+    this.setChunkLodLevel(chunk, prevLod as 0 | 1 | 2 | 3);
     chunk.hasBuiltMesh = true;
     if (chunk.state === ChunkState.QUEUED || chunk.state === ChunkState.GENERATING || chunk.state === ChunkState.WIREFRAME_READY) {
       if (chunk.wireMesh) {
@@ -5621,9 +6057,68 @@ export class MicroVoxelWorld {
       }
     }
     this.flushPendingTerrainEntitiesForChunk(chunk);
+    if (chunk.userModified) {
+      this.captureModifiedChunkStamp(chunk);
+    }
     if (_tMesh0 > 0) {
       perfProfiler.recordChunkMeshing(performance.now() - _tMesh0);
     }
+  }
+
+  /**
+   * Captures a compact 16x16 (~768-byte) surface height & material stamp of a player-modified chunk
+   * so craters, trenches, and player-built structures persist across every distant mega-tile LOD ring.
+   */
+  private captureModifiedChunkStamp(chunk: MicroVoxelChunk): void {
+    if (!this.horizonManager) return;
+    const heights = new Uint16Array(256);
+    const mats = new Uint8Array(256);
+    const isFull3D =
+      !chunk.isSurfaceOnlyTerrain &&
+      chunk.voxels.length === CHUNK_X * CHUNK_Y * CHUNK_Z;
+    const vox = chunk.voxels;
+    const hMap = chunk.surfaceHeightMap;
+    const scanMaxY = Math.min(CHUNK_Y - 1, Math.max(chunk.maxY, WATER_VY + 4));
+
+    for (let sz = 0; sz < 16; sz++) {
+      const lz = (sz << 2) + 2;
+      const rowOff = sz << 4;
+      for (let sx = 0; sx < 16; sx++) {
+        const lx = (sx << 2) + 2;
+        const idx = rowOff + sx;
+        if (isFull3D) {
+          let topVY = 0;
+          let topMat: number = MAT.AIR;
+          const colBase = lx + CHUNK_X * CHUNK_Y * lz;
+          for (let vy = scanMaxY; vy >= 0; vy--) {
+            const m = vox[colBase + CHUNK_X * vy];
+            if (m !== MAT.AIR && m !== MAT.WATER_VOX) {
+              topVY = vy;
+              topMat = m;
+              break;
+            }
+          }
+          heights[idx] = topVY;
+          mats[idx] = topMat;
+        } else {
+          const topVY = hMap[lx + CHUNK_X * lz];
+          heights[idx] = topVY;
+          mats[idx] =
+            topVY > 0
+              ? vox[lx + CHUNK_X * (SURFACE_CHUNK_Y - 1 + SURFACE_CHUNK_Y * lz)]
+              : MAT.AIR;
+        }
+      }
+    }
+
+    const stamp: ModifiedChunkSurfaceStamp = {
+      cx: chunk.cx,
+      cz: chunk.cz,
+      heights16: heights,
+      mats16: mats,
+      version: chunk.version,
+    };
+    this.horizonManager.setModifiedChunkStamp(stamp);
   }
 
   /**
@@ -5644,53 +6139,78 @@ export class MicroVoxelWorld {
     this.rebuildChunk(chunk, lod0Only);
   }
 
-  rebuildChunkAsync(chunk: MicroVoxelChunk, forceLod0Only?: boolean): void {
+  rebuildChunkAsync(
+    chunk: MicroVoxelChunk,
+    forceLod0Only?: boolean,
+    priorityScore = 100,
+    lod12Only = false,
+  ): void {
     const hasPendingDestruction = chunk.pendingRemovals.size > 0;
     if (chunk.isSurfaceOnlyTerrain && (hasPendingDestruction || chunk.userModified)) {
       this.ensureFullChunkTerrain(chunk);
     }
     if (chunk.workerPending) {
-      chunk.dirty = true;
+      if (!lod12Only) {
+        chunk.dirty = true;
+      }
       return;
     }
-    chunk.dirty = false;
+    if (!lod12Only) {
+      chunk.dirty = false;
+    }
     chunk.workerPending = true;
     const jobVersion = chunk.version;
     const isSurfOnlyJob =
-      (chunk.isSurfaceOnlyTerrain || chunk.minY >= 38) &&
+      chunk.isSurfaceOnlyTerrain &&
       !chunk.userModified &&
       !hasPendingDestruction &&
       this.worldGenMode !== 'CUSTOM_GLB_MAP';
+    const effectiveLod12Only = lod12Only && !hasPendingDestruction && chunk.hasBuiltMesh;
     const jobRemovals = hasPendingDestruction
       ? new Map(chunk.pendingRemovals)
       : undefined;
-    if (hasPendingDestruction || chunk.userModified) {
+    if (!effectiveLod12Only && (hasPendingDestruction || chunk.userModified)) {
       chunk.cachedOpaqueBuckets = [null, null, null];
     }
     const missingCachedBucket =
       !chunk.cachedOpaqueBuckets[0] ||
       !chunk.cachedOpaqueBuckets[1] ||
       !chunk.cachedOpaqueBuckets[2];
-    const requestedBucketMask =
-      hasPendingDestruction ||
-      chunk.userModified ||
-      !chunk.hasBuiltMesh ||
-      chunk.isSurfaceOnlyMesh ||
-      missingCachedBucket ||
-      chunk.dirtyBucketMask === 0
+    const requestedBucketMask = effectiveLod12Only
+      ? 0b0111
+      : hasPendingDestruction ||
+          chunk.userModified ||
+          !chunk.hasBuiltMesh ||
+          chunk.isSurfaceOnlyMesh ||
+          missingCachedBucket ||
+          chunk.dirtyBucketMask === 0
         ? MAT_BUCKET_ALL_MASK
         : chunk.dirtyBucketMask;
-    chunk.dirtyBucketMask = 0;
+    if (!effectiveLod12Only) {
+      chunk.dirtyBucketMask = 0;
+    }
 
-    // Defer LOD1/LOD2 generation if not all chunks have reached LOD0 MESH_READY yet
-    const lod0Only =
-      isSurfOnlyJob ||
-      (forceLod0Only !== undefined
-        ? forceLod0Only
-        : !this.areAllChunksLod0MeshReady());
+    // Defer LOD1/LOD2/LOD3 generation for full 3D chunks until LOD0 ready; surface-only chunks build cheap LOD1/2/3 directly!
+    const lod0Only = effectiveLod12Only
+      ? false
+      : isSurfOnlyJob ||
+        (forceLod0Only !== undefined
+          ? forceLod0Only
+          : !this.areAllChunksLod0MeshReady());
 
-    // Pass `chunk.voxels` + `jobRemovals` directly to the worker pool so pending removals
-    // are masked in-place inside the worker's SharedArrayBuffer / transferable copy (zero 819KB main-thread clone!)
+    const generateInWorker =
+      isSurfOnlyJob &&
+      !effectiveLod12Only &&
+      !chunk.terrainPopulated &&
+      this.canUseWorkerProceduralSurfaceGen();
+    const useSharedSlab =
+      isSurfOnlyJob &&
+      chunk.isSurfaceOnlyTerrain &&
+      chunk.voxels.length === CHUNK_X * SURFACE_CHUNK_Y * CHUNK_Z &&
+      this.voxelWorld.usesSharedSurfaceSlab &&
+      this.workerPool.hasSharedSurfaceSlab &&
+      chunk.slotIndex < this.voxelWorld.surfaceSlabCapacity;
+
     this.workerPool
       .enqueueChunkJob(
         chunk.cx,
@@ -5709,8 +6229,18 @@ export class MicroVoxelWorld {
         isSurfOnlyJob ? undefined : this.extractNeighborBoundarySlices(chunk),
         jobRemovals,
         isSurfOnlyJob,
-        isSurfOnlyJob ? chunk.surfaceHeightMap : undefined,
-        isSurfOnlyJob ? this.extractNeighborSurfaceHeights(chunk) : undefined,
+        isSurfOnlyJob && !generateInWorker ? chunk.surfaceHeightMap : undefined,
+        isSurfOnlyJob && !generateInWorker ? this.extractNeighborSurfaceHeights(chunk) : undefined,
+        {
+          priorityScore: hasPendingDestruction ? -500 : priorityScore,
+          slotIndex: chunk.slotIndex,
+          useSharedSlab,
+          generateSurfaceTerrain: generateInWorker,
+          worldGenMode: generateInWorker ? this.worldGenMode : undefined,
+          flatBaseplateMat: generateInWorker ? this.flatBaseplateMat : undefined,
+          buildSurfaceLods: isSurfOnlyJob && !this._horizonActive,
+          lod12Only: effectiveLod12Only,
+        },
       )
       .then((workerRes) => {
         chunk.workerPending = false;
@@ -5718,9 +6248,9 @@ export class MicroVoxelWorld {
           return;
         }
         if (hasPendingDestruction || chunk.pendingRemovals.size > 0) {
-          // For large destruction (radius > 2), remove the voxels + swap the mesh at the EXACT same time
-          // the moment the worker completes!
-          this.applyWorkerPayloadToChunk(chunk, workerRes, jobRemovals);
+          // Route destruction commits to the high-priority front of the budgeted commit queue
+          // so explosions stay snappy without spiking a single frame when many chunks finish together!
+          this.completedWorkerQueue.unshift({ chunk, res: workerRes, jobRemovals });
         } else {
           this.completedWorkerQueue.push({ chunk, res: workerRes });
         }
@@ -5728,7 +6258,7 @@ export class MicroVoxelWorld {
           chunk.dirty = true;
           chunk.dirtyBucketMask = MAT_BUCKET_ALL_MASK;
           if (chunk.pendingRemovals.size > 0 || chunk.userModified) {
-            this.rebuildChunkAsync(chunk, true);
+            this.rebuildChunkAsync(chunk, true, -250);
           } else if (!chunk.inDirtyQueue) {
             chunk.inDirtyQueue = true;
             this.dirtyQueue.push(chunk);
@@ -5738,6 +6268,9 @@ export class MicroVoxelWorld {
       .catch(() => {
         chunk.workerPending = false;
         chunk.dirtyBucketMask |= requestedBucketMask;
+        if (!chunk.hasBuiltMesh) {
+          chunk.dirty = true;
+        }
         if (chunk.dirty && !chunk.inDirtyQueue) {
           chunk.inDirtyQueue = true;
           this.dirtyQueue.push(chunk);
@@ -5871,8 +6404,8 @@ export class MicroVoxelWorld {
       if (tm0Res.updatedInPlace) chunk.inPlaceBufferUpdates++;
     }
 
-    // Invalidate stale LOD1/LOD2 meshes when rebuilding synchronously on main thread so setChunkLodLevel
-    // always displays the fresh LOD0 mesh until a background worker regenerates LOD1/LOD2
+    // Invalidate stale LOD1/LOD2/LOD3 meshes when rebuilding synchronously on main thread so setChunkLodLevel
+    // always displays the fresh LOD0 mesh until a background worker regenerates LOD1/LOD2/LOD3
     if (chunk.meshLOD1) {
       chunk.meshLOD1.visible = false;
       chunk.meshLOD1.userData.hasActiveVerts = false;
@@ -5881,10 +6414,14 @@ export class MicroVoxelWorld {
       chunk.meshLOD2.visible = false;
       chunk.meshLOD2.userData.hasActiveVerts = false;
     }
+    if (chunk.meshLOD3) {
+      chunk.meshLOD3.visible = false;
+      chunk.meshLOD3.userData.hasActiveVerts = false;
+    }
 
     this.setChunkLodLevel(
       chunk,
-      (chunk.activeLodLevel >= 0 ? chunk.activeLodLevel : 0) as 0 | 1 | 2,
+      (chunk.activeLodLevel >= 0 ? chunk.activeLodLevel : 0) as 0 | 1 | 2 | 3,
     );
     chunk.hasBuiltMesh = true;
     chunk.isSurfaceOnlyMesh = false;
@@ -5900,6 +6437,9 @@ export class MicroVoxelWorld {
       }
     }
     this.flushPendingTerrainEntitiesForChunk(chunk);
+    if (chunk.userModified) {
+      this.captureModifiedChunkStamp(chunk);
+    }
     if (_tMesh0 > 0) {
       perfProfiler.recordChunkMeshing(performance.now() - _tMesh0);
     }
@@ -5917,7 +6457,7 @@ export class MicroVoxelWorld {
     chunk.dirty = false;
     chunk.dirtyBucketMask = 0;
     chunk.version++;
-    chunk.lod12Built = true; // Top-surface mesh is already ultra-lightweight (~300-600 tris), no LOD1/LOD2 worker needed!
+    chunk.lod12Built = !this.workerPool.hasDedicatedWorkers;
     chunk.cachedOpaqueBuckets = [null, null, null];
 
     const getBoundarySurfVY = (lx: number, lz: number): number => {
@@ -5940,34 +6480,12 @@ export class MicroVoxelWorld {
         nlz -= CHUNK_Z;
       }
       const neighbor = this.chunkMap.get(`${ncx},${ncz}`);
-      // Step 2: If the neighboring chunk doesn't exist yet (not generated),
+      // If the neighboring chunk doesn't exist yet (not generated),
       // DON'T cull the face — return 0 so the entire boundary wall is rendered conservatively!
       if (!neighbor || !neighbor.terrainPopulated) {
         return 0;
       }
-      const nColIdx = (nlx & 63) + ((nlz & 63) << 6);
-      const nSurfVY = neighbor.surfaceHeightMap[nColIdx];
-      if (neighbor.isSurfaceOnlyTerrain && !neighbor.userModified) {
-        return nSurfVY;
-      }
-      // Step 1: Neighbor is a 3D volumetric chunk (may contain caves, tunnels, or craters on the border).
-      // Find the highest continuous opaque voxel from vy = 1 up to nSurfVY so we never cull across a cave mouth or crater!
-      const nVox = neighbor.voxels;
-      const hasPending = neighbor.pendingRemovals.size > 0;
-      const colBase = (nlx & 63) + CHUNK_X * CHUNK_Y * (nlz & 63);
-      let solidTop = 0;
-      for (let vy = 1; vy <= nSurfVY; vy++) {
-        const flatIdx = colBase + vy * CHUNK_X;
-        const m =
-          hasPending && neighbor.pendingRemovals.has(flatIdx)
-            ? (neighbor.pendingRemovals.get(flatIdx) ?? MAT.AIR)
-            : nVox[flatIdx];
-        if (m === MAT.AIR || isTranslucentVoxelMat(m)) {
-          break;
-        }
-        solidTop = vy;
-      }
-      return solidTop;
+      return this.getNeighborContinuousSolidTopVY(neighbor, nlx, nlz);
     };
 
     const opaquePayload = greedyMeshTopSurfaceOnly(
@@ -6049,6 +6567,10 @@ export class MicroVoxelWorld {
       chunk.meshLOD2.visible = false;
       chunk.meshLOD2.userData.hasActiveVerts = false;
     }
+    if (chunk.meshLOD3) {
+      chunk.meshLOD3.visible = false;
+      chunk.meshLOD3.userData.hasActiveVerts = false;
+    }
 
     this.setChunkLodLevel(chunk, 0);
     chunk.hasBuiltMesh = true;
@@ -6071,7 +6593,7 @@ export class MicroVoxelWorld {
     }
   }
 
-  private setChunkLodLevel(chunk: MicroVoxelChunk, level: -1 | 0 | 1 | 2): number {
+  private setChunkLodLevel(chunk: MicroVoxelChunk, level: -1 | 0 | 1 | 2 | 3): number {
     if (!chunk.mesh && !chunk.transMesh) return 0;
 
     if (level === -1) {
@@ -6080,6 +6602,7 @@ export class MicroVoxelWorld {
       if (chunk.mesh) chunk.mesh.visible = false;
       if (chunk.meshLOD1) chunk.meshLOD1.visible = false;
       if (chunk.meshLOD2) chunk.meshLOD2.visible = false;
+      if (chunk.meshLOD3) chunk.meshLOD3.visible = false;
       if (chunk.transMesh) chunk.transMesh.visible = false;
       if (chunk.transMeshLOD1) chunk.transMeshLOD1.visible = false;
       if (chunk.transMeshLOD2) chunk.transMeshLOD2.visible = false;
@@ -6089,44 +6612,35 @@ export class MicroVoxelWorld {
     const hasLod0 = Boolean(chunk.mesh && chunk.mesh.userData.hasActiveVerts !== false);
     const hasLod1 = Boolean(chunk.meshLOD1 && chunk.meshLOD1.userData.hasActiveVerts !== false);
     const hasLod2 = Boolean(chunk.meshLOD2 && chunk.meshLOD2.userData.hasActiveVerts !== false);
+    const hasLod3 = Boolean(chunk.meshLOD3 && chunk.meshLOD3.userData.hasActiveVerts !== false);
 
-    const effectiveLevel: 0 | 1 | 2 =
-      level === 1 && hasLod1
-        ? 1
-        : level === 2 && hasLod2
-          ? 2
-          : 0;
+    let effectiveLevel: 0 | 1 | 2 | 3 = 0;
+    if (level === 3) {
+      effectiveLevel = hasLod3 ? 3 : hasLod2 ? 2 : hasLod1 ? 1 : 0;
+    } else if (level === 2) {
+      effectiveLevel = hasLod2 ? 2 : hasLod1 ? 1 : 0;
+    } else if (level === 1) {
+      effectiveLevel = hasLod1 ? 1 : 0;
+    }
 
     chunk.activeLodLevel = effectiveLevel;
     this.voxelWorld.setChunkVisible(chunk.slotIndex, true);
     if (chunk.mesh) chunk.mesh.visible = effectiveLevel === 0 && hasLod0;
     if (chunk.meshLOD1) chunk.meshLOD1.visible = effectiveLevel === 1 && hasLod1;
     if (chunk.meshLOD2) chunk.meshLOD2.visible = effectiveLevel === 2 && hasLod2;
+    if (chunk.meshLOD3) chunk.meshLOD3.visible = effectiveLevel === 3 && hasLod3;
 
     if (chunk.transMesh) {
       const hasTransLod0 = chunk.transMesh.userData.hasActiveVerts !== false;
-      const hasTransLod1 = Boolean(
-        chunk.transMeshLOD1 && chunk.transMeshLOD1.userData.hasActiveVerts !== false,
-      );
-      const hasTransLod2 = Boolean(
-        chunk.transMeshLOD2 && chunk.transMeshLOD2.userData.hasActiveVerts !== false,
-      );
-      // Always prefer full-resolution LOD0 translucent water mesh when available so shoreline waves never pop across LOD boundaries
-      const transEff = hasTransLod0
-        ? 0
-        : effectiveLevel === 1 && hasTransLod1
-          ? 1
-          : effectiveLevel === 2 && hasTransLod2
-            ? 2
-            : 0;
-      chunk.transMesh.visible = transEff === 0 && hasTransLod0;
-      if (chunk.transMeshLOD1) chunk.transMeshLOD1.visible = transEff === 1 && hasTransLod1;
-      if (chunk.transMeshLOD2) chunk.transMeshLOD2.visible = transEff === 2 && hasTransLod2;
+      chunk.transMesh.visible = hasTransLod0;
+      if (chunk.transMeshLOD1) chunk.transMeshLOD1.visible = false;
+      if (chunk.transMeshLOD2) chunk.transMeshLOD2.visible = false;
     }
 
     if (effectiveLevel === 0) return chunk.mergedQuads;
     if (effectiveLevel === 1) return chunk.lod1Quads || chunk.mergedQuads;
-    return chunk.lod2Quads || chunk.mergedQuads;
+    if (effectiveLevel === 2) return chunk.lod2Quads || chunk.mergedQuads;
+    return chunk.lod3Quads || chunk.lod2Quads || chunk.mergedQuads;
   }
 
   evaluateCaveAtmosphereAt(
@@ -6514,9 +7028,49 @@ export class MicroVoxelWorld {
     let traveledDist = startOffset;
     const maxSteps = Math.ceil(maxDist / VOXEL_SIZE) + 2;
 
+    let cachedCX = -99999999;
+    let cachedCZ = -99999999;
+    let cachedChunk: MicroVoxelChunk | undefined;
+
     for (let i = 0; i < maxSteps && traveledDist < maxDist; i++) {
       if (vy >= 1 && vy < CHUNK_Y - 1) {
-        const mat = this.getVoxel(vx, vy, vz);
+        const cx = vx >> 6;
+        const cz = vz >> 6;
+        if (cx !== cachedCX || cz !== cachedCZ) {
+          cachedCX = cx;
+          cachedCZ = cz;
+          if (cx >= 0 && cx < WORLD_CHUNKS_X && cz >= 0 && cz < WORLD_CHUNKS_Z) {
+            cachedChunk = this.chunks[cx + cz * WORLD_CHUNKS_X];
+          } else {
+            cachedChunk = this.chunkMap.get(`${cx},${cz}`);
+          }
+        } else {
+          unifiedEngineTelemetry.cachedChunkRaycastSteps++;
+        }
+
+        let mat: number = MAT.AIR;
+        if (cachedChunk) {
+          if (cachedChunk.terrainPopulated && vy > cachedChunk.maxY) {
+            // Fast hierarchical Y-bound skip: ray step is above the highest solid/water voxel in this chunk
+            unifiedEngineTelemetry.skippedAirRaycastSteps++;
+          } else if (
+            cachedChunk.terrainPopulated &&
+            cachedChunk.isSurfaceOnlyTerrain &&
+            !cachedChunk.userModified
+          ) {
+            const lx = vx & 63;
+            const lz = vz & 63;
+            const surfVY = cachedChunk.surfaceHeightMap[lx + (lz << 6)];
+            if (vy > surfVY) {
+              unifiedEngineTelemetry.skippedAirRaycastSteps++;
+            } else {
+              mat = cachedChunk.sampleSurfaceCompactVoxel(lx, vy, lz);
+            }
+          } else {
+            mat = this.getVoxel(vx, vy, vz);
+          }
+        }
+
         if (mat !== MAT.AIR && mat !== MAT.WATER_VOX) {
           _rayHitWorldPos.set(
             (vx - halfVX + 0.5) * VOXEL_SIZE,
@@ -6873,6 +7427,11 @@ export class MicroVoxelWorld {
       typeof performance === 'undefined' ||
       performance.now() - startMs < chunkBudgetMs;
 
+    const velX = focusX - this.lastFocusX;
+    const velZ = focusZ - this.lastFocusZ;
+    const velLen = Math.hypot(velX, velZ);
+    const velDirX = velLen > 0.05 ? velX / velLen : 0;
+    const velDirZ = velLen > 0.05 ? velZ / velLen : 0;
     this.lastFocusX = focusX;
     this.lastFocusZ = focusZ;
 
@@ -6951,19 +7510,176 @@ export class MicroVoxelWorld {
     }
 
     const isMassDirtySpike = this.dirtyQueue.length > 50;
+    const isLowEndMode = this.usePotatoShader || this.cpuThreads <= 2;
+
+    const supportsHorizonTiles = true;
+    const mapAltChunks = Math.max(
+      dynamicMapRad,
+      baseRad,
+      Math.min(1000000000, Math.ceil((camAlt * 2.4 * Math.max(1, camAspect)) / 16)),
+    );
+    const effectiveRenderDistBig: bigint = isMapFastLoad
+      ? BigInt(mapAltChunks)
+      : this.customRenderDistanceBig > 0n
+        ? this.customRenderDistanceBig
+        : BigInt(baseRad);
+    if (isMapFastLoad) {
+      this.activeMapRenderRadiusChunks = mapAltChunks;
+    }
+    const lodPlan = computeDynamicLodPlan({
+      renderDistanceChunks: effectiveRenderDistBig,
+      lodSpacing: this.lodSpacing,
+      isLowEndMode,
+      uncappedChunkLod: this.uncappedChunkLod,
+      supportsHorizonTiles,
+    });
+    const nestedBoxesBig = computeNestedRingBoxesBigInt(centerCX, centerCZ, lodPlan);
+    const lod0BoxNum: ChunkBox = {
+      minCX: Number(nestedBoxesBig.lod0Box.minCX),
+      maxCXExcl: Number(nestedBoxesBig.lod0Box.maxCXExcl),
+      minCZ: Number(nestedBoxesBig.lod0Box.minCZ),
+      maxCZExcl: Number(nestedBoxesBig.lod0Box.maxCZExcl),
+    };
+    const horizonActive = lodPlan.rings.length > 0;
+    this._horizonActive = horizonActive;
+    this.activeTotalLodLayers = lodPlan.totalLodLayers;
+    this.activeScaleBands = lodPlan.activeScaleBands;
+    if (this.mapHorizonSkirt) {
+      this.mapHorizonSkirt.visible = isMapFastLoad && !horizonActive;
+    }
+
+    // Compute Optical Zoom LOD0 Focus Box (snapped to LOD1's 2x2 chunk grid for 100% watertight tile cutout!)
+    let zoomLod0BoxBig: ChunkBoxBigInt | null = null;
+    let zoomLod0BoxNum: ChunkBox | null = null;
+    if (!isMapFastLoad && this.zoomFocusWorld !== null) {
+      const rawZoomCX = Math.floor(
+        this.zoomFocusWorld.x / (CHUNK_X * VOXEL_SIZE) + WORLD_CHUNKS_X / 2,
+      );
+      const rawZoomCZ = Math.floor(
+        this.zoomFocusWorld.z / (CHUNK_Z * VOXEL_SIZE) + WORLD_CHUNKS_Z / 2,
+      );
+      if (
+        this._lastZoomCX === -999999 ||
+        Math.hypot(rawZoomCX - this._lastZoomCX, rawZoomCZ - this._lastZoomCZ) >= 1.15
+      ) {
+        this._lastZoomCX = rawZoomCX;
+        this._lastZoomCZ = rawZoomCZ;
+      }
+      const zoomSnapMult = lodPlan.rings.length > 0 ? lodPlan.rings[0].tileChunksBig : 2n;
+      const candidateZoomBoxBig = computeZoomedLod0BoxBigInt(
+        this._lastZoomCX,
+        this._lastZoomCZ,
+        isLowEndMode ? 1 : 2,
+        zoomSnapMult,
+      );
+      const candidateZoomBoxNum: ChunkBox = {
+        minCX: Number(candidateZoomBoxBig.minCX),
+        maxCXExcl: Number(candidateZoomBoxBig.maxCXExcl),
+        minCZ: Number(candidateZoomBoxBig.minCZ),
+        maxCZExcl: Number(candidateZoomBoxBig.maxCZExcl),
+      };
+      // Only activate secondary zoomed LOD0 box if it extends outside the player's local lod0BoxNum
+      const fullyInsidePlayerLod0 =
+        candidateZoomBoxNum.minCX >= lod0BoxNum.minCX &&
+        candidateZoomBoxNum.maxCXExcl <= lod0BoxNum.maxCXExcl &&
+        candidateZoomBoxNum.minCZ >= lod0BoxNum.minCZ &&
+        candidateZoomBoxNum.maxCZExcl <= lod0BoxNum.maxCZExcl;
+      if (!fullyInsidePlayerLod0) {
+        zoomLod0BoxBig = candidateZoomBoxBig;
+        zoomLod0BoxNum = candidateZoomBoxNum;
+      }
+    } else {
+      this._lastZoomCX = -999999;
+      this._lastZoomCZ = -999999;
+    }
+
+    if (!isMapFastLoad && this.skyDome) {
+      const targetSkyScale = lodPlan.skyDomeScale;
+      if (Math.abs(this.skyDome.scale.x - targetSkyScale) > 0.01) {
+        this.skyDome.scale.setScalar(targetSkyScale);
+        this.skyDome.updateMatrix();
+      }
+    }
+
+    const lod0ScanRad = horizonActive
+      ? Math.max(
+          Math.abs(lod0BoxNum.minCX - centerCX),
+          Math.abs(lod0BoxNum.maxCXExcl - 1 - centerCX),
+          Math.abs(lod0BoxNum.minCZ - centerCZ),
+          Math.abs(lod0BoxNum.maxCZExcl - 1 - centerCZ),
+        )
+      : maxRad;
+
+    // Check how many chunks inside the crisp LOD0 bubble (and active zoomed LOD0 box) still lack a built mesh
+    let missingLod0Count = 0;
+    let missingZoomLod0Count = 0;
+    if (!isMapFastLoad) {
+      const b0 = lod0BoxNum;
+      for (let cz = b0.minCZ; cz < b0.maxCZExcl; cz++) {
+        for (let cx = b0.minCX; cx < b0.maxCXExcl; cx++) {
+          const c = this.chunkMap.get(`${cx},${cz}`);
+          if (!c || !c.hasBuiltMesh) {
+            missingLod0Count++;
+          }
+        }
+      }
+      if (missingLod0Count === 0) {
+        this._initialSpawnBubbleReady = true;
+      }
+      if (zoomLod0BoxNum !== null) {
+        for (let cz = zoomLod0BoxNum.minCZ; cz < zoomLod0BoxNum.maxCZExcl; cz++) {
+          for (let cx = zoomLod0BoxNum.minCX; cx < zoomLod0BoxNum.maxCXExcl; cx++) {
+            if (isChunkInsideBox(cx, cz, b0)) continue;
+            const c = this.chunkMap.get(`${cx},${cz}`);
+            if (!c || !c.hasBuiltMesh) {
+              missingZoomLod0Count++;
+            }
+          }
+        }
+      }
+    }
+    const isBootstrappingLod0 =
+      !isMapFastLoad &&
+      (!this._initialSpawnBubbleReady || missingLod0Count > 6 || missingZoomLod0Count > 0);
+
     const chunkRebuildBudget = isMapFastLoad
       ? 24
-      : Math.min(2, Math.max(1, this.maxChunkRebuildsPerFrame));
+      : isLowEndMode
+        ? isBootstrappingLod0
+          ? 2
+          : 1
+        : isBootstrappingLod0
+          ? 6
+          : Math.min(3, Math.max(2, this.maxChunkRebuildsPerFrame));
+    // Unified per-frame worker upload budget: boost during initial spawn bubble or optical zoom lock so LOD0 fills immediately with zero gap
+    const workerCommitLimit = isMapFastLoad
+      ? 24
+      : isLowEndMode
+        ? isBootstrappingLod0
+          ? 4
+          : 1
+        : isBootstrappingLod0
+          ? 8
+          : isMassDirtySpike
+            ? 3
+            : 2;
+    const workerBudgetMs = isMapFastLoad
+      ? chunkBudgetMs
+      : isBootstrappingLod0
+        ? Math.min(chunkBudgetMs, isLowEndMode ? 3.5 : 5.5)
+        : Math.min(chunkBudgetMs, isLowEndMode ? 1.5 : 2.0);
     let appliedWorkers = 0;
     while (
       this.completedWorkerQueue.length > 0 &&
-      appliedWorkers < chunkRebuildBudget &&
-      (isMassDirtySpike || hasBudget())
+      appliedWorkers < workerCommitLimit &&
+      (appliedWorkers === 0 ||
+        typeof performance === 'undefined' ||
+        performance.now() - startMs < workerBudgetMs)
     ) {
       const item = this.completedWorkerQueue.shift()!;
       const wasStillDirty = item.chunk.dirty;
       const savedDirtyMask = item.chunk.dirtyBucketMask;
-      this.applyWorkerPayloadToChunk(item.chunk, item.res);
+      this.applyWorkerPayloadToChunk(item.chunk, item.res, item.jobRemovals);
       if (wasStillDirty && savedDirtyMask !== 0) {
         item.chunk.dirty = true;
         item.chunk.dirtyBucketMask = savedDirtyMask;
@@ -6971,9 +7687,44 @@ export class MicroVoxelWorld {
       appliedWorkers++;
     }
 
+    // Cancel stale out-of-range worker jobs whenever the player crosses a chunk boundary or changes LOD settings
+    const centerMoved =
+      centerCX !== this._lastStreamCenterCX ||
+      centerCZ !== this._lastStreamCenterCZ ||
+      maxRad !== this._lastStreamMaxRad ||
+      effectiveRenderDistBig !== this._lastStreamMaxRadBig ||
+      this.lodSpacing !== this._lastStreamLodSpacing;
+    if (centerMoved) {
+      this._lastStreamCenterCX = centerCX;
+      this._lastStreamCenterCZ = centerCZ;
+      this._lastStreamMaxRad = maxRad;
+      this._lastStreamMaxRadBig = effectiveRenderDistBig;
+      this._lastStreamLodSpacing = this.lodSpacing;
+      this._allChunksInRadiusPresent = false;
+      if (!isMapFastLoad) {
+        let cancelRad = lod0ScanRad + 1;
+        if (zoomLod0BoxNum !== null) {
+          const zoomFarCheb = Math.max(
+            Math.abs(zoomLod0BoxNum.minCX - centerCX),
+            Math.abs(zoomLod0BoxNum.maxCXExcl - centerCX),
+            Math.abs(zoomLod0BoxNum.minCZ - centerCZ),
+            Math.abs(zoomLod0BoxNum.maxCZExcl - centerCZ),
+          );
+          cancelRad = Math.max(cancelRad, zoomFarCheb + 2);
+        }
+        this.workerPool.cancelOutOfRangeJobs(centerCX, centerCZ, cancelRad);
+      }
+    }
+
     let createdThisFrame = 0;
     let immediateBuiltThisFrame = 0;
-    const maxNewChunksThisFrame = isMapFastLoad ? 44 : 2;
+    const maxNewChunksThisFrame = isMapFastLoad
+      ? 44
+      : isBootstrappingLod0
+        ? isLowEndMode
+          ? 6
+          : 16
+        : 4;
     const chunkSpanMeters = CHUNK_X * VOXEL_SIZE;
 
     // Ground level in the park is y = 14.5m (WATER_LEVEL = 14.25m); only trigger full 3D cave chunk upgrades
@@ -6983,102 +7734,247 @@ export class MicroVoxelWorld {
       camera !== undefined &&
       camera.position.y < WATER_LEVEL - 0.5;
 
-    // Scan outward from center (ring 0, ring 1, ..., maxRad) so chunks directly in the camera view load first!
-    for (let ring = 0; ring <= maxRad; ring++) {
-      for (let dz = -ring; dz <= ring; dz++) {
-        for (let dx = -ring; dx <= ring; dx++) {
-          if (Math.max(Math.abs(dx), Math.abs(dz)) !== ring) continue;
-          const cx = centerCX + dx;
-          const cz = centerCZ + dz;
+    // All real LOD0 chunks get strictly negative priority scores (-500 .. -200) so they ALWAYS beat outer horizon tiles (+600+)
+    const computeChunkPriority = (cx: number, cz: number, dx: number, dz: number, ring: number): number => {
+      let score = -500 + ring * 25 + Math.hypot(dx, dz) * 4;
+      if (camera) {
+        _tmpChunkSphere.center.set(
+          (cx - WORLD_CHUNKS_X / 2 + 0.5) * chunkSpanMeters,
+          12,
+          (cz - WORLD_CHUNKS_Z / 2 + 0.5) * chunkSpanMeters,
+        );
+        if (_frustum.intersectsSphere(_tmpChunkSphere)) {
+          score -= 35;
+        }
+      }
+      if (velLen > 0.05 && ring > 0) {
+        const dLen = Math.hypot(dx, dz) || 1;
+        const align = (dx / dLen) * velDirX + (dz / dLen) * velDirZ;
+        score -= align * 20;
+      }
+      return score;
+    };
+
+    // High-priority Optical Zoom LOD0 Focus Streamer:
+    // Streams the compact 4x4 (or 2x2 on low-end) zoomed LOD0 focus box at ultra-high priority (-560)
+    // and builds the 1-2 central crosshair chunks immediately so the zoomed sightline is instant LOD0!
+    if (zoomLod0BoxNum !== null && missingZoomLod0Count > 0) {
+      let syncCrosshairBuilt = 0;
+      const maxSyncCrosshair = isLowEndMode ? 1 : 2;
+      for (let cz = zoomLod0BoxNum.minCZ; cz < zoomLod0BoxNum.maxCZExcl; cz++) {
+        for (let cx = zoomLod0BoxNum.minCX; cx < zoomLod0BoxNum.maxCXExcl; cx++) {
+          if (isChunkInsideBox(cx, cz, lod0BoxNum)) continue;
           const inBounds =
             cx >= 0 && cx < WORLD_CHUNKS_X && cz >= 0 && cz < WORLD_CHUNKS_Z;
           const existing = inBounds
             ? this.chunks[cx + cz * WORLD_CHUNKS_X]
             : this.chunkMap.get(`${cx},${cz}`);
-          const isDirectlyUnder = dx === 0 && dz === 0;
-          const needsFull3DCaveTerrain =
-            !isMapFastLoad &&
-            this.worldGenMode !== 'FLAT_BASEPLATE' &&
-            isPlayerNearOrUnderground &&
-            ring <= 1;
+          if (existing && existing.hasBuiltMesh && !existing.dirty) {
+            if (existing.wireMesh || existing.isBloomMaterialAttached) {
+              this.disposeChunkWireAndBloom(existing);
+              existing.state = ChunkState.COMPLETE;
+            }
+            continue;
+          }
+          const zDx = cx - this._lastZoomCX;
+          const zDz = cz - this._lastZoomCZ;
+          const zCheb = Math.max(Math.abs(zDx), Math.abs(zDz));
+          const isCrosshairCenter = zCheb === 0;
+          const zoomPrio = -560 + Math.hypot(zDx, zDz) * 6;
           if (!existing) {
-            if (isMapFastLoad) {
-              // For outer rings in Map Mode, prioritize chunks that intersect the camera frustum (+36m side margin)
-              if (ring > 4 && camera) {
-                _tmpChunkSphere.center.set(
-                  (cx - WORLD_CHUNKS_X / 2 + 0.5) * chunkSpanMeters,
-                  8,
-                  (cz - WORLD_CHUNKS_Z / 2 + 0.5) * chunkSpanMeters,
-                );
-                if (!_frustum.intersectsSphere(_tmpChunkSphere)) {
-                  continue;
-                }
-              }
-              // In Map Mode, load ONLY the top visible surface layer (~0.15ms per chunk, zero underground layers!)
-              if (createdThisFrame < maxNewChunksThisFrame && hasBudget()) {
-                this.getOrCreateChunkTopSurfaceOnly(cx, cz, true);
-                createdThisFrame++;
-                immediateBuiltThisFrame++;
-              }
-            } else if (createdThisFrame < maxNewChunksThisFrame && (isDirectlyUnder || hasBudget())) {
-              if (needsFull3DCaveTerrain) {
-                const c = this.getOrCreateChunk(cx, cz, false, false);
-                if (this.workerPool.hasDedicatedWorkers) {
-                  this.rebuildChunkAsync(c, true);
-                } else {
-                  this.rebuildChunkSync(c, true);
-                }
-              } else {
-                // Populate lightweight surface heightmap on main thread, and dispatch meshing to Web Worker!
-                const c = this.getOrCreateChunkTopSurfaceOnly(
-                  cx,
-                  cz,
-                  !this.workerPool.hasDedicatedWorkers,
-                );
-                if (this.workerPool.hasDedicatedWorkers && !c.hasBuiltMesh && !c.workerPending) {
-                  this.rebuildChunkAsync(c, true);
-                }
-              }
+            if (
+              isCrosshairCenter &&
+              syncCrosshairBuilt < maxSyncCrosshair &&
+              hasBudget()
+            ) {
+              const c = this.getOrCreateChunkTopSurfaceOnly(cx, cz, true, false);
+              this.disposeChunkWireAndBloom(c);
+              c.state = ChunkState.COMPLETE;
+              syncCrosshairBuilt++;
               createdThisFrame++;
               immediateBuiltThisFrame++;
-            }
-          } else if (
-            needsFull3DCaveTerrain &&
-            existing.isSurfaceOnlyTerrain &&
-            !existing.workerPending &&
-            createdThisFrame < 1 &&
-            hasBudget()
-          ) {
-            // Upgrade nearby surface-only chunk to full 3D subterranean cave terrain (max 1 per frame, meshed in Web Worker)
-            this.ensureFullChunkTerrain(existing);
-            if (this.workerPool.hasDedicatedWorkers) {
-              this.rebuildChunkAsync(existing, true);
             } else {
-              this.rebuildChunkSync(existing, true);
+              const deferToWorker = this.canUseWorkerProceduralSurfaceGen();
+              const c = this.getOrCreateChunkTopSurfaceOnly(
+                cx,
+                cz,
+                !this.workerPool.hasDedicatedWorkers,
+                deferToWorker,
+              );
+              this.disposeChunkWireAndBloom(c);
+              if (this.workerPool.hasDedicatedWorkers && !c.hasBuiltMesh && !c.workerPending) {
+                this.rebuildChunkAsync(c, true, zoomPrio);
+              }
+              createdThisFrame++;
             }
-            createdThisFrame++;
-            immediateBuiltThisFrame++;
-          } else if (isMapFastLoad && !existing.hasBuiltMesh && !existing.workerPending && hasBudget()) {
-            this.rebuildChunkTopSurfaceOnly(existing);
-            immediateBuiltThisFrame++;
-          } else if (
-            existing.dirty &&
-            !existing.workerPending &&
-            (isDirectlyUnder || (isMapFastLoad && ring <= 1)) &&
-            immediateBuiltThisFrame < (isMapFastLoad ? 12 : 2)
-          ) {
-            if (isMapFastLoad && !existing.userModified) {
+          } else if (!existing.workerPending) {
+            this.disposeChunkWireAndBloom(existing);
+            if (
+              isCrosshairCenter &&
+              syncCrosshairBuilt < maxSyncCrosshair &&
+              existing.isSurfaceOnlyTerrain &&
+              !existing.userModified &&
+              hasBudget()
+            ) {
               this.rebuildChunkTopSurfaceOnly(existing);
+              existing.state = ChunkState.COMPLETE;
+              syncCrosshairBuilt++;
+              immediateBuiltThisFrame++;
             } else if (this.workerPool.hasDedicatedWorkers) {
-              this.rebuildChunkAsync(existing, true);
+              this.rebuildChunkAsync(existing, true, zoomPrio);
             } else if (existing.isSurfaceOnlyTerrain && !existing.userModified) {
               this.rebuildChunkTopSurfaceOnly(existing);
             } else {
-              this.rebuildChunk(existing);
+              this.rebuildChunkSync(existing, true);
             }
-            immediateBuiltThisFrame++;
           }
         }
+      }
+    }
+
+    // Skip the triple-nested ring creation scan completely when stationary and all chunks in radius are loaded!
+    const shouldRunRingScan =
+      isMapFastLoad ||
+      isPlayerNearOrUnderground ||
+      !this._allChunksInRadiusPresent ||
+      this.dirtyQueue.length > 0;
+
+    if (shouldRunRingScan) {
+      let allPresentInScan = true;
+      const circularScanRadSq = (lod0ScanRad + 0.35) * (lod0ScanRad + 0.35);
+      for (let ring = 0; ring <= lod0ScanRad; ring++) {
+        for (let dz = -ring; dz <= ring; dz++) {
+          for (let dx = -ring; dx <= ring; dx++) {
+            if (Math.max(Math.abs(dx), Math.abs(dz)) !== ring) continue;
+            const cx = centerCX + dx;
+            const cz = centerCZ + dz;
+            if (horizonActive) {
+              if (!isChunkInsideBox(cx, cz, lod0BoxNum)) continue;
+            } else if (
+              !isMapFastLoad &&
+              ring > 1 &&
+              dx * dx + dz * dz > circularScanRadSq
+            ) {
+              continue;
+            }
+            const inBounds =
+              cx >= 0 && cx < WORLD_CHUNKS_X && cz >= 0 && cz < WORLD_CHUNKS_Z;
+            const existing = inBounds
+              ? this.chunks[cx + cz * WORLD_CHUNKS_X]
+              : this.chunkMap.get(`${cx},${cz}`);
+            const isDirectlyUnder = dx === 0 && dz === 0;
+            const needsFull3DCaveTerrain =
+              !isMapFastLoad &&
+              this.worldGenMode !== 'FLAT_BASEPLATE' &&
+              isPlayerNearOrUnderground &&
+              ring <= 1;
+            if (!existing) {
+              allPresentInScan = false;
+              if (isMapFastLoad) {
+                if (ring > 4 && camera) {
+                  _tmpChunkSphere.center.set(
+                    (cx - WORLD_CHUNKS_X / 2 + 0.5) * chunkSpanMeters,
+                    8,
+                    (cz - WORLD_CHUNKS_Z / 2 + 0.5) * chunkSpanMeters,
+                  );
+                  if (!_frustum.intersectsSphere(_tmpChunkSphere)) {
+                    continue;
+                  }
+                }
+                if (createdThisFrame < maxNewChunksThisFrame && hasBudget()) {
+                  this.getOrCreateChunkTopSurfaceOnly(cx, cz, true, false);
+                  createdThisFrame++;
+                  immediateBuiltThisFrame++;
+                }
+              } else if (createdThisFrame < maxNewChunksThisFrame && (isDirectlyUnder || hasBudget())) {
+                const prio = computeChunkPriority(cx, cz, dx, dz, ring);
+                if (needsFull3DCaveTerrain) {
+                  const c = this.getOrCreateChunk(cx, cz, false, false);
+                  if (this.workerPool.hasDedicatedWorkers) {
+                    this.rebuildChunkAsync(c, true, prio);
+                  } else {
+                    this.rebuildChunkSync(c, true);
+                  }
+                } else {
+                  // Ring 0 populates immediately for instant ground physics; outer rings generate 100% off-thread in the worker!
+                  const deferToWorker = !isDirectlyUnder && this.canUseWorkerProceduralSurfaceGen();
+                  const c = this.getOrCreateChunkTopSurfaceOnly(
+                    cx,
+                    cz,
+                    !this.workerPool.hasDedicatedWorkers,
+                    deferToWorker,
+                  );
+                  if (this.workerPool.hasDedicatedWorkers && !c.hasBuiltMesh && !c.workerPending) {
+                    this.rebuildChunkAsync(c, true, prio);
+                  }
+                }
+                createdThisFrame++;
+                immediateBuiltThisFrame++;
+              }
+            } else if (
+              needsFull3DCaveTerrain &&
+              existing.isSurfaceOnlyTerrain &&
+              !existing.workerPending &&
+              createdThisFrame < 1 &&
+              hasBudget()
+            ) {
+              allPresentInScan = false;
+              this.ensureFullChunkTerrain(existing);
+              if (this.workerPool.hasDedicatedWorkers) {
+                this.rebuildChunkAsync(existing, true, -100);
+              } else {
+                this.rebuildChunkSync(existing, true);
+              }
+              createdThisFrame++;
+              immediateBuiltThisFrame++;
+            } else if (isMapFastLoad && !existing.hasBuiltMesh && !existing.workerPending && hasBudget()) {
+              allPresentInScan = false;
+              this.rebuildChunkTopSurfaceOnly(existing);
+              immediateBuiltThisFrame++;
+            } else if (
+              existing.dirty &&
+              !existing.workerPending &&
+              (isDirectlyUnder || (isMapFastLoad && ring <= 1)) &&
+              immediateBuiltThisFrame < (isMapFastLoad ? 12 : 2)
+            ) {
+              allPresentInScan = false;
+              if (isMapFastLoad && !existing.userModified) {
+                this.rebuildChunkTopSurfaceOnly(existing);
+              } else if (this.workerPool.hasDedicatedWorkers) {
+                this.rebuildChunkAsync(existing, true, computeChunkPriority(cx, cz, dx, dz, ring));
+              } else if (existing.isSurfaceOnlyTerrain && !existing.userModified) {
+                this.rebuildChunkTopSurfaceOnly(existing);
+              } else {
+                this.rebuildChunk(existing);
+              }
+              immediateBuiltThisFrame++;
+            } else if (
+              !isMapFastLoad &&
+              !existing.hasBuiltMesh &&
+              !existing.workerPending &&
+              existing.state !== ChunkState.QUEUED &&
+              createdThisFrame < maxNewChunksThisFrame &&
+              (isDirectlyUnder || hasBudget())
+            ) {
+              allPresentInScan = false;
+              const prio = computeChunkPriority(cx, cz, dx, dz, ring);
+              if (this.workerPool.hasDedicatedWorkers) {
+                this.rebuildChunkAsync(existing, true, prio);
+              } else if (existing.isSurfaceOnlyTerrain && !existing.userModified) {
+                this.rebuildChunkTopSurfaceOnly(existing);
+              } else {
+                this.rebuildChunkSync(existing, true);
+              }
+              createdThisFrame++;
+              immediateBuiltThisFrame++;
+            } else if (!existing.hasBuiltMesh || existing.dirty) {
+              allPresentInScan = false;
+            }
+          }
+        }
+      }
+      if (!isMapFastLoad) {
+        this._allChunksInRadiusPresent = allPresentInScan;
       }
     }
 
@@ -7091,19 +7987,27 @@ export class MicroVoxelWorld {
       );
     } else if (this.dirtyQueue.length > 0 && immediateBuiltThisFrame < chunkRebuildBudget && hasBudget()) {
       let dispatchedCount = immediateBuiltThisFrame;
+      const dirtySearchRad = horizonActive ? Math.max(lod0ScanRad + 1, 4) : maxRad;
       while (
         this.dirtyQueue.length > 0 &&
         dispatchedCount < chunkRebuildBudget &&
         hasBudget()
       ) {
-        const picked = this.extractClosestDirtyChunk(centerCX, centerCZ, maxRad);
+        const picked = this.extractClosestDirtyChunk(centerCX, centerCZ, dirtySearchRad);
         if (!picked) break;
         const { chunk: next } = picked;
         if (isMapFastLoad && !next.userModified) {
           this.rebuildChunkTopSurfaceOnly(next);
           dispatchedCount++;
         } else if (this.workerPool.hasDedicatedWorkers) {
-          this.rebuildChunkAsync(next, true);
+          const prio = computeChunkPriority(
+            next.cx,
+            next.cz,
+            next.cx - centerCX,
+            next.cz - centerCZ,
+            Math.max(Math.abs(next.cx - centerCX), Math.abs(next.cz - centerCZ)),
+          );
+          this.rebuildChunkAsync(next, true, prio);
           dispatchedCount++;
         } else if (next.isSurfaceOnlyTerrain && !next.userModified) {
           this.rebuildChunkTopSurfaceOnly(next);
@@ -7115,14 +8019,19 @@ export class MicroVoxelWorld {
       }
     }
 
-    // Defer LOD1 and LOD2 generation until AFTER ALL chunks have reached LOD0 MESH_READY state (skip in Map Mode and for surface-only chunks!)
-    if (!isMapFastLoad && this.areAllChunksLod0MeshReady() && hasBudget()) {
+    // Defer per-chunk LOD1/LOD2/LOD3 generation ONLY when Distant Horizon mega-tiles are inactive
+    if (
+      !horizonActive &&
+      !isMapFastLoad &&
+      this.workerPool.hasDedicatedWorkers &&
+      this.areAllChunksLod0MeshReady() &&
+      hasBudget()
+    ) {
       let lod12Scheduled = 0;
       for (const chunk of this.chunkMap.values()) {
         if (lod12Scheduled >= chunkRebuildBudget || !hasBudget()) break;
-        if (!chunk.lod12Built && !chunk.isSurfaceOnlyMesh && !chunk.workerPending && !chunk.dirty) {
-          chunk.dirtyBucketMask = MAT_BUCKET_ALL_MASK;
-          this.rebuildChunkAsync(chunk, false);
+        if (!chunk.lod12Built && chunk.hasBuiltMesh && !chunk.workerPending && !chunk.dirty) {
+          this.rebuildChunkAsync(chunk, false, 500, true);
           lod12Scheduled++;
         }
       }
@@ -7141,35 +8050,91 @@ export class MicroVoxelWorld {
     let l0Count = 0;
     let l1Count = 0;
     let l2Count = 0;
+    let l3Count = 0;
+    let zoomLod0Count = 0;
 
-    const tuning = computeRenderDistanceTuning(maxRad, this.uncappedChunkLod);
-    const effectiveVisibilityRad = isMapFastLoad ? Math.max(maxRad + 4, 26) : maxRad;
-    const retentionRad = Math.min(effectiveVisibilityRad, maxRad + 3);
-    const maxRetainedChunks = (2 * retentionRad + 3) * (2 * retentionRad + 3);
+    const tuning = computeRenderDistanceTuning(
+      maxRad,
+      this.uncappedChunkLod,
+      this.lodSpacing,
+    );
+    const effectiveVisibilityRad = horizonActive
+      ? lod0ScanRad
+      : isMapFastLoad
+        ? Math.max(maxRad + 4, 26)
+        : maxRad;
+    // Hysteresis band: tighter (+1) on Pentium/low draw distance so far chunks free RAM quickly
+    const retentionRad =
+      isLowEndMode || effectiveVisibilityRad <= 4
+        ? effectiveVisibilityRad + 1
+        : effectiveVisibilityRad + 2;
+    const zoomRetentionExtra = zoomLod0BoxNum !== null ? 16 : 0;
+    const maxRetainedChunks =
+      (2 * retentionRad + 1) * (2 * retentionRad + 1) + zoomRetentionExtra;
     const shouldPruneFarChunks = !isMapFastLoad && this.chunkMap.size > maxRetainedChunks;
+    let evictedThisFrame = 0;
+    const maxEvictionsPerFrame = isLowEndMode ? 4 : 3;
 
+    const effectiveVisCircRadSq = (effectiveVisibilityRad + 0.35) * (effectiveVisibilityRad + 0.35);
     this.chunkMap.forEach((chunk, key) => {
-      const chebDist = Math.max(
-        Math.abs(chunk.cx - centerCX),
-        Math.abs(chunk.cz - centerCZ),
-      );
-      if (chebDist > effectiveVisibilityRad) {
+      const dxC = chunk.cx - centerCX;
+      const dzC = chunk.cz - centerCZ;
+      const chebDist = Math.max(Math.abs(dxC), Math.abs(dzC));
+      const isInsideZoomBox =
+        zoomLod0BoxNum !== null && isChunkInsideBox(chunk.cx, chunk.cz, zoomLod0BoxNum);
+      const isOutsideVisible = isInsideZoomBox
+        ? false
+        : horizonActive
+          ? !isChunkInsideBox(chunk.cx, chunk.cz, lod0BoxNum)
+          : chebDist > effectiveVisibilityRad ||
+            (!isMapFastLoad &&
+              chebDist > 1 &&
+              dxC * dxC + dzC * dzC > effectiveVisCircRadSq);
+
+      // Seamless Outgoing Bridge: if a real LOD0 chunk just exited lod0Box or zoomLod0Box,
+      // keep it visible until the replacement Distant Horizon mega-tile covering it has built!
+      const isOutgoingLod0Bridge =
+        horizonActive &&
+        isOutsideVisible &&
+        chunk.hasBuiltMesh &&
+        (chunk.mesh !== null || chunk.transMesh !== null) &&
+        (chebDist <= lod0ScanRad + 3 || nowMs - chunk.lastAccessedMs < 2500) &&
+        Boolean(this.horizonManager) &&
+        !this.horizonManager.isChunkCoveredByReadyTile(chunk.cx, chunk.cz);
+
+      if (isOutsideVisible && !isOutgoingLod0Bridge) {
         this.setChunkLodLevel(chunk, -1);
+        // Only clear CPU cachedOpaqueBuckets once chunk is hidden outside visibility radius
+        if (
+          !chunk.dirty &&
+          !chunk.workerPending &&
+          (chunk.cachedOpaqueBuckets[0] !== null ||
+            chunk.cachedOpaqueBuckets[1] !== null ||
+            chunk.cachedOpaqueBuckets[2] !== null)
+        ) {
+          chunk.cachedOpaqueBuckets = [null, null, null];
+        }
+        const isStaleUnmodified =
+          !isMapFastLoad &&
+          !chunk.userModified &&
+          chebDist > retentionRad &&
+          (shouldPruneFarChunks || nowMs - chunk.lastAccessedMs > 30_000);
         const isStaleUserModified =
           chunk.userModified &&
-          chebDist > maxRad * 2 &&
+          chebDist > Math.max(effectiveVisibilityRad * 2, 16) &&
           nowMs - chunk.lastAccessedMs > 120_000;
         if (
+          evictedThisFrame < maxEvictionsPerFrame &&
           !chunk.workerPending &&
           !chunk.inDirtyQueue &&
-          ((shouldPruneFarChunks && chebDist > maxRad + 2 && !chunk.userModified) ||
-            isStaleUserModified)
+          (isStaleUnmodified || isStaleUserModified)
         ) {
-          this.disposeChunkMeshes(chunk);
+          this.disposeChunkMeshes(chunk, true);
           chunk.hasBuiltMesh = false;
           chunk.lod12Built = false;
           this.chunkMap.delete(key);
           this.chunkSlotMap.delete(key);
+          evictedThisFrame++;
           if (chunk.userModified) {
             chunk.compressForCache();
             if (this.modifiedChunkCache.has(key)) {
@@ -7213,7 +8178,8 @@ export class MicroVoxelWorld {
 
       if (
         !isMapFastLoad &&
-        chebDist > tuning.lod0MaxCheb &&
+        !isInsideZoomBox &&
+        chebDist > (horizonActive ? 2 : tuning.lod0MaxCheb) &&
         camera &&
         !_frustum.intersectsSphere(chunk.boundingSphere)
       ) {
@@ -7221,52 +8187,134 @@ export class MicroVoxelWorld {
         return;
       }
 
-      let targetLod: 0 | 1 | 2 = 0;
-      if (isMapFastLoad) {
-        targetLod = 0;
-        l0Count++;
-      } else {
-        const dxMeters = chunk.centerWorld.x - focusX;
-        const dzMeters = chunk.centerWorld.z - focusZ;
-        const distMeters = Math.hypot(dxMeters, dzMeters);
-
-        if (chebDist <= tuning.lod0MaxCheb && distMeters <= tuning.lod0MaxMeters) {
-          targetLod = 0;
-          l0Count++;
-        } else if (chebDist <= tuning.lod1MaxCheb && distMeters <= tuning.lod1MaxMeters) {
-          targetLod = 1;
-          l1Count++;
-        } else {
-          targetLod = 2;
-          l2Count++;
-        }
+      if (isInsideZoomBox && (chunk.wireMesh || chunk.isBloomMaterialAttached)) {
+        this.disposeChunkWireAndBloom(chunk);
+        chunk.state = ChunkState.COMPLETE;
       }
 
+      const targetLod: 0 | 1 | 2 | 3 =
+        horizonActive || isInsideZoomBox
+          ? 0
+          : resolveChunkTargetLod({
+              chebDist,
+              distMeters: Math.hypot(
+                chunk.centerWorld.x - focusX,
+                chunk.centerWorld.z - focusZ,
+              ),
+              prevLod: chunk.activeLodLevel,
+              tuning,
+              isLowEndMode,
+              isMapFastLoad,
+            });
+
       const activeQuads = this.setChunkLodLevel(chunk, targetLod);
+      if (chunk.activeLodLevel === 0) {
+        l0Count++;
+        if (isInsideZoomBox) zoomLod0Count++;
+      } else if (chunk.activeLodLevel === 1) l1Count++;
+      else if (chunk.activeLodLevel === 2) l2Count++;
+      else if (chunk.activeLodLevel === 3) l3Count++;
       visibleRaw += chunk.rawFaces;
       visibleMerged += activeQuads;
     });
+    this.activeZoomLod0Chunks = zoomLod0Count;
 
+    // Update Distant Horizons dynamic outer mega-tile rings (LOD1 .. LOD8)
+    let horizonStats = {
+      activeRings: 0,
+      visibleTiles: 0,
+      visibleQuads: 0,
+      pendingJobs: 0,
+      cachedTiles: 0,
+    };
+    if (this.horizonManager) {
+      if (horizonActive) {
+        const camBigSector = camera
+          ? createBigSectorPosition(camera.position.x, camera.position.y, camera.position.z)
+          : createBigSectorPosition(focusX, 16, focusZ);
+        if (camera) {
+          camera.getWorldDirection(this._cameraFwdScratch);
+        }
+        horizonStats = this.horizonManager.update({
+          plan: lodPlan,
+          nestedBoxes: nestedBoxesBig,
+          centerCX,
+          centerCZ,
+          zoomLod0Box: zoomLod0BoxBig,
+          cameraBigSector: camBigSector,
+          cameraForward: camera ? this._cameraFwdScratch : null,
+          worldGenMode: this.worldGenMode,
+          flatBaseplateMat: this.flatBaseplateMat,
+          frustum: camera ? _frustum : null,
+          isLowEndMode,
+          isLod0RegionReady: (minCX, maxCXExcl, minCZ, maxCZExcl) => {
+            for (let cz = minCZ; cz < maxCZExcl; cz++) {
+              for (let cx = minCX; cx < maxCXExcl; cx++) {
+                const c = this.chunkMap.get(`${cx},${cz}`);
+                if (!c || !c.hasBuiltMesh || (!c.mesh && !c.transMesh)) {
+                  return false;
+                }
+              }
+            }
+            return true;
+          },
+          nowMs,
+          // Hold off dispatching NEW outer mega-tiles only while core spawn chunks or zoomed LOD0 chunks are still missing
+          deferNewDispatches:
+            (!this._initialSpawnBubbleReady && missingLod0Count > 6) ||
+            missingZoomLod0Count > 4,
+          planetCurvatureRadius: this.planetCurvatureRadius,
+        });
+        visibleMerged += horizonStats.visibleQuads;
+        visibleRaw += horizonStats.visibleQuads * 16;
+      } else {
+        this.horizonManager.setAllVisible(false);
+      }
+    }
+    const prevRings = this.activeHorizonRings;
+    const prevTiles = this.activeHorizonTiles;
+    this.activeHorizonRings = horizonStats.activeRings;
+    this.activeHorizonTiles = horizonStats.visibleTiles;
+
+    const prevL0 = this.lod0Chunks;
+    const prevL1 = this.lod1Chunks;
+    const prevL2 = this.lod2Chunks;
+    const prevL3 = this.lod3Chunks;
     this.lod0Chunks = l0Count;
     this.lod1Chunks = l1Count;
     this.lod2Chunks = l2Count;
+    this.lod3Chunks = l3Count;
     this.visibleTris = visibleMerged * 2;
     const rawTris = visibleRaw * 2;
     this.greedySavingsPct =
       rawTris > 0 ? Math.round((1 - this.visibleTris / rawTris) * 100) : 96;
-    this.lodSummary = `L0:${l0Count} L1:${l1Count} L2:${l2Count} · ${this.cpuThreads} CORES`;
+    if (
+      l0Count !== prevL0 ||
+      l1Count !== prevL1 ||
+      l2Count !== prevL2 ||
+      l3Count !== prevL3 ||
+      this.activeHorizonRings !== prevRings ||
+      this.activeHorizonTiles !== prevTiles ||
+      !this.lodSummary
+    ) {
+      this.lodSummary = horizonActive
+        ? `LOD0:${l0Count} · +${lodPlan.rings.length} RINGS (${horizonStats.visibleTiles} TILES) · ${this.cpuThreads} CORES`
+        : `L0:${l0Count} L1:${l1Count} L2:${l2Count} L3:${l3Count} · ${this.cpuThreads} CORES`;
+    }
   }
 
   public dispose(): void {
+    this.horizonManager?.dispose();
     this.workerPool.dispose();
     this.dirtyQueue.length = 0;
     this.completedWorkerQueue.length = 0;
     this.pendingWaterFlowQueue.length = 0;
     this.pendingWaterFlowSet.clear();
     this.chunkMap.forEach((chunk) => {
-      this.disposeChunkMeshes(chunk);
+      this.disposeChunkMeshes(chunk, false);
       this.voxelWorld.releaseChunkSlot(chunk.slotIndex);
     });
+    drainChunkMeshPool();
     this.modifiedChunkCache.forEach((chunk) => {
       this.voxelWorld.releaseChunkSlot(chunk.slotIndex);
     });
@@ -7284,6 +8332,7 @@ export class MicroVoxelWorld {
         } else {
           wm.material.dispose();
         }
+        wm.dispose();
       }
     }
     if (sharedCubeWireGeom) {
@@ -7294,6 +8343,7 @@ export class MicroVoxelWorld {
       this.scene.remove(this.waterWaveInstancedMesh);
       this.waterWaveInstancedMesh.geometry.dispose();
       (this.waterWaveInstancedMesh.material as THREE.Material).dispose();
+      this.waterWaveInstancedMesh.dispose();
     }
     if (this.skyDome) {
       this.scene.remove(this.skyDome);
@@ -7307,6 +8357,7 @@ export class MicroVoxelWorld {
     }
     this.sharedVoxelMaterial.dispose();
     this.sharedTranslucentMaterial.dispose();
+    this.sharedHorizonWaterMaterial.dispose();
     this.sharedPotatoVoxelMaterial?.dispose();
     this.sharedCartoonVoxelMaterial?.dispose();
   }

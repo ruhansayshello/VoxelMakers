@@ -237,6 +237,7 @@ export interface ModuleTuningConfig {
   gateType?: 'AND' | 'OR' | 'XOR' | 'NAND' | 'NOR';
   channel?: number;
   accentHex?: string;
+  disabled?: boolean;
 }
 
 export function isWheelOrTireModuleKind(
@@ -373,6 +374,7 @@ export type BuildPlacementMode =
   | 'PLATE_5X5'
   | 'BEAM_6'
   | 'PAINT'
+  | 'CHISEL'
   | 'PAINT_TOOL'
   | 'FLOOD_PAINT'
   | 'FACE_EXTRUDE';
@@ -383,16 +385,17 @@ export const PLACEMENT_MODES: Array<{
   shortLabel: string;
   desc: string;
 }> = [
-  { id: 'SINGLE',       label: '1×1 Single',     shortLabel: '1×1',      desc: 'Precision single block or module' },
-  { id: 'BOX_FILL',     label: 'Rect / Box Fill',shortLabel: 'Box Fill', desc: 'Drag from Point A to Point B anywhere to fill a rectangle or 3D box' },
-  { id: 'LINE_DRAG',    label: 'Line Drag',      shortLabel: 'Line',     desc: 'Click & drag to stretch a structural beam' },
-  { id: 'BEAM_6',       label: '6-Block Beam',   shortLabel: 'Beam×6',   desc: 'Extrude a 6-voxel spar along surface normal' },
-  { id: 'PLATE_3X3',    label: '3×3 Plate',      shortLabel: '3×3',      desc: 'Stamp a 3×3 armor plate on any face' },
-  { id: 'PLATE_5X5',    label: '5×5 Deck Plate', shortLabel: '5×5',      desc: 'Stamp a wide 5×5 hull deck or wall' },
-  { id: 'PAINT',        label: 'Continuous Weld',shortLabel: 'Sweep',    desc: 'Hold L-Click & sweep to weld blocks rapidly' },
-  { id: 'PAINT_TOOL',   label: 'Paint Tool',     shortLabel: 'Paint',    desc: 'Recolor/change material of existing blocks without deleting them' },
-  { id: 'FLOOD_PAINT',  label: 'Flood Paint',    shortLabel: 'Flood',    desc: 'One-click contiguous color bucket fill across matching hull blocks' },
-  { id: 'FACE_EXTRUDE', label: 'Face Extrude',   shortLabel: 'Extrude',  desc: 'One-click extrude an entire contiguous coplanar face outward by 1 voxel' },
+  { id: 'SINGLE',       label: '1×1 Dot',         shortLabel: '1×1 Dot',  desc: 'Precision single 1px micro-voxel (or 4×4×4 cluster in 4px Block mode) or module' },
+  { id: 'BOX_FILL',     label: 'Rect / 3D Box',   shortLabel: 'Box Fill', desc: 'Drag out a 1px sheet, wall, or 3D box (Q/E adjusts slab depth 1..8px)' },
+  { id: 'LINE_DRAG',    label: '1px Line',        shortLabel: 'Line',     desc: 'Click & drag to stretch a 1px trim line or structural beam' },
+  { id: 'BEAM_6',       label: '6-Voxel Beam',    shortLabel: 'Beam×6',   desc: 'Extrude a 6-voxel spar along surface normal' },
+  { id: 'PLATE_3X3',    label: '4×4 Plate',       shortLabel: '4×4',      desc: 'Stamp a 4×4×1 1px micro-plate (= 1 standard block face at 1px thickness)' },
+  { id: 'PLATE_5X5',    label: '8×8 Panel',       shortLabel: '8×8',      desc: 'Stamp an 8×8×1 1px hull panel (= 2×2 block deck at 1px thickness)' },
+  { id: 'PAINT',        label: 'Continuous Sweep',shortLabel: 'Sweep',    desc: 'Hold L-Click & sweep to weld 1px voxels rapidly' },
+  { id: 'CHISEL',       label: '1px Chisel',      shortLabel: 'Chisel',   desc: 'Carve & shave 1px micro-voxels (or 4×4×4 blocks) on Left-Click' },
+  { id: 'PAINT_TOOL',   label: 'Paint Tool',      shortLabel: 'Paint',    desc: 'Recolor/change material of existing voxels without deleting them' },
+  { id: 'FLOOD_PAINT',  label: 'Flood Paint',     shortLabel: 'Flood',    desc: 'One-click contiguous color bucket fill across matching hull blocks' },
+  { id: 'FACE_EXTRUDE', label: '1px Extrude',     shortLabel: 'Extrude',  desc: 'One-click extrude an entire contiguous coplanar face outward by 1px (or Q/E depth)' },
 ];
 
 export interface BuildSlotItem {
@@ -424,7 +427,7 @@ export const BUILD_SLOTS: BuildSlotItem[] = [
   { slot: 10, key: '0', type: 'module', category: 'AERODYNAMICS', kind: 'AERO_WING',       name: 'Modular Wing',       tag: 'Airfoil Lift Plate · 22kg',   color: '#a855f7', massKg: 22,  powerCores: 0 },
   { slot: 11, key: '-', type: 'module', category: 'PROPULSION',   kind: 'VTOL_ROTOR',      name: 'Helicopter Engine',  tag: '[Space/Ctrl] Rotor Lift · 55kg', color: '#34d399', massKg: 55, powerCores: 2, defaultConfig: { posKey: 'Space', negKey: 'ControlLeft', strength: 1.0 } },
   { slot: 12, key: '=', type: 'module', category: 'WEAPONS',      kind: 'PLASMA_CANNON',   name: 'Tank Cannon',        tag: 'Ballistic Recoil · 55kg',     color: '#fb7185', massKg: 55,  powerCores: 2, defaultConfig: { posKey: 'KeyF', strength: 1.0 } },
-  { slot: 13, key: 'X', type: 'module', category: 'MECHANICAL',   kind: 'PISTON',          name: 'Hydraulic Piston',   tag: '[X] Linear Rod · Auto-Reset', color: '#f97316', massKg: 28,  powerCores: 1, defaultConfig: { posKey: 'KeyX', negKey: 'KeyQ', toggleMode: true, autoReset: false, strength: 1.0 } },
+  { slot: 13, key: 'X', type: 'module', category: 'MECHANICAL',   kind: 'PISTON',          name: 'Hydraulic Piston',   tag: '[X] Hydraulic Rod · Toggle Ext/Ret', color: '#f97316', massKg: 28, powerCores: 1, defaultConfig: { posKey: 'KeyX', negKey: 'KeyQ', toggleMode: true, autoReset: true, strength: 1.0 } },
   { slot: 14, key: 'T', type: 'module', category: 'MECHANICAL',   kind: 'GRAPPLING_WINCH', name: 'Grapple Winch',      tag: '[T] Tow Cable · 32kg',        color: '#38bdf8', massKg: 32,  powerCores: 1, defaultConfig: { posKey: 'KeyT' } },
 
   // --- 0. ADDITIONAL CHASSIS MATERIALS ---
@@ -800,6 +803,7 @@ export interface SerializedVehicleBlueprint {
   blockCount: number;
   powerCores: number;
   voxels: Array<[number, number, number, number]>; // [vx, vy, vz, mat]
+  microVoxels?: Array<[number, number, number, number]>; // [mx, my, mz, mat] at 1px (0.0625m)
   modules: Array<{
     kind: ModuleKind;
     vx: number;

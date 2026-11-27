@@ -22,16 +22,15 @@ import * as THREE from 'three';
 export type ActiveShaderMode = 'PBR' | 'POTATO' | 'CARTOON';
 
 export const POTATO_VERTEX_SHADER = /* glsl */ `
+  #include <common>
+  #include <logdepthbuf_pars_vertex>
   varying vec3 vNormal;
   varying vec3 vViewDir;
   varying vec3 vWorldPos;
-  varying vec3 vLocalPos;
   varying vec3 vColor;
   varying float vAo;
   varying vec2 vUv;
   varying float vFogDepth;
-
-  uniform float uUseVertexColors;
 
   void main() {
     #ifdef USE_COLOR
@@ -40,15 +39,15 @@ export const POTATO_VERTEX_SHADER = /* glsl */ `
       vColor = vec3(1.0);
     #endif
 
+    #ifdef USE_INSTANCING_COLOR
+      vColor *= instanceColor;
+    #endif
+
     #ifdef USE_AO
       vAo = ao;
     #else
       vAo = 1.0;
     #endif
-
-    if (uUseVertexColors < 0.5) {
-      vColor = vec3(1.0);
-    }
 
     vec3 localPosition = position;
     #ifdef USE_SPAWN_POP
@@ -60,30 +59,44 @@ export const POTATO_VERTEX_SHADER = /* glsl */ `
     #endif
 
     vUv = uv;
-    vLocalPos = localPosition;
 
-    vec4 worldPosition = modelMatrix * vec4(localPosition, 1.0);
+    vec4 localPos4 = vec4(localPosition, 1.0);
+    vec3 objNormal = normal;
+    #ifdef USE_INSTANCING
+      localPos4 = instanceMatrix * localPos4;
+      objNormal = mat3(instanceMatrix) * objNormal;
+    #endif
+
+    vec4 worldPosition = modelMatrix * localPos4;
     vWorldPos = worldPosition.xyz;
 
     // Transform normal to world space for consistent directional cel-shading
-    vNormal = normalize(mat3(modelMatrix) * normal);
+    vNormal = normalize(mat3(modelMatrix) * objNormal);
 
-    // View direction from vertex world position toward camera
-    vViewDir = normalize(cameraPosition - worldPosition.xyz);
+    // Compute view-space position directly from 64-bit RTE modelViewMatrix (jitter-free up to 1,000 km!)
+    vec4 mvPosition = modelViewMatrix * localPos4;
+    vec3 relWorldPos = mvPosition.xyz * mat3(viewMatrix);
+    vViewDir = normalize(-relWorldPos);
 
-    vec4 mvPosition = viewMatrix * worldPosition;
+    if (uPlanetCurvatureInv2R > 0.0) {
+      float _h2 = relWorldPos.x * relWorldPos.x + relWorldPos.z * relWorldPos.z;
+      float _drop = min(_h2 * uPlanetCurvatureInv2R, 650000.0);
+      mvPosition.xyz -= viewMatrix[1].xyz * _drop;
+    }
+
     vFogDepth = -mvPosition.z;
     gl_Position = projectionMatrix * mvPosition;
+    #include <logdepthbuf_vertex>
   }
 `;
 
 export const POTATO_FRAGMENT_SHADER = /* glsl */ `
-  precision lowp float;
+  precision highp float;
+  #include <logdepthbuf_pars_fragment>
 
   varying vec3 vNormal;
   varying vec3 vViewDir;
   varying vec3 vWorldPos;
-  varying vec3 vLocalPos;
   varying vec3 vColor;
   varying float vAo;
   varying vec2 vUv;
@@ -93,28 +106,27 @@ export const POTATO_FRAGMENT_SHADER = /* glsl */ `
   uniform vec3 uLightDir;
   uniform vec3 uRimColor;
   uniform float uRimIntensity;
-  uniform float uSaturation;
-  uniform float uCelBands;
-  uniform float uVoxelInkStrength;
   uniform vec3 uSunTint;
   uniform vec3 uShadowTint;
-  uniform vec3 uOutlineInkColor;
-  uniform float uTime;
-  uniform float uUseVertexColors;
-  uniform float uHasMap;
-  uniform sampler2D uMap;
+  #ifdef USE_POTATO_MAP
+    uniform sampler2D uMap;
+  #endif
   uniform float uFogEnabled;
   uniform vec3 uFogColor;
   uniform float uFogNear;
   uniform float uFogFar;
 
   void main() {
-    // Ultra-fast ALU path for Intel HD Graphics 2000 / Sandy Bridge (no pow, no sin, no fract/floor in default Potato mode)
+    #include <logdepthbuf_fragment>
+    // Ultra-fast ALU path for integrated/mobile GPUs (zero pow, zero sin, zero unused uniforms)
     vec3 N = vNormal * (gl_FrontFacing ? 1.0 : -1.0);
-    vec3 texColor = uHasMap > 0.5 ? texture2D(uMap, vUv).rgb : vec3(1.0);
-    vec3 baseAlbedo = clamp(vColor * uBaseColor * texColor * vAo, 0.0, 1.0);
+    #ifdef USE_POTATO_MAP
+      vec3 baseAlbedo = clamp(vColor * uBaseColor * texture2D(uMap, vUv).rgb * vAo, 0.0, 1.0);
+    #else
+      vec3 baseAlbedo = clamp(vColor * uBaseColor * vAo, 0.0, 1.0);
+    #endif
 
-    // Hemisphere AO + 3-band smoothstep cel shading using fast polynomials
+    // Hemisphere AO + 3-band smoothstep cel shading
     float hemiAO = 0.84 + 0.08 * (N.y + 1.0);
     float NdotL = dot(N, uLightDir);
     float bandShadow = smoothstep(-0.12, 0.08, NdotL);
@@ -123,14 +135,11 @@ export const POTATO_FRAGMENT_SHADER = /* glsl */ `
     float celIntensity = (0.50 + 0.26 * bandShadow + 0.14 * bandMid + 0.10 * bandHigh) * hemiAO;
     vec3 lightColor = mix(uShadowTint, uSunTint, bandShadow);
 
-    // Fast cubic Fresnel rim (f * f * f instead of transcendental pow(f, 3.0))
+    // Fast cubic Fresnel rim (zero transcendental pow)
     float fresnel = 1.0 - max(dot(N, vViewDir), 0.0);
     float rim = fresnel * fresnel * fresnel;
-    vec3 rimContribution = uRimColor * (rim * uRimIntensity * 0.65);
+    vec3 litColor = baseAlbedo * lightColor * celIntensity + uRimColor * (rim * uRimIntensity * 0.65);
 
-    vec3 litColor = baseAlbedo * lightColor * celIntensity + rimContribution;
-
-    // Linear Distance Fog
     if (uFogEnabled > 0.5) {
       float fogFactor = clamp((vFogDepth - uFogNear) / max(1.0, uFogFar - uFogNear), 0.0, 1.0);
       litColor = mix(litColor, uFogColor, fogFactor);
@@ -142,25 +151,25 @@ export const POTATO_FRAGMENT_SHADER = /* glsl */ `
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
- * CARTOON MODE SHADER (HARD-STEPPED COMIC CEL + VOXEL INK LINES + CUSTOM PRESETS)
+ * CARTOON MODE SHADER (HARD-STEPPED COMIC CEL + OPTIONAL VOXEL INK + CUSTOM PRESETS)
  * ═══════════════════════════════════════════════════════════════════════════
  */
 export const CARTOON_VERTEX_SHADER = POTATO_VERTEX_SHADER;
 
 export const CARTOON_FRAGMENT_SHADER = /* glsl */ `
-  precision mediump float;
+  precision highp float;
+  #include <logdepthbuf_pars_fragment>
 
   varying vec3 vNormal;
   varying vec3 vViewDir;
   varying vec3 vWorldPos;
-  varying vec3 vLocalPos;
   varying vec3 vColor;
   varying float vAo;
   varying vec2 vUv;
   varying float vFogDepth;
 
   uniform vec3 uBaseColor;
-  uniform vec3 uLightDir;
+  uniform vec3 uLightDir; // Pre-normalized on CPU
   uniform vec3 uRimColor;
   uniform float uRimIntensity;
   uniform float uSaturation;
@@ -169,63 +178,66 @@ export const CARTOON_FRAGMENT_SHADER = /* glsl */ `
   uniform vec3 uSunTint;
   uniform vec3 uShadowTint;
   uniform vec3 uOutlineInkColor;
-  uniform float uTime;
-  uniform float uUseVertexColors;
-  uniform float uHasMap;
-  uniform sampler2D uMap;
+  #ifdef USE_POTATO_MAP
+    uniform sampler2D uMap;
+  #endif
   uniform float uFogEnabled;
   uniform vec3 uFogColor;
   uniform float uFogNear;
   uniform float uFogFar;
 
   void main() {
+    #include <logdepthbuf_fragment>
     vec3 N = normalize(vNormal) * (gl_FrontFacing ? 1.0 : -1.0);
     vec3 V = normalize(vViewDir);
-    vec3 L = normalize(uLightDir);
+    vec3 L = uLightDir;
 
-    vec3 texColor = vec3(1.0);
-    if (uHasMap > 0.5) {
-      texColor = texture2D(uMap, vUv).rgb;
-    }
-    vec3 rawAlbedo = clamp(vColor * uBaseColor * texColor * vAo, 0.0, 1.0);
+    #ifdef USE_POTATO_MAP
+      vec3 rawAlbedo = clamp(vColor * uBaseColor * texture2D(uMap, vUv).rgb * vAo, 0.0, 1.0);
+    #else
+      vec3 rawAlbedo = clamp(vColor * uBaseColor * vAo, 0.0, 1.0);
+    #endif
 
     // 1. Configurable Saturation Boost (default 1.38x in Cartoon mode)
     float luma = dot(rawAlbedo, vec3(0.299, 0.587, 0.114));
     vec3 saturatedAlbedo = clamp(mix(vec3(luma), rawAlbedo, uSaturation), 0.0, 1.0);
 
-    // 2. Crisp Hard-Stepped Cartoon Cel Bands (supports 2..6 bands via uCelBands)
+    // 2. Crisp Hard-Stepped Cartoon Cel Bands (supports 2..8 bands via uCelBands)
     float NdotL = dot(N, L);
-    float step1 = smoothstep(-0.18, -0.13, NdotL);
     float step2 = smoothstep(0.18, 0.23, NdotL);
-    float step3 = smoothstep(0.62, 0.67, NdotL);
-
     float bands = clamp(uCelBands, 2.0, 8.0);
-    float normL = clamp(NdotL * 0.5 + 0.5, 0.0, 0.999);
-    float quantizedL = floor(normL * bands) / max(1.0, bands - 1.0);
-    float fourBandShade = 0.44 + 0.22 * step1 + 0.22 * step2 + 0.16 * step3;
-    float multiBandShade = 0.40 + 0.64 * quantizedL;
-    float toonShade = mix(fourBandShade, multiBandShade, 0.65);
+    float scaledL = clamp(NdotL * 0.5 + 0.5, 0.0, 0.999) * bands;
+    float bandIdx = floor(scaledL);
+    float bandFrac = smoothstep(0.88, 1.0, fract(scaledL));
+    float quantizedL = (bandIdx + bandFrac) / max(1.0, bands - 1.0);
+    float toonShade = 0.42 + 0.62 * clamp(quantizedL, 0.0, 1.0);
 
-    // Stylized comic shadow & sun tint
     vec3 toonLightCol = mix(uShadowTint, uSunTint, step2);
 
-    // 3. Hard Cartoon Specular Dot
+    // 3. Hard Cartoon Specular Dot (polynomial x^48 — zero pow())
     vec3 H = normalize(L + V);
-    float spec = pow(max(dot(N, H), 0.0), 48.0);
+    float nh = max(dot(N, H), 0.0);
+    float nh2 = nh * nh;
+    float nh4 = nh2 * nh2;
+    float nh8 = nh4 * nh4;
+    float nh16 = nh8 * nh8;
+    float spec = nh16 * nh16 * nh16;
     float toonSpec = smoothstep(0.52, 0.58, spec) * 0.26 * step2;
 
-    // 4. Crisp Voxel Block Ink Borders + Grazing Silhouette Ink Line
-    vec3 absN = abs(N);
-    vec2 planeCoord = absN.y > 0.5
-      ? vWorldPos.xz
-      : (absN.x > 0.5 ? vWorldPos.yz : vWorldPos.xy);
-    vec2 gridDist = abs(fract(planeCoord / 0.25 - 0.5) - 0.5);
-    float minGrid = min(gridDist.x, gridDist.y);
-    float distFade = 1.0 - smoothstep(14.0, 52.0, vFogDepth);
-    float voxelInkMask = (1.0 - smoothstep(0.025, 0.065, minGrid)) * uVoxelInkStrength * distFade;
-
-    // Grazing-angle dark comic silhouette ink + bright inner rim pop
+    // 4. Optional Voxel Block Ink Borders (compiled out when uVoxelInkStrength == 0) + Grazing Rim
     float NdotV = max(dot(N, V), 0.0);
+    float voxelInkMask = 0.0;
+    #ifdef USE_VOXEL_INK
+      vec3 absN = abs(N);
+      vec2 planeCoord = absN.y > 0.5
+        ? vWorldPos.xz
+        : (absN.x > 0.5 ? vWorldPos.yz : vWorldPos.xy);
+      vec2 gridDist = abs(fract(planeCoord * 4.0 - 0.5) - 0.5);
+      float minGrid = min(gridDist.x, gridDist.y);
+      float distFade = 1.0 - smoothstep(14.0, 52.0, vFogDepth);
+      voxelInkMask = (1.0 - smoothstep(0.025, 0.065, minGrid)) * uVoxelInkStrength * distFade;
+    #endif
+
     float comicEdgeInk = (1.0 - smoothstep(0.14, 0.24, NdotV)) * clamp(uVoxelInkStrength * 1.5, 0.15, 0.78);
     float innerRimPop  = smoothstep(0.24, 0.34, NdotV) * (1.0 - smoothstep(0.34, 0.48, NdotV)) * uRimIntensity * step2;
 
@@ -251,6 +263,8 @@ export const CARTOON_FRAGMENT_SHADER = /* glsl */ `
  * world/object space to draw a bold, clean cartoon outline around any vehicle.
  */
 export const CARTOON_OUTLINE_VERTEX_SHADER = /* glsl */ `
+  #include <common>
+  #include <logdepthbuf_pars_vertex>
   uniform float uOutlineThickness;
 
   void main() {
@@ -262,10 +276,21 @@ export const CARTOON_OUTLINE_VERTEX_SHADER = /* glsl */ `
     vec3 normDir = length(normal) > 0.001 ? normalize(normal) : normalize(position + vec3(0.0, 0.001, 0.0));
     vec3 extrudedPos = position + normDir * dynamicThickness;
 
-    vec4 clipPos = projectionMatrix * modelViewMatrix * vec4(extrudedPos, 1.0);
+    vec4 mvExtruded = modelViewMatrix * vec4(extrudedPos, 1.0);
+    if (uPlanetCurvatureInv2R > 0.0) {
+      vec3 _relW = mvExtruded.xyz * mat3(viewMatrix);
+      float _h2 = _relW.x * _relW.x + _relW.z * _relW.z;
+      float _drop = min(_h2 * uPlanetCurvatureInv2R, 650000.0);
+      mvExtruded.xyz -= viewMatrix[1].xyz * _drop;
+    }
+    vec4 clipPos = projectionMatrix * mvExtruded;
     // Tiny depth bias so the BackSide outline never z-fights with FrontSide vehicle faces
     clipPos.z += 0.0004 * clipPos.w;
     gl_Position = clipPos;
+    #include <logdepthbuf_vertex>
+    #ifdef USE_LOGARITHMIC_DEPTH_BUFFER
+      vFragDepth += 0.025;
+    #endif
   }
 `;
 
@@ -370,10 +395,12 @@ export function disposeSmoothedOutlineGeometry(
 }
 
 export const CARTOON_OUTLINE_FRAGMENT_SHADER = /* glsl */ `
-  precision mediump float;
+  precision highp float;
+  #include <logdepthbuf_pars_fragment>
   uniform vec3 uOutlineColor;
 
   void main() {
+    #include <logdepthbuf_fragment>
     gl_FragColor = vec4(uOutlineColor, 1.0);
   }
 `;
@@ -659,11 +686,14 @@ export function createPotatoShaderMaterial(
   mapTexture: THREE.Texture | null = null,
 ): THREE.ShaderMaterial {
   const uniforms = createBaseShaderUniforms(baseColorHex, useVertexColors, 0x7dd3fc, mapTexture, _activeShaderPreset);
+  const defines: Record<string, number> = {};
+  if (mapTexture) defines.USE_POTATO_MAP = 1;
 
   return new THREE.ShaderMaterial({
     name: useVertexColors ? 'PotatoCelRimShaderMaterial' : `PotatoSolidShader_${baseColorHex.toString(16)}`,
     vertexShader: POTATO_VERTEX_SHADER,
     fragmentShader: POTATO_FRAGMENT_SHADER,
+    defines,
     uniforms,
     vertexColors: useVertexColors,
     side: THREE.DoubleSide,
@@ -682,11 +712,17 @@ export function createCartoonShaderMaterial(
   mapTexture: THREE.Texture | null = null,
 ): THREE.ShaderMaterial {
   const uniforms = createBaseShaderUniforms(baseColorHex, useVertexColors, 0xfef08a, mapTexture, _activeShaderPreset);
+  const defines: Record<string, number> = {};
+  if (mapTexture) defines.USE_POTATO_MAP = 1;
+  if ((_activeShaderPreset.voxelInkStrength ?? 0.34) > 0.001) {
+    defines.USE_VOXEL_INK = 1;
+  }
 
-  return new THREE.ShaderMaterial({
+  const mat = new THREE.ShaderMaterial({
     name: useVertexColors ? 'CartoonCelShaderMaterial' : `CartoonSolidShader_${baseColorHex.toString(16)}`,
     vertexShader: CARTOON_VERTEX_SHADER,
     fragmentShader: CARTOON_FRAGMENT_SHADER,
+    defines,
     uniforms,
     vertexColors: useVertexColors,
     side: THREE.DoubleSide,
@@ -694,6 +730,9 @@ export function createCartoonShaderMaterial(
     depthWrite: true,
     depthTest: true,
   });
+  mat.customProgramCacheKey = () =>
+    `cartoon_v2_${mapTexture ? 1 : 0}_${mat.defines.USE_VOXEL_INK ? 1 : 0}`;
+  return mat;
 }
 
 /**
@@ -737,6 +776,13 @@ function applyPresetUniformsToShaderMat(mat: THREE.ShaderMaterial, preset: Custo
   u.uSunTint?.value?.set(preset.sunTintHex || '#fff5e0');
   u.uShadowTint?.value?.set(preset.shadowTintHex || '#a8bdf5');
   u.uOutlineInkColor?.value?.set(preset.outlineColorHex || '#060a12');
+  if (mat.name.startsWith('Cartoon')) {
+    if (preset.voxelInkStrength > 0.001) {
+      mat.defines.USE_VOXEL_INK = 1;
+    } else {
+      delete mat.defines.USE_VOXEL_INK;
+    }
+  }
 }
 
 /**
@@ -910,6 +956,18 @@ export function disposeSharedPotatoShaderResources(): void {
     mat.dispose();
   }
   _cartoonSolidMaterialCache.clear();
+  if (_sharedBlobShadowTexture) {
+    _sharedBlobShadowTexture.dispose();
+    _sharedBlobShadowTexture = null;
+  }
+  if (_sharedBlobShadowGeometry) {
+    _sharedBlobShadowGeometry.dispose();
+    _sharedBlobShadowGeometry = null;
+  }
+  if (_sharedBlobShadowMaterial) {
+    _sharedBlobShadowMaterial.dispose();
+    _sharedBlobShadowMaterial = null;
+  }
 }
 
 function isCustomCelMaterial(mat: unknown): boolean {
@@ -1017,7 +1075,13 @@ export function getWebGLRendererString(
         (canvas.getContext('webgl2') as WebGL2RenderingContext | null) ||
         (canvas.getContext('webgl') as WebGLRenderingContext | null);
       if (gl) {
-        return extractWebGLRendererString(gl);
+        const result = extractWebGLRendererString(gl);
+        try {
+          gl.getExtension('WEBGL_lose_context')?.loseContext();
+        } catch {
+          // Ignore extension errors on headless/mock contexts
+        }
+        return result;
       }
     } catch {
       // Ignore context creation errors in non-browser environments
@@ -1160,6 +1224,157 @@ export function updateVehicleBlobShadow(
   blobMesh.rotation.y = yawRad;
 }
 
+const _blobShadowPos = new THREE.Vector3();
+const _blobShadowQuat = new THREE.Quaternion();
+const _blobShadowScale = new THREE.Vector3();
+const _blobShadowMat = new THREE.Matrix4();
+const _blobShadowUpAxis = new THREE.Vector3(0, 1, 0);
+const _blobShadowHiddenMat = new THREE.Matrix4().makeScale(0, 0, 0);
+
+/**
+ * Pooled single-draw-call InstancedMesh manager for all vehicle and voxel entity ground blob shadows.
+ * Replaces 20+ separate PlaneGeometry draw calls with 1 instanced draw call.
+ */
+export class BlobShadowInstancedManager {
+  public readonly mesh: THREE.InstancedMesh;
+  private _capacity: number;
+  private freeSlots: number[] = [];
+  private activeSlots = new Set<number>();
+  private dirty = false;
+
+  public get capacity(): number {
+    return this._capacity;
+  }
+
+  constructor(initialCapacity = 64) {
+    this._capacity = Math.max(1, initialCapacity);
+    if (!_sharedBlobShadowGeometry) {
+      _sharedBlobShadowGeometry = new THREE.PlaneGeometry(1, 1);
+      _sharedBlobShadowGeometry.rotateX(-Math.PI / 2);
+    }
+    if (!_sharedBlobShadowMaterial) {
+      const blobTexture = getSharedBlobShadowTexture();
+      _sharedBlobShadowMaterial = new THREE.MeshBasicMaterial({
+        map: blobTexture,
+        color: blobTexture ? 0xffffff : 0x000000,
+        transparent: true,
+        opacity: blobTexture ? 1.0 : 0.4,
+        depthWrite: false,
+      });
+    }
+    this.mesh = new THREE.InstancedMesh(
+      _sharedBlobShadowGeometry,
+      _sharedBlobShadowMaterial,
+      this._capacity,
+    );
+    this.mesh.name = 'InstancedBlobShadows';
+    this.mesh.renderOrder = 2;
+    this.mesh.frustumCulled = false;
+    this.mesh.count = 0;
+
+    for (let i = this._capacity - 1; i >= 0; i--) {
+      this.mesh.setMatrixAt(i, _blobShadowHiddenMat);
+      this.freeSlots.push(i);
+    }
+    this.mesh.instanceMatrix.needsUpdate = true;
+  }
+
+  public acquireSlot(): number {
+    if (this.freeSlots.length === 0) {
+      const prevCap = this._capacity;
+      const nextCap = prevCap * 2;
+      const oldArr = this.mesh.instanceMatrix.array as Float32Array;
+      const nextArr = new Float32Array(nextCap * 16);
+      nextArr.set(oldArr);
+      this.mesh.instanceMatrix = new THREE.InstancedBufferAttribute(nextArr, 16);
+      this.mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+      for (let i = nextCap - 1; i >= prevCap; i--) {
+        this.mesh.setMatrixAt(i, _blobShadowHiddenMat);
+        this.freeSlots.push(i);
+      }
+      this._capacity = nextCap;
+    }
+    const slot = this.freeSlots.pop()!;
+    this.activeSlots.add(slot);
+    this.mesh.setMatrixAt(slot, _blobShadowHiddenMat);
+    this.syncCount();
+    this.dirty = true;
+    return slot;
+  }
+
+  public updateSlot(
+    slot: number,
+    worldX: number,
+    worldY: number,
+    worldZ: number,
+    groundY: number,
+    footprintX: number,
+    footprintZ: number,
+    yawRad: number,
+    blobShadowsEnabled: boolean,
+  ): void {
+    if (slot < 0 || slot >= this.capacity) return;
+    if (!blobShadowsEnabled) {
+      this.mesh.setMatrixAt(slot, _blobShadowHiddenMat);
+      this.dirty = true;
+      return;
+    }
+    const heightAboveFloor = Math.max(0, worldY - groundY);
+    const atten = Math.max(0.45, 1.0 - heightAboveFloor * 0.05);
+    _blobShadowPos.set(worldX, groundY + 0.02, worldZ);
+    _blobShadowQuat.setFromAxisAngle(_blobShadowUpAxis, yawRad);
+    _blobShadowScale.set(
+      Math.max(2.2, footprintX) * atten,
+      1.0,
+      Math.max(2.8, footprintZ) * atten,
+    );
+    _blobShadowMat.compose(_blobShadowPos, _blobShadowQuat, _blobShadowScale);
+    this.mesh.setMatrixAt(slot, _blobShadowMat);
+    this.dirty = true;
+  }
+
+  public hideSlot(slot: number): void {
+    if (slot < 0 || slot >= this.capacity) return;
+    this.mesh.setMatrixAt(slot, _blobShadowHiddenMat);
+    this.dirty = true;
+  }
+
+  public releaseSlot(slot: number): void {
+    if (!this.activeSlots.has(slot)) return;
+    this.activeSlots.delete(slot);
+    this.mesh.setMatrixAt(slot, _blobShadowHiddenMat);
+    this.freeSlots.push(slot);
+    this.syncCount();
+    this.dirty = true;
+  }
+
+  private syncCount(): void {
+    let maxSlot = -1;
+    for (const s of this.activeSlots) {
+      if (s > maxSlot) maxSlot = s;
+    }
+    this.mesh.count = maxSlot + 1;
+    this.mesh.visible = this.mesh.count > 0;
+  }
+
+  public commit(): void {
+    if (!this.dirty) return;
+    this.mesh.instanceMatrix.needsUpdate = true;
+    this.dirty = false;
+  }
+
+  public getActiveCount(): number {
+    return this.activeSlots.size;
+  }
+
+  public dispose(): void {
+    this.activeSlots.clear();
+    this.freeSlots.length = 0;
+    this.mesh.count = 0;
+    this.mesh.dispose();
+  }
+}
+
 /**
  * ═══════════════════════════════════════════════════════════════════════════
  * DELIVERABLE 7 (PART A): GPU VOXEL-STEPPED GERSTNER OCEAN SHADER
@@ -1205,9 +1420,14 @@ export function attachGpuGerstnerOceanShader(
     uRenderingPlanar: { value: 0.0 },
   };
   (material as any).userData.waveUniforms = waveUniforms;
-  material.customProgramCacheKey = () => 'gpu_gerstner_ocean_realistic_v3';
+  // Split Realistic Water vs Voxel-Stepped Water into two cached WebGLPrograms via compile-time #define
+  material.customProgramCacheKey = () =>
+    waveUniforms.uRealisticWater.value > 0.5
+      ? 'gpu_gerstner_ocean_realistic_v4'
+      : 'gpu_gerstner_ocean_voxel_v4';
 
   material.onBeforeCompile = (shader) => {
+    const realisticDefine = waveUniforms.uRealisticWater.value > 0.5 ? '#define REALISTIC_WATER 1\n' : '';
     shader.uniforms.uWaveTime = waveUniforms.uWaveTime;
     shader.uniforms.uWavesEnabled = waveUniforms.uWavesEnabled;
     shader.uniforms.uWeatherWaveMult = waveUniforms.uWeatherWaveMult;
@@ -1251,6 +1471,7 @@ export function attachGpuGerstnerOceanShader(
     shader.vertexShader = shader.vertexShader.replace(
       `#include <common>`,
       `
+      ${realisticDefine}
       #include <common>
       uniform float uWaveTime;
       uniform float uWavesEnabled;
@@ -1446,6 +1667,7 @@ export function attachGpuGerstnerOceanShader(
     shader.fragmentShader = shader.fragmentShader.replace(
       `#include <common>`,
       `
+      ${realisticDefine}
       #include <common>
       uniform float uWaveTime;
       uniform float uWavesEnabled;
@@ -1466,34 +1688,33 @@ export function attachGpuGerstnerOceanShader(
       varying vec3 vWaterWorldPos;
       ${oceanBasinGlsl}
 
-      float waterHash(vec2 p) {
-        return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
-      }
-      float waterNoise(vec2 p) {
-        vec2 i = floor(p);
-        vec2 f = fract(p);
-        vec2 u = f * f * (3.0 - 2.0 * f);
-        float a = waterHash(i);
-        float b = waterHash(i + vec2(1.0, 0.0));
-        float c = waterHash(i + vec2(0.0, 1.0));
-        float d = waterHash(i + vec2(1.0, 1.0));
-        return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
-      }
-      float waterFbm(vec2 p) {
-        float v = 0.0;
-        float amp = 0.5;
-        mat2 rot = mat2(0.80, -0.60, 0.60, 0.80);
-        for (int i = 0; i < 4; i++) {
-          v += amp * waterNoise(p);
-          p = rot * p * 2.04 + vec2(11.3, 7.1);
-          amp *= 0.5;
+      #ifdef REALISTIC_WATER
+        float waterHash(vec2 p) {
+          return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
         }
-        return v;
-      }
+        float waterNoise(vec2 p) {
+          vec2 i = floor(p);
+          vec2 f = fract(p);
+          vec2 u = f * f * (3.0 - 2.0 * f);
+          float a = waterHash(i);
+          float b = waterHash(i + vec2(1.0, 0.0));
+          float c = waterHash(i + vec2(0.0, 1.0));
+          float d = waterHash(i + vec2(1.0, 1.0));
+          return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+        }
+        // Optimized 2-octave FBM (cuts per-pixel noise taps from 20 down to 7 on realistic water)
+        float waterFbm(vec2 p) {
+          float v = 0.65 * waterNoise(p);
+          mat2 rot = mat2(0.80, -0.60, 0.60, 0.80);
+          p = rot * p * 2.04 + vec2(11.3, 7.1);
+          v += 0.35 * waterNoise(p);
+          return v;
+        }
+      #endif
       `,
     );
 
-    // Realistic Water Shading runs BEFORE fog/colorspace/tonemap in linear RGB so scene.fog & post-FX stay 100% unified
+    // Realistic Water Shading runs BEFORE fog/colorspace/tonemap in linear RGB (compiled out in Voxel Water mode)
     shader.fragmentShader = shader.fragmentShader.replace(
       `#include <opaque_fragment>`,
       `
@@ -1501,14 +1722,11 @@ export function attachGpuGerstnerOceanShader(
         discard;
       }
       #include <opaque_fragment>
-      if (vIsWaterSurface > 0.5 && uRealisticWater > 0.5) {
+      #ifdef REALISTIC_WATER
+      if (vIsWaterSurface > 0.5) {
         // Any vertical water side face exposed to air: soft translucent water volume, never a chrome mirror wall!
         if (abs(vWaterNormalY) <= 0.5) {
-          vec3 sideCol = vec3(0.018, 0.21, 0.34);
-          if (uWaterOutputSrgb > 0.5) {
-            sideCol = pow(sideCol, vec3(1.0 / 2.2));
-          }
-          gl_FragColor.rgb = sideCol;
+          gl_FragColor.rgb = vec3(0.018, 0.21, 0.34);
           gl_FragColor.a = 0.34;
         } else {
           float animT = uWavesEnabled > 0.5 ? uWaveTime : uWaveTime * 0.28;
@@ -1549,13 +1767,12 @@ export function attachGpuGerstnerOceanShader(
             - 0.08 * ampScale * k4 * (-0.69) * sin(ph4)
           );
 
-          // High-frequency rotating capillary wavelets for photorealistic micro-glitter
+          // High-frequency rotating capillary wavelets (2-octave FBM finite difference)
           float eps = 0.08;
-          vec2 uvA = pXZ * 0.58 + vec2(animT * 0.62, -animT * 0.41);
-          vec2 uvB = pXZ * 1.35 + vec2(-animT * 0.88, animT * 0.73);
-          float r0 = waterFbm(uvA) * 0.65 + waterNoise(uvB) * 0.35;
-          float rx = waterFbm(uvA + vec2(eps, 0.0)) * 0.65 + waterNoise(uvB + vec2(eps * 2.0, 0.0)) * 0.35;
-          float rz = waterFbm(uvA + vec2(0.0, eps)) * 0.65 + waterNoise(uvB + vec2(0.0, eps * 2.0)) * 0.35;
+          vec2 uvA = pXZ * 0.62 + vec2(animT * 0.62, -animT * 0.41);
+          float r0 = waterFbm(uvA);
+          float rx = waterFbm(uvA + vec2(eps, 0.0));
+          float rz = waterFbm(uvA + vec2(0.0, eps));
           float microScale = mix(0.28, 0.12, holeBlend) * mix(0.55, 1.0, waveEnableAmp);
           vec2 gradMicro = vec2(rx - r0, rz - r0) / eps * microScale;
 
@@ -1565,43 +1782,40 @@ export function attachGpuGerstnerOceanShader(
 
           bool isUnderwater = cameraPosition.y < vWaterWorldPos.y - 0.05 || !gl_FrontFacing;
           if (isUnderwater) {
-            // Looking up from underwater: Snell's window looking into sky + deep teal total internal reflection (no milky whitewash!)
             vec3 Nunder = normalize(vec3(N.x * 0.5, -abs(N.y), N.z * 0.5));
             float underNdotV = clamp(dot(Nunder, V), 0.02, 1.0);
             float snellWindow = smoothstep(0.32, 0.72, underNdotV);
             vec3 deepUnderRefl = vec3(0.012, 0.145, 0.255) + vec3(0.015, 0.10, 0.14) * normWave;
             vec3 snellSkyTint = vec3(0.14, 0.42, 0.64);
-            float underGlitter = pow(max(dot(Nunder, normalize(L + V)), 0.0), 64.0) * 0.45;
-            vec3 underCol = mix(deepUnderRefl, snellSkyTint, snellWindow * 0.75) + vec3(0.55, 0.85, 0.96) * underGlitter;
-            if (uWaterOutputSrgb > 0.5) {
-              underCol = pow(max(underCol, vec3(0.0)), vec3(1.0 / 2.2));
-            }
-            gl_FragColor.rgb = underCol;
+            float uh = max(dot(Nunder, normalize(L + V)), 0.0);
+            float uh2 = uh * uh; float uh4 = uh2 * uh2; float uh8 = uh4 * uh4; float uh16 = uh8 * uh8;
+            float underGlitter = (uh16 * uh16 * uh16 * uh16) * 0.45;
+            gl_FragColor.rgb = mix(deepUnderRefl, snellSkyTint, snellWindow * 0.75) + vec3(0.55, 0.85, 0.96) * underGlitter;
             gl_FragColor.a = mix(0.58, 0.18, snellWindow);
           } else {
             float NdotV = clamp(dot(N, V), 0.02, 1.0);
-            float fresnel = 0.03 + 0.97 * pow(1.0 - NdotV, 5.0);
+            float invNdotV = 1.0 - NdotV;
+            float inv2 = invNdotV * invNdotV;
+            float fresnel = 0.03 + 0.97 * (inv2 * inv2 * invNdotV);
 
-            // Beer-Lambert deep-to-shallow linear water absorption + wave crest subsurface scattering
             vec3 abyssCol   = vec3(0.004, 0.030, 0.110);
             vec3 pelagicCol = vec3(0.010, 0.115, 0.255);
             vec3 shallowCol = vec3(0.022, 0.275, 0.355);
             float depthFactor = clamp(oceanExposure * (0.25 + clamp(deepOceanDist / 160.0, 0.0, 0.75)), 0.0, 1.0);
             vec3 waterBodyCol = mix(shallowCol, mix(pelagicCol, abyssCol, depthFactor), clamp(0.35 + depthFactor * 0.65 - normWave * 0.28, 0.0, 1.0));
 
-            // Sunlit translucent teal subsurface scatter through wave crests
-            float sssWrap = pow(clamp(dot(V, -L + N * 0.45), 0.0, 1.0), 3.0);
+            float sssBase = clamp(dot(V, -L + N * 0.45), 0.0, 1.0);
+            float sssWrap = sssBase * sssBase * sssBase;
             float crestHeight = clamp(normWave * (1.0 - holeBlend), 0.0, 1.0);
             waterBodyCol += vec3(0.020, 0.34, 0.39) * (sssWrap * 0.65 + crestHeight * 0.22);
 
-            // Physical reflected sky & clouds along R
             vec3 R = reflect(-V, N);
             float rUp = clamp(R.y, 0.0, 1.0);
             vec3 skyZenith  = vec3(0.045, 0.195, 0.560);
             vec3 skyHorizon = vec3(0.310, 0.540, 0.790);
-            vec3 skyReflCol = mix(skyHorizon, skyZenith, pow(rUp, 0.55));
-            float cloudWisp = smoothstep(0.52, 0.85, waterFbm(R.xz / max(0.14, R.y + 0.18) * 1.4 + animT * 0.02));
-            skyReflCol = mix(skyReflCol, vec3(0.85, 0.90, 0.96), cloudWisp * 0.24 * (1.0 - rUp * 0.5));
+            vec3 skyReflCol = mix(skyHorizon, skyZenith, sqrt(rUp));
+            float cloudWisp = smoothstep(0.52, 0.85, waterNoise(R.xz / max(0.14, R.y + 0.18) * 1.4 + animT * 0.02));
+            skyReflCol = mix(skyReflCol, vec3(0.85, 0.90, 0.96), cloudWisp * 0.22 * (1.0 - rUp * 0.5));
 
             // #14 Real-Time Planar Mirror Reflection sampling with wave distortion
             if (uHasPlanarTex > 0.5) {
@@ -1621,14 +1835,14 @@ export function attachGpuGerstnerOceanShader(
               }
             }
 
-            // GGX / Blinn-Phong solar glitter sparkle path
+            // Blinn-Phong solar glitter sparkle path
             vec3 H = normalize(L + V);
             float NdotH = max(dot(N, H), 0.0);
-            float sunCore = pow(NdotH, 380.0) * 2.8;
-            float sunHalo = pow(NdotH, 52.0) * 0.34;
+            float sunCore = pow(NdotH, 320.0) * 2.6;
+            float sunHalo = pow(NdotH, 48.0) * 0.34;
             vec3 sunGlitter = vec3(1.0, 0.93, 0.80) * (sunCore + sunHalo);
 
-            // Delicate lacy whitecaps on true wave peaks & broken shoreline surf on both beach and road
+            // Shoreline surf & lacy whitecaps
             float swashZone = 0.0;
             if (uWorldGenMode < 0.5) {
               float eastSwash = (1.0 - vIsHoleWater) * smoothstep(-32.0, -25.5, pXZ.x) * (1.0 - smoothstep(-23.0, -20.5, pXZ.x)) * (1.0 - smoothstep(29.0, 37.5, pXZ.y));
@@ -1638,18 +1852,13 @@ export function attachGpuGerstnerOceanShader(
             }
             float shoreBreakerFoam = swashZone * clamp(sin(pXZ.x * 0.22 - animT * 2.15 + sin(pXZ.y * 0.14) * 0.85) * 0.52 + 0.42, 0.0, 1.0);
             float foamNoise = waterFbm(pXZ * 1.15 + vec2(-animT * 0.35, animT * 0.25));
-            float foamDetail = waterNoise(pXZ * 3.1 + vec2(animT * 0.45, -animT * 0.32));
             float crestSignal = smoothstep(0.76, 0.97, normWave) * (0.45 + 0.55 * foamNoise);
-            float surfSignal = shoreBreakerFoam * smoothstep(0.32, 0.78, foamNoise * 0.72 + foamDetail * 0.28);
+            float surfSignal = shoreBreakerFoam * smoothstep(0.32, 0.78, foamNoise);
             float foamMask = (1.0 - smoothstep(0.28, 0.60, holeBlend)) * smoothstep(0.46, 0.86, max(crestSignal, surfSignal * 1.05));
 
             float reflBlend = clamp(0.08 + fresnel * 0.84, 0.08, 0.92);
             vec3 waterLinear = mix(waterBodyCol, skyReflCol, reflBlend) + sunGlitter;
             waterLinear = mix(waterLinear, vec3(0.86, 0.92, 0.97), foamMask * 0.78);
-
-            if (uWaterOutputSrgb > 0.5) {
-              waterLinear = pow(max(waterLinear, vec3(0.0)), vec3(1.0 / 2.2));
-            }
 
             float shallowFade = mix(0.62, 1.0, clamp(oceanExposure * 0.75 + depthFactor * 0.45, 0.0, 1.0));
             gl_FragColor.rgb = waterLinear;
@@ -1657,15 +1866,17 @@ export function attachGpuGerstnerOceanShader(
           }
         }
       }
+      #endif
       `,
     );
 
-    // Classic Voxel-Stepped Water Shader (when BOTH #14 Planar Reflections and #3 SSR are OFF)
+    // Classic Voxel-Stepped Water Shader (compiled ONLY when REALISTIC_WATER is NOT defined)
     shader.fragmentShader = shader.fragmentShader.replace(
       `#include <dithering_fragment>`,
       `
       #include <dithering_fragment>
-      if (vIsWaterSurface > 0.5 && uRealisticWater < 0.5) {
+      #ifndef REALISTIC_WATER
+      if (vIsWaterSurface > 0.5) {
         vec2 voxId = floor(vWaterWorldPos.xz / 0.25);
         vec2 voxUv = fract(vWaterWorldPos.xz / 0.25);
         float cellHash = fract(sin(dot(voxId, vec2(12.9898, 78.233))) * 43758.5453);
@@ -1719,6 +1930,7 @@ export function attachGpuGerstnerOceanShader(
         gl_FragColor.rgb = mix(gl_FragColor.rgb, waveCol, 0.86);
         gl_FragColor.a = max(gl_FragColor.a, mix(0.92, 0.98, isFoamBlock));
       }
+      #endif
       `,
     );
   };

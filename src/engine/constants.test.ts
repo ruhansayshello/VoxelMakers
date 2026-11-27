@@ -5,7 +5,7 @@ import * as THREE_REF from 'three';
 import * as Engine from './index';
 import * as EngineConstants from './constants';
 
-test('src/engine/constants.ts matches Three.js constants exactly', () => {
+test('src/voxl/constants.ts matches Three.js constants exactly', () => {
   const checkedKeys: string[] = [];
   for (const [key, value] of Object.entries(EngineConstants)) {
     const refVal = (THREE_REF as Record<string, unknown>)[key];

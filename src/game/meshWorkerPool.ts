@@ -1,28 +1,51 @@
 import {
   buildAllLodPayloadsForChunk,
+  buildHorizonTilePayload,
   type ChunkMeshJobRequest,
   type ChunkMeshJobResponse,
   type ChunkNeighborBoundarySlices,
+  type HorizonTileJobRequest,
+  type HorizonTileJobResponse,
   type LodSubMeshPayload,
+  type ModifiedChunkSurfaceStamp,
+  type WorkerInitSlabRequest,
   type WorkerPingRequest,
   type WorkerPingResponse,
 } from './meshWorker.ts';
+import type { WorldGenMode } from './constants.ts';
 import { MAT_BUCKET_ALL_MASK, warmUpGreedyMesherScratchpad } from './physicsMath.ts';
 import { perfProfiler } from '../engine/perf/PerfProfiler';
 
-export const MAX_CONCURRENT_CHUNK_LOADS = 2;
+export const MAX_CONCURRENT_CHUNK_LOADS = 4;
+
+const EMPTY_VOXELS = new Uint8Array(0);
+
+export interface EnqueueChunkExtraOptions {
+  priorityScore?: number;
+  slotIndex?: number;
+  useSharedSlab?: boolean;
+  generateSurfaceTerrain?: boolean;
+  worldGenMode?: WorldGenMode;
+  flatBaseplateMat?: number;
+  buildSurfaceLods?: boolean;
+  lod12Only?: boolean;
+}
+
+type AnyWorkerJobRequest = ChunkMeshJobRequest | HorizonTileJobRequest;
+type AnyWorkerJobResponse = ChunkMeshJobResponse | HorizonTileJobResponse;
 
 interface QueuedJob {
-  req: ChunkMeshJobRequest;
-  resolvers: Array<(res: ChunkMeshJobResponse) => void>;
+  req: AnyWorkerJobRequest;
+  priorityScore: number;
+  resolvers: Array<(res: AnyWorkerJobResponse) => void>;
   rejecters: Array<(err: Error) => void>;
 }
 
 interface WorkerSharedArena {
   voxelsSab: SharedArrayBuffer;
   voxelsView: Uint8Array;
-  colorsSab: SharedArrayBuffer;
-  colorsView: Uint8Array;
+  colorsSab: SharedArrayBuffer | null;
+  colorsView: Uint8Array | null;
   westSab: SharedArrayBuffer;
   westView: Uint8Array;
   eastSab: SharedArrayBuffer;
@@ -39,17 +62,19 @@ const MAX_BORDER_SLICE_BYTES = 64 * 320;
 /**
  * Multi-Core CPU Web Worker Pool that scales across `navigator.hardwareConcurrency` cores!
  * - Uses `SharedArrayBuffer` zero-copy arenas when `crossOriginIsolated` is active, with transferable `ArrayBuffer` fallback
- * - Pre-warms idle workers every 1,000 ms with a lightweight "ping" job (#6) so worker threads are never
- *   de-prioritized by the OS after a pause!
+ * - Lazy-allocates full-depth 3D staging SABs ONLY when a non-surface 3D chunk is actually meshed (saves 10-21 MB RAM!)
+ * - Uses 1 dedicated worker on dual-core CPUs (e.g. Pentium) so workers never starve the main render/physics thread.
  */
 export class MultiCoreMeshWorkerPool {
   public readonly coreCount: number;
   public readonly activeWorkers: number;
   public readonly hasDedicatedWorkers: boolean;
   public readonly usesSharedArrayBuffer: boolean;
+  public hasSharedSurfaceSlab = false;
   public completedJobs = 0;
   public pingCount = 0;
 
+  private readonly maxConcurrentJobs: number;
   private workers: Worker[] = [];
   private idleWorkers: Worker[] = [];
   private inFlightCount = 0;
@@ -59,7 +84,7 @@ export class MultiCoreMeshWorkerPool {
   private pendingCallbacks = new Map<
     number,
     {
-      resolvers: Array<(res: ChunkMeshJobResponse) => void>;
+      resolvers: Array<(res: AnyWorkerJobResponse) => void>;
       rejecters: Array<(err: Error) => void>;
     }
   >();
@@ -73,8 +98,16 @@ export class MultiCoreMeshWorkerPool {
         ? navigator.hardwareConcurrency
         : 4;
     this.coreCount = Math.max(2, detectedCores);
-    // Strictly cap concurrent chunk loads at 2 so worker pool never saturates CPU cores during fast driving
-    const targetWorkerCount = MAX_CONCURRENT_CHUNK_LOADS;
+    // On dual-core CPUs (Pentium / Celeron / low-end laptops), spawn 1 worker so the main thread
+    // keeps a dedicated physical core and saves ~30-40 MB of extra V8 worker isolate RAM!
+    const targetWorkerCount =
+      this.coreCount <= 2
+        ? 1
+        : Math.min(
+            MAX_CONCURRENT_CHUNK_LOADS,
+            Math.max(2, Math.floor(this.coreCount / 2)),
+          );
+    this.maxConcurrentJobs = targetWorkerCount;
 
     const canUseSab =
       typeof SharedArrayBuffer !== 'undefined' &&
@@ -88,11 +121,14 @@ export class MultiCoreMeshWorkerPool {
             type: 'module',
           });
           w.onmessage = (
-            e: MessageEvent<ChunkMeshJobResponse | WorkerPingResponse>,
+            e: MessageEvent<ChunkMeshJobResponse | HorizonTileJobResponse | WorkerPingResponse>,
           ) => {
             this.handleWorkerResponse(w, e.data);
           };
           w.onerror = (evt: ErrorEvent) => {
+            if (typeof console !== 'undefined' && console.error) {
+              console.error('[MeshWorkerPool] worker error:', evt?.message || evt);
+            }
             // Recover active job and dispatch next queued job so worker pool never deadlocks
             const failedJobId = this.activeJobByWorker.get(w);
             if (failedJobId !== undefined) {
@@ -107,36 +143,14 @@ export class MultiCoreMeshWorkerPool {
                 }
               }
             }
-            if (this.queue.length > 0 && this.inFlightCount < MAX_CONCURRENT_CHUNK_LOADS) {
-              const next = this.queue.shift()!;
+            if (this.queue.length > 0 && this.inFlightCount < this.maxConcurrentJobs) {
+              const next = this.popBestQueuedJob()!;
               this.inFlightCount++;
               this.dispatchToWorker(w, next);
             } else if (!this.idleWorkers.includes(w)) {
               this.idleWorkers.push(w);
             }
           };
-          if (canUseSab) {
-            const voxelsSab = new SharedArrayBuffer(MAX_CHUNK_VOXELS_BYTES);
-            const colorsSab = new SharedArrayBuffer(MAX_CHUNK_VOXELS_BYTES * 3);
-            const westSab = new SharedArrayBuffer(MAX_BORDER_SLICE_BYTES);
-            const eastSab = new SharedArrayBuffer(MAX_BORDER_SLICE_BYTES);
-            const northSab = new SharedArrayBuffer(MAX_BORDER_SLICE_BYTES);
-            const southSab = new SharedArrayBuffer(MAX_BORDER_SLICE_BYTES);
-            this.workerSharedArenas.set(w, {
-              voxelsSab,
-              voxelsView: new Uint8Array(voxelsSab),
-              colorsSab,
-              colorsView: new Uint8Array(colorsSab),
-              westSab,
-              westView: new Uint8Array(westSab),
-              eastSab,
-              eastView: new Uint8Array(eastSab),
-              northSab,
-              northView: new Uint8Array(northSab),
-              southSab,
-              southView: new Uint8Array(southSab),
-            });
-          }
           this.workers.push(w);
           this.idleWorkers.push(w);
         }
@@ -147,25 +161,176 @@ export class MultiCoreMeshWorkerPool {
       }
     }
     this.hasDedicatedWorkers = this.workers.length > 0;
-    this.activeWorkers = Math.max(2, this.workers.length || targetWorkerCount);
+    this.activeWorkers = Math.max(1, this.workers.length || targetWorkerCount);
 
-    // Pre-warm the worker pool immediately and keep workers warm every 1 second (#6)
+    // Pre-warm the worker pool immediately; use gentler keepalive cadence on dual-core CPUs
     warmUpGreedyMesherScratchpad();
     if (this.hasDedicatedWorkers) {
       this.pingIdleWorkers();
+      const pingIntervalMs = this.coreCount <= 2 ? 4000 : 1500;
       this.keepAliveTimer = setInterval(() => {
         this.pingIdleWorkers();
-      }, 1000);
+      }, pingIntervalMs);
       if (typeof (this.keepAliveTimer as any)?.unref === 'function') {
         (this.keepAliveTimer as any).unref();
       }
     }
   }
 
+  private getOrCreateSharedArena(worker: Worker, needsColors: boolean): WorkerSharedArena | null {
+    if (!this.usesSharedArrayBuffer) return null;
+    let arena = this.workerSharedArenas.get(worker);
+    if (!arena) {
+      try {
+        const voxelsSab = new SharedArrayBuffer(MAX_CHUNK_VOXELS_BYTES);
+        const westSab = new SharedArrayBuffer(MAX_BORDER_SLICE_BYTES);
+        const eastSab = new SharedArrayBuffer(MAX_BORDER_SLICE_BYTES);
+        const northSab = new SharedArrayBuffer(MAX_BORDER_SLICE_BYTES);
+        const southSab = new SharedArrayBuffer(MAX_BORDER_SLICE_BYTES);
+        arena = {
+          voxelsSab,
+          voxelsView: new Uint8Array(voxelsSab),
+          colorsSab: null,
+          colorsView: null,
+          westSab,
+          westView: new Uint8Array(westSab),
+          eastSab,
+          eastView: new Uint8Array(eastSab),
+          northSab,
+          northView: new Uint8Array(northSab),
+          southSab,
+          southView: new Uint8Array(southSab),
+        };
+        this.workerSharedArenas.set(worker, arena);
+      } catch {
+        return null;
+      }
+    }
+    if (needsColors && !arena.colorsSab) {
+      try {
+        const colorsSab = new SharedArrayBuffer(MAX_CHUNK_VOXELS_BYTES * 3);
+        arena.colorsSab = colorsSab;
+        arena.colorsView = new Uint8Array(colorsSab);
+      } catch {
+        // Fallback to non-SAB transfer if allocation fails
+      }
+    }
+    return arena;
+  }
+
   /**
-   * Sends a tiny "ping" job to all currently idle workers (#6) so the OS never de-prioritizes
-   * or parks worker threads during quiet driving pauses.
+   * Shares the single VoxelWorld SharedArrayBuffer surface slab once with every worker
+   * so workers read/write surface chunks directly by `slotIndex` with zero cloning or copying!
    */
+  public attachSharedSurfaceSlab(
+    surfaceVoxelsSab: SharedArrayBuffer | null,
+    surfaceHeightSab: SharedArrayBuffer | null,
+    surfaceVoxelsStride: number,
+    surfaceHeightStride: number,
+    surfaceSlabCapacity: number,
+  ): void {
+    if (!surfaceVoxelsSab || !surfaceHeightSab || this.workers.length === 0) {
+      this.hasSharedSurfaceSlab = false;
+      return;
+    }
+    const msg: WorkerInitSlabRequest = {
+      type: 'initSlab',
+      surfaceVoxelsSab,
+      surfaceHeightSab,
+      surfaceVoxelsStride,
+      surfaceHeightStride,
+      surfaceSlabCapacity,
+    };
+    for (let i = 0; i < this.workers.length; i++) {
+      this.workers[i].postMessage(msg);
+    }
+    this.hasSharedSurfaceSlab = true;
+  }
+
+  private popBestQueuedJob(): QueuedJob | undefined {
+    const len = this.queue.length;
+    if (len === 0) return undefined;
+    let bestIdx = 0;
+    let bestScore = this.queue[0].priorityScore;
+    for (let i = 1; i < len; i++) {
+      if (this.queue[i].priorityScore < bestScore) {
+        bestScore = this.queue[i].priorityScore;
+        bestIdx = i;
+      }
+    }
+    const picked = this.queue[bestIdx];
+    const last = this.queue.pop()!;
+    if (bestIdx < this.queue.length) {
+      this.queue[bestIdx] = last;
+    }
+    return picked;
+  }
+
+  /**
+   * Drops queued jobs that have drifted outside `maxChebRad` of `(centerCX, centerCZ)`
+   * so workers never waste CPU meshing chunks the player already drove past.
+   */
+  public cancelOutOfRangeJobs(
+    centerCX: number,
+    centerCZ: number,
+    maxChebRad: number,
+  ): number {
+    if (this.queue.length === 0) return 0;
+    let cancelled = 0;
+    const cancelErr = new Error('Chunk mesh job out of range');
+    let i = 0;
+    while (i < this.queue.length) {
+      const q = this.queue[i];
+      if (q.req.type === 'horizonTile') {
+        i++;
+        continue;
+      }
+      const cheb = Math.max(
+        Math.abs(q.req.cx - centerCX),
+        Math.abs(q.req.cz - centerCZ),
+      );
+      if (cheb > maxChebRad) {
+        const last = this.queue.pop()!;
+        if (i < this.queue.length) {
+          this.queue[i] = last;
+        }
+        for (let k = 0; k < q.rejecters.length; k++) {
+          q.rejecters[k](cancelErr);
+        }
+        cancelled++;
+      } else {
+        i++;
+      }
+    }
+    return cancelled;
+  }
+
+  /**
+   * Drops queued horizon tile jobs whose tileKey is no longer in the active desired set.
+   */
+  public cancelStaleHorizonJobs(activeTileKeys: ReadonlySet<string>): number {
+    if (this.queue.length === 0) return 0;
+    let cancelled = 0;
+    const cancelErr = new Error('Horizon tile job out of range');
+    let i = 0;
+    while (i < this.queue.length) {
+      const q = this.queue[i];
+      if (q.req.type === 'horizonTile' && !activeTileKeys.has(q.req.tileKey)) {
+        const last = this.queue.pop()!;
+        if (i < this.queue.length) {
+          this.queue[i] = last;
+        }
+        for (let k = 0; k < q.rejecters.length; k++) {
+          q.rejecters[k](cancelErr);
+        }
+        cancelled++;
+      } else {
+        i++;
+      }
+    }
+    return cancelled;
+  }
+
   public pingIdleWorkers(): number {
     if (this.workers.length === 0) {
       warmUpGreedyMesherScratchpad();
@@ -204,48 +369,61 @@ export class MultiCoreMeshWorkerPool {
 
   private handleWorkerResponse(
     worker: Worker,
-    res: ChunkMeshJobResponse | WorkerPingResponse,
+    res: ChunkMeshJobResponse | HorizonTileJobResponse | WorkerPingResponse,
   ): void {
     if (res && res.type === 'pong') {
       return;
     }
     const _tRespStart = typeof performance !== 'undefined' ? performance.now() : 0;
-    const meshRes = res as ChunkMeshJobResponse;
-    const sentAt = this.jobDispatchTimeMs.get(meshRes.jobId);
+    const sentAt = this.jobDispatchTimeMs.get(res.jobId);
     if (sentAt !== undefined) {
-      this.jobDispatchTimeMs.delete(meshRes.jobId);
+      this.jobDispatchTimeMs.delete(res.jobId);
       if (_tRespStart > 0) {
         perfProfiler.recordWorkerRoundTrip(_tRespStart - sentAt);
       }
     }
     this.activeJobByWorker.delete(worker);
-    this.unwrapTransferredPayload(meshRes.lod0);
-    if (meshRes.lod0Buckets) {
-      this.unwrapTransferredPayload(meshRes.lod0Buckets[0]);
-      this.unwrapTransferredPayload(meshRes.lod0Buckets[1]);
-      this.unwrapTransferredPayload(meshRes.lod0Buckets[2]);
+
+    if (res.type === 'horizonTile') {
+      this.unwrapTransferredPayload(res.opaque);
+      this.unwrapTransferredPayload(res.water);
+    } else {
+      const meshRes = res as ChunkMeshJobResponse;
+      this.unwrapTransferredPayload(meshRes.lod0);
+      if (meshRes.lod0Buckets) {
+        this.unwrapTransferredPayload(meshRes.lod0Buckets[0]);
+        this.unwrapTransferredPayload(meshRes.lod0Buckets[1]);
+        this.unwrapTransferredPayload(meshRes.lod0Buckets[2]);
+      }
+      this.unwrapTransferredPayload(meshRes.lod1);
+      this.unwrapTransferredPayload(meshRes.lod2);
+      this.unwrapTransferredPayload(meshRes.lod3);
+      this.unwrapTransferredPayload(meshRes.transLod0);
+      this.unwrapTransferredPayload(meshRes.transLod1);
+      this.unwrapTransferredPayload(meshRes.transLod2);
+      if (meshRes.generatedSurfaceVoxelsBuffer instanceof ArrayBuffer) {
+        meshRes.generatedSurfaceVoxels = new Uint8Array(meshRes.generatedSurfaceVoxelsBuffer);
+      }
+      if (meshRes.generatedSurfaceHeightMapBuffer instanceof ArrayBuffer) {
+        meshRes.generatedSurfaceHeightMap = new Uint16Array(meshRes.generatedSurfaceHeightMapBuffer);
+      }
     }
-    this.unwrapTransferredPayload(meshRes.lod1);
-    this.unwrapTransferredPayload(meshRes.lod2);
-    this.unwrapTransferredPayload(meshRes.transLod0);
-    this.unwrapTransferredPayload(meshRes.transLod1);
-    this.unwrapTransferredPayload(meshRes.transLod2);
 
     this.completedJobs++;
     this.inFlightCount = Math.max(0, this.inFlightCount - 1);
-    const cb = this.pendingCallbacks.get(meshRes.jobId);
+    const cb = this.pendingCallbacks.get(res.jobId);
     if (cb) {
-      this.pendingCallbacks.delete(meshRes.jobId);
+      this.pendingCallbacks.delete(res.jobId);
       for (let k = 0; k < cb.resolvers.length; k++) {
-        cb.resolvers[k](meshRes);
+        cb.resolvers[k](res);
       }
     }
     if (_tRespStart > 0) {
       perfProfiler.recordWorkerMessage(performance.now() - _tRespStart);
     }
 
-    if (this.queue.length > 0 && this.inFlightCount < MAX_CONCURRENT_CHUNK_LOADS) {
-      const next = this.queue.shift()!;
+    if (this.queue.length > 0 && this.inFlightCount < this.maxConcurrentJobs) {
+      const next = this.popBestQueuedJob()!;
       this.inFlightCount++;
       this.dispatchToWorker(worker, next);
     } else if (!this.idleWorkers.includes(worker)) {
@@ -263,7 +441,38 @@ export class MultiCoreMeshWorkerPool {
       resolvers: job.resolvers,
       rejecters: job.rejecters,
     });
-    const arena = this.workerSharedArenas.get(worker);
+
+    if (job.req.type === 'horizonTile') {
+      worker.postMessage(job.req);
+      if (_tSendStart > 0) {
+        perfProfiler.recordWorkerMessage(performance.now() - _tSendStart);
+      }
+      return;
+    }
+
+    // Fast zero-copy path: worker either generates procedural surface terrain off-thread
+    // or reads directly from the single shared VoxelWorld surface slab by slotIndex!
+    if (
+      job.req.generateSurfaceTerrain ||
+      (job.req.useSharedSlab && this.hasSharedSurfaceSlab && job.req.isSurfaceOnly)
+    ) {
+      const payload: ChunkMeshJobRequest = {
+        ...job.req,
+        type: 'mesh',
+        voxels: EMPTY_VOXELS,
+        surfaceHeightMap: undefined,
+        customColors: undefined,
+        neighborBorders: undefined,
+        pendingRemovals: undefined,
+      };
+      worker.postMessage(payload);
+      if (_tSendStart > 0) {
+        perfProfiler.recordWorkerMessage(performance.now() - _tSendStart);
+      }
+      return;
+    }
+
+    const arena = this.getOrCreateSharedArena(worker, Boolean(job.req.customColors));
     if (arena && job.req.voxels.byteLength <= arena.voxelsView.byteLength) {
       const vLen = job.req.voxels.byteLength;
       arena.voxelsView.set(job.req.voxels, 0);
@@ -279,6 +488,8 @@ export class MultiCoreMeshWorkerPool {
       let customColorsShared: Uint8Array | undefined = undefined;
       if (
         job.req.customColors &&
+        arena.colorsSab &&
+        arena.colorsView &&
         job.req.customColors.byteLength <= arena.colorsView.byteLength
       ) {
         const cLen = job.req.customColors.byteLength;
@@ -400,11 +611,12 @@ export class MultiCoreMeshWorkerPool {
     isSurfaceOnly = false,
     surfaceHeightMap?: Uint16Array,
     neighborSurfaceHeights?: {
-      west?: Uint8Array;
-      east?: Uint8Array;
-      north?: Uint8Array;
-      south?: Uint8Array;
+      west?: Uint16Array | Uint8Array;
+      east?: Uint16Array | Uint8Array;
+      north?: Uint16Array | Uint8Array;
+      south?: Uint16Array | Uint8Array;
     },
+    extraOpts?: EnqueueChunkExtraOptions,
   ): Promise<ChunkMeshJobResponse> {
     const jobId = this.nextJobId++;
     const clonedPending =
@@ -427,11 +639,18 @@ export class MultiCoreMeshWorkerPool {
       transMaxY,
       dirtyBucketMask,
       lod0Only,
+      lod12Only: extraOpts?.lod12Only,
       neighborBorders,
       pendingRemovals: clonedPending,
       isSurfaceOnly,
       surfaceHeightMap,
       neighborSurfaceHeights,
+      slotIndex: extraOpts?.slotIndex,
+      useSharedSlab: extraOpts?.useSharedSlab,
+      generateSurfaceTerrain: extraOpts?.generateSurfaceTerrain,
+      worldGenMode: extraOpts?.worldGenMode,
+      flatBaseplateMat: extraOpts?.flatBaseplateMat,
+      buildSurfaceLods: extraOpts?.buildSurfaceLods,
     };
 
     if (this.workers.length === 0) {
@@ -449,20 +668,113 @@ export class MultiCoreMeshWorkerPool {
       return Promise.resolve(buildAllLodPayloadsForChunk(req));
     }
 
+    const priorityScore = extraOpts?.priorityScore ?? 1000;
     return new Promise<ChunkMeshJobResponse>((resolve, reject) => {
-      // If this chunk is already queued and waiting for a worker, replace the stale queued job in-place without nesting closures
+      // If this chunk is already queued and waiting for a worker, coalesce without letting a lod12Only job clobber a full LOD0 rebuild
       for (let i = 0; i < this.queue.length; i++) {
-        if (this.queue[i].req.cx === cx && this.queue[i].req.cz === cz) {
+        const qReq = this.queue[i].req;
+        if (qReq.type !== 'horizonTile' && qReq.cx === cx && qReq.cz === cz) {
           const prevJob = this.queue[i];
-          prevJob.req = req;
-          prevJob.resolvers.push(resolve);
+          if (!qReq.lod12Only && req.lod12Only) {
+            // Upgrade the existing full job to also build LOD1/2/3 in the same pass
+            qReq.lod0Only = false;
+            qReq.buildSurfaceLods = true;
+          } else {
+            prevJob.req = req;
+          }
+          prevJob.priorityScore = Math.min(prevJob.priorityScore, priorityScore);
+          prevJob.resolvers.push(resolve as (res: AnyWorkerJobResponse) => void);
           prevJob.rejecters.push(reject);
           return;
         }
       }
-      const job: QueuedJob = { req, resolvers: [resolve], rejecters: [reject] };
+      const job: QueuedJob = {
+        req,
+        priorityScore,
+        resolvers: [resolve as (res: AnyWorkerJobResponse) => void],
+        rejecters: [reject],
+      };
       if (
-        this.inFlightCount < MAX_CONCURRENT_CHUNK_LOADS &&
+        this.inFlightCount < this.maxConcurrentJobs &&
+        this.idleWorkers.length > 0
+      ) {
+        const freeWorker = this.idleWorkers.pop()!;
+        this.inFlightCount++;
+        this.dispatchToWorker(freeWorker, job);
+      } else {
+        this.queue.push(job);
+      }
+    });
+  }
+
+  public enqueueHorizonTileJob(
+    params: {
+      tileKey: string;
+      level: number;
+      tx: number;
+      tz: number;
+      tileChunks: number;
+      stepVoxels: number;
+      txBig?: bigint;
+      tzBig?: bigint;
+      tileChunksBig?: bigint;
+      stepVoxelsBig?: bigint;
+      gridCells?: number;
+      scaleBand?: number;
+      bandScaleMetersBig?: bigint;
+      worldGenMode: WorldGenMode;
+      flatBaseplateMat: number;
+      stamps?: ModifiedChunkSurfaceStamp[];
+    },
+    priorityScore = 600,
+  ): Promise<HorizonTileJobResponse> {
+    const jobId = this.nextJobId++;
+    const req: HorizonTileJobRequest = {
+      type: 'horizonTile',
+      jobId,
+      tileKey: params.tileKey,
+      level: params.level,
+      tx: params.tx,
+      tz: params.tz,
+      tileChunks: params.tileChunks,
+      stepVoxels: params.stepVoxels,
+      txBig: params.txBig,
+      tzBig: params.tzBig,
+      tileChunksBig: params.tileChunksBig,
+      stepVoxelsBig: params.stepVoxelsBig,
+      gridCells: params.gridCells,
+      scaleBand: params.scaleBand,
+      bandScaleMetersBig: params.bandScaleMetersBig,
+      worldGenMode: params.worldGenMode,
+      flatBaseplateMat: params.flatBaseplateMat,
+      stamps: params.stamps,
+    };
+
+    if (this.workers.length === 0) {
+      this.completedJobs++;
+      return Promise.resolve(buildHorizonTilePayload(req));
+    }
+
+    return new Promise<HorizonTileJobResponse>((resolve, reject) => {
+      for (let i = 0; i < this.queue.length; i++) {
+        const qReq = this.queue[i].req;
+        if (qReq.type === 'horizonTile' && qReq.tileKey === params.tileKey) {
+          const prevJob = this.queue[i];
+          prevJob.req = req;
+          prevJob.priorityScore = Math.min(prevJob.priorityScore, priorityScore);
+          prevJob.resolvers.push(resolve as (res: AnyWorkerJobResponse) => void);
+          prevJob.rejecters.push(reject);
+          return;
+        }
+      }
+      const job: QueuedJob = {
+        req,
+        priorityScore,
+        resolvers: [resolve as (res: AnyWorkerJobResponse) => void],
+        rejecters: [reject],
+      };
+      if (
+        this.inFlightCount < this.maxConcurrentJobs &&
         this.idleWorkers.length > 0
       ) {
         const freeWorker = this.idleWorkers.pop()!;

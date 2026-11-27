@@ -1,13 +1,9 @@
 import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import * as THREE from 'three';
-import { MULTIPLAYER_BADGE_COLORS } from '../multiplayer';
 import { isWaterBasinArea, type MicroVoxelWorld } from '../world';
 import type { ModularVehicleRig } from '../vehicle';
 import type { TeleportNode } from '../gameModesEngine';
-import {
-  isMobileDevice,
-  computeTacticalMapRenderRadiusChunks,
-} from '../touchControls';
+import { isMobileDevice } from '../touchControls';
 
 export type WaypointIconKind =
   | 'FLAG'
@@ -139,6 +135,7 @@ export const WAYPOINT_ICON_OPTIONS: ReadonlyArray<{
 ];
 
 const CUSTOM_WAYPOINTS_STORAGE_KEY = 'voxel_tactical_map_waypoints_v1';
+const SAVED_PATH_STORAGE_KEY = 'voxel_tactical_map_path_v1';
 
 const DEFAULT_CUSTOM_WAYPOINTS: CustomMapWaypoint[] = [
   {
@@ -171,17 +168,6 @@ const DEFAULT_CUSTOM_WAYPOINTS: CustomMapWaypoint[] = [
     icon: 'ANCHOR',
     createdAt: 3,
   },
-  {
-    id: 'wp-bridge-site',
-    name: 'North Gorge Construction Site',
-    x: -44,
-    y: 12.0,
-    z: -92,
-    color: '#facc15',
-    icon: 'CONSTRUCTION',
-    isConstructionMarker: true,
-    createdAt: 4,
-  },
 ];
 
 export function loadCustomWaypoints(): CustomMapWaypoint[] {
@@ -210,6 +196,31 @@ export function saveCustomWaypoints(waypoints: CustomMapWaypoint[]): void {
   if (typeof window === 'undefined' || !window.localStorage) return;
   try {
     window.localStorage.setItem(CUSTOM_WAYPOINTS_STORAGE_KEY, JSON.stringify(waypoints));
+  } catch {
+    // Ignore storage quota
+  }
+}
+
+function loadSavedPathPoints(): MapRoutePoint[] {
+  if (typeof window === 'undefined' || !window.localStorage) return [];
+  try {
+    const raw = window.localStorage.getItem(SAVED_PATH_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (p): p is MapRoutePoint =>
+        p && typeof p.x === 'number' && typeof p.y === 'number' && typeof p.z === 'number',
+    );
+  } catch {
+    return [];
+  }
+}
+
+function savePathPoints(points: MapRoutePoint[]): void {
+  if (typeof window === 'undefined' || !window.localStorage) return;
+  try {
+    window.localStorage.setItem(SAVED_PATH_STORAGE_KEY, JSON.stringify(points));
   } catch {
     // Ignore storage quota
   }
@@ -475,13 +486,13 @@ export interface FullScreenMapProps {
   activeSpinupNodeId?: string | null;
   spinupProgress?: number;
   onTeleportToNode?: (nodeId: string) => void;
+  onTeleportToCoords?: (x: number, y: number, z: number) => void;
   onDeleteTeleportNode?: (nodeId: string) => void;
   onDropBeaconHere?: (name: string) => void;
   onRemoveBeacon?: (nodeId: string) => void;
 }
 
 const _projV3 = new THREE.Vector3();
-const _fwdTmp = new THREE.Vector3();
 const _raycaster = new THREE.Raycaster();
 const _mouseNDCTmp = new THREE.Vector2();
 
@@ -501,359 +512,132 @@ function projectWorldToScreen(
   return { sx, sy, visible };
 }
 
-function drawWaypointSymbol(
-  ctx: CanvasRenderingContext2D,
-  icon: WaypointIconKind,
-  cx: number,
-  cy: number,
-  size: number,
-  color: string,
-): void {
-  ctx.save();
-  ctx.translate(cx, cy);
-
-  ctx.fillStyle = 'rgba(0,0,0,0.7)';
-  ctx.fillRect(-size * 0.7 + 2, -size * 0.7 + 2, size * 1.4, size * 1.4);
-
-  ctx.fillStyle = '#18181b';
-  ctx.strokeStyle = color;
-  ctx.lineWidth = 1.8;
-  ctx.fillRect(-size * 0.7, -size * 0.7, size * 1.4, size * 1.4);
-  ctx.strokeRect(-size * 0.7, -size * 0.7, size * 1.4, size * 1.4);
-
-  ctx.fillStyle = color;
-  ctx.strokeStyle = color;
-  ctx.lineWidth = 1.8;
-
-  switch (icon) {
-    case 'FLAG': {
-      ctx.beginPath();
-      ctx.moveTo(-size * 0.3, size * 0.45);
-      ctx.lineTo(-size * 0.3, -size * 0.45);
-      ctx.stroke();
-      ctx.beginPath();
-      ctx.moveTo(-size * 0.3, -size * 0.45);
-      ctx.lineTo(size * 0.45, -size * 0.2);
-      ctx.lineTo(-size * 0.3, 0.05);
-      ctx.closePath();
-      ctx.fill();
-      break;
-    }
-    case 'TARGET': {
-      ctx.beginPath();
-      ctx.arc(0, 0, size * 0.38, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.beginPath();
-      ctx.moveTo(-size * 0.52, 0);
-      ctx.lineTo(size * 0.52, 0);
-      ctx.moveTo(0, -size * 0.52);
-      ctx.lineTo(0, size * 0.52);
-      ctx.stroke();
-      break;
-    }
-    case 'WRENCH': {
-      ctx.beginPath();
-      for (let i = 0; i < 6; i++) {
-        const a = (i * Math.PI) / 3;
-        const rx = Math.cos(a) * size * 0.42;
-        const ry = Math.sin(a) * size * 0.42;
-        if (i === 0) ctx.moveTo(rx, ry);
-        else ctx.lineTo(rx, ry);
-      }
-      ctx.closePath();
-      ctx.stroke();
-      ctx.beginPath();
-      ctx.arc(0, 0, size * 0.16, 0, Math.PI * 2);
-      ctx.fill();
-      break;
-    }
-    case 'HAZARD': {
-      ctx.beginPath();
-      ctx.moveTo(0, -size * 0.46);
-      ctx.lineTo(size * 0.46, size * 0.42);
-      ctx.lineTo(-size * 0.46, size * 0.42);
-      ctx.closePath();
-      ctx.stroke();
-      ctx.fillRect(-1, -size * 0.14, 2, size * 0.28);
-      break;
-    }
-    case 'STAR': {
-      ctx.beginPath();
-      for (let i = 0; i < 10; i++) {
-        const r = i % 2 === 0 ? size * 0.46 : size * 0.2;
-        const a = (i * Math.PI) / 5 - Math.PI / 2;
-        const sx = Math.cos(a) * r;
-        const sy = Math.sin(a) * r;
-        if (i === 0) ctx.moveTo(sx, sy);
-        else ctx.lineTo(sx, sy);
-      }
-      ctx.closePath();
-      ctx.fill();
-      break;
-    }
-    case 'ANCHOR': {
-      ctx.beginPath();
-      ctx.moveTo(0, -size * 0.4);
-      ctx.lineTo(0, size * 0.38);
-      ctx.moveTo(-size * 0.35, -size * 0.12);
-      ctx.lineTo(size * 0.35, -size * 0.12);
-      ctx.stroke();
-      ctx.beginPath();
-      ctx.arc(0, 0, size * 0.38, 0.15 * Math.PI, 0.85 * Math.PI);
-      ctx.stroke();
-      break;
-    }
-    case 'RUNWAY': {
-      ctx.beginPath();
-      ctx.moveTo(0, -size * 0.45);
-      ctx.lineTo(size * 0.42, size * 0.15);
-      ctx.lineTo(0, 0);
-      ctx.lineTo(-size * 0.42, size * 0.15);
-      ctx.closePath();
-      ctx.fill();
-      break;
-    }
-    case 'CONSTRUCTION': {
-      ctx.strokeRect(-size * 0.38, -size * 0.38, size * 0.76, size * 0.76);
-      ctx.beginPath();
-      ctx.moveTo(-size * 0.38, -size * 0.38);
-      ctx.lineTo(size * 0.38, size * 0.38);
-      ctx.moveTo(size * 0.38, -size * 0.38);
-      ctx.lineTo(-size * 0.38, size * 0.38);
-      ctx.stroke();
-      break;
-    }
-  }
-  ctx.restore();
+interface UnifiedWaypointEntry {
+  id: string;
+  name: string;
+  x: number;
+  y: number;
+  z: number;
+  color: string;
+  isCustom: boolean;
+  nodeId?: string;
 }
 
 export const FullScreenMap: React.FC<FullScreenMapProps> = ({
   isOpen,
   onClose,
   world,
-  vehicles,
-  localVehicle,
-  isSeatedInRig,
   localPlayerPos,
-  localPlayerYawRad,
   localPlayerName,
-  localPlayerColor,
-  remotePlayers,
   camera,
   tacticalCamState,
-  tacticalGridVisible,
-  onToggleGrid,
   onPanTacticalMap,
   onZoomTacticalMap,
   onSetTacticalMapAltitude,
-  onSetTacticalMapTopDown,
   onCenterTacticalMapOnPlayer,
-  onFocusTacticalMapOn,
   teleportNodes = [],
-  combatCooldownSec = 0,
-  activeSpinupNodeId = null,
-  spinupProgress = 0,
   onTeleportToNode,
+  onTeleportToCoords,
   onDeleteTeleportNode,
-  onPlaceBeaconAtPlayer,
-  onDropBeaconHere,
-  onRemoveBeacon,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const gridHeightCacheRef = useRef<Map<string, number>>(new Map());
   const touchPinchDistRef = useRef<number | null>(null);
-  const lastCursorUpdateMsRef = useRef<number>(0);
+  const isDraggingRef = useRef(false);
+  const dragStartRef = useRef<{ clientX: number; clientY: number }>({ clientX: 0, clientY: 0 });
+  const hasDraggedRef = useRef(false);
 
   const [isMobileMap, setIsMobileMap] = useState<boolean>(() => {
     if (typeof window === 'undefined') return false;
     return isMobileDevice() || window.innerWidth < 900 || window.innerHeight < 540;
   });
-  const isMobileMapRef = useRef<boolean>(isMobileMap);
-  isMobileMapRef.current = isMobileMap;
-  const [mobileDrawerOpen, setMobileDrawerOpen] = useState<boolean>(false);
 
   useEffect(() => {
     const updateMobileMapMode = () => {
       if (typeof window === 'undefined') return;
-      const compact =
-        isMobileDevice() || window.innerWidth < 900 || window.innerHeight < 540;
-      setIsMobileMap(compact);
+      setIsMobileMap(
+        isMobileDevice() || window.innerWidth < 900 || window.innerHeight < 540,
+      );
     };
     window.addEventListener('resize', updateMobileMapMode);
-    window.addEventListener('voxelmakers-touch-mode-change', updateMobileMapMode);
-    return () => {
-      window.removeEventListener('resize', updateMobileMapMode);
-      window.removeEventListener('voxelmakers-touch-mode-change', updateMobileMapMode);
-    };
+    return () => window.removeEventListener('resize', updateMobileMapMode);
   }, []);
 
-  // Active interaction tool
+  // Only 3 clean interaction modes:
+  // 'PAN_SELECT' (Click any waypoint to teleport)
+  // 'ADD_WAYPOINT' (Click on map to add a waypoint)
+  // 'DRAW_ROUTE' (Mark Path: click on map to add path points)
   const [activeTool, setActiveTool] = useState<MapInteractionTool>('PAN_SELECT');
   const activeToolRef = useRef<MapInteractionTool>('PAN_SELECT');
   activeToolRef.current = activeTool;
 
-  // Layer visibility toggles (minimal on mobile by default so the 2.5D terrain stays clean)
-  const [layers, setLayers] = useState<MapLayerVisibility>(() => {
-    const compact =
-      typeof window !== 'undefined' &&
-      (isMobileDevice() || window.innerWidth < 900 || window.innerHeight < 540);
-    return {
-      terrainLabels: !compact,
-      waterDepth: false,
-      roadsBridgesTunnels: false,
-      vehiclesAndTrails: true,
-      engineeringFeatures: !compact,
-      navigationAndGrid: true,
-    };
-  });
-  const layersRef = useRef<MapLayerVisibility>(layers);
-  layersRef.current = layers;
-
-  // Custom Waypoints state (persisted)
   const [customWaypoints, setCustomWaypoints] = useState<CustomMapWaypoint[]>(() =>
     loadCustomWaypoints(),
   );
   const customWaypointsRef = useRef<CustomMapWaypoint[]>(customWaypoints);
   customWaypointsRef.current = customWaypoints;
 
-  const [selectedWaypointId, setSelectedWaypointId] = useState<string | null>(
-    () => customWaypoints[0]?.id ?? null,
+  const [wpDraftName, setWpDraftName] = useState<string>('');
+  const [routePoints, setRoutePoints] = useState<MapRoutePoint[]>(() =>
+    loadSavedPathPoints(),
   );
-  const selectedWaypointIdRef = useRef<string | null>(selectedWaypointId);
-  selectedWaypointIdRef.current = selectedWaypointId;
-
-  // Waypoint creation / editing draft fields
-  const [wpDraftName, setWpDraftName] = useState<string>('Tactical Marker');
-  const [wpDraftColor, setWpDraftColor] = useState<string>('#facc15');
-  const [wpDraftIcon, setWpDraftIcon] = useState<WaypointIconKind>('FLAG');
-
-  // Explosion / Crater markers
-  const [craterMarkers, setCraterMarkers] = useState<MapExplosionCraterMarker[]>([
-    {
-      id: 'crater-c4-east',
-      x: 58,
-      y: -1.5,
-      z: 22,
-      radiusMeters: 14,
-      label: 'C4 Blast Crater #1',
-      timestamp: 1,
-    },
-    {
-      id: 'crater-ordnance-north',
-      x: -28,
-      y: 3.0,
-      z: -56,
-      radiusMeters: 18,
-      label: 'Artillery Impact Zone',
-      timestamp: 2,
-    },
-  ]);
-  const craterMarkersRef = useRef<MapExplosionCraterMarker[]>(craterMarkers);
-  craterMarkersRef.current = craterMarkers;
-
-  // Distance Measurement Tool (Ruler A -> B)
-  const [rulerPointA, setRulerPointA] = useState<{ x: number; y: number; z: number } | null>(null);
-  const [rulerPointB, setRulerPointB] = useState<{ x: number; y: number; z: number } | null>(null);
-  const rulerRef = useRef<{
-    a: { x: number; y: number; z: number } | null;
-    b: { x: number; y: number; z: number } | null;
-  }>({ a: null, b: null });
-  rulerRef.current = { a: rulerPointA, b: rulerPointB };
-
-  // Multi-point Route Drawing Tool
-  const [routePoints, setRoutePoints] = useState<MapRoutePoint[]>([
-    { id: 'rt-1', label: 'Start Pad', x: 0, y: 2.0, z: 0 },
-    { id: 'rt-2', label: 'Bridge Checkpoint', x: -64, y: 9.5, z: 0 },
-    { id: 'rt-3', label: 'Hydro Basin', x: -98, y: 0.0, z: 84 },
-  ]);
   const routePointsRef = useRef<MapRoutePoint[]>(routePoints);
   routePointsRef.current = routePoints;
 
-  // Bounded vehicle history trails (ring buffer per vehicleId)
-  const vehicleTrailsRef = useRef<Map<string, Array<{ x: number; y: number; z: number }>>>(
-    new Map(),
-  );
-
-  // Sidebar tab state
-  const [sidebarTab, setSidebarTab] = useState<
-    'WAYPOINTS' | 'ROUTE_RULER' | 'LEGEND_LAYERS' | 'FAST_TRAVEL'
-  >('WAYPOINTS');
-
-  const isDraggingRef = useRef(false);
-  const dragStartRef = useRef<{ clientX: number; clientY: number }>({ clientX: 0, clientY: 0 });
-  const hasDraggedRef = useRef(false);
-
-  const [cursorWorldCoords, setCursorWorldCoords] = useState<{
-    x: number;
-    y: number;
-    z: number;
-    biome: MapBiomeId;
-    waterDepth: number;
-  } | null>(null);
-  const [beaconNameInput, setBeaconNameInput] = useState('Forward Outpost');
-
-  // Persist waypoints
   useEffect(() => {
     saveCustomWaypoints(customWaypoints);
   }, [customWaypoints]);
 
-  const selectedWaypoint = useMemo(
-    () => customWaypoints.find((w) => w.id === selectedWaypointId) ?? null,
-    [customWaypoints, selectedWaypointId],
-  );
-
   useEffect(() => {
-    if (selectedWaypoint) {
-      setWpDraftName(selectedWaypoint.name);
-      setWpDraftColor(selectedWaypoint.color);
-      setWpDraftIcon(selectedWaypoint.icon);
-    }
-  }, [selectedWaypoint]);
+    savePathPoints(routePoints);
+  }, [routePoints]);
 
-  // Record vehicle trails
-  useEffect(() => {
-    if (!vehicles || vehicles.length === 0) return;
-    const map = vehicleTrailsRef.current;
-    for (let i = 0; i < vehicles.length; i++) {
-      const v = vehicles[i];
-      const vid = v.vehicleId || `veh_${i}`;
-      const prev = map.get(vid) ?? [];
-      const next = appendVehicleTrailPoint(prev, {
-        x: v.position.x,
-        y: v.position.y,
-        z: v.position.z,
+  // Combine built-in teleport nodes and custom waypoints into a single Waypoints list
+  const allWaypoints = useMemo<UnifiedWaypointEntry[]>(() => {
+    const list: UnifiedWaypointEntry[] = [];
+    for (const node of teleportNodes) {
+      list.push({
+        id: `node-${node.id}`,
+        nodeId: node.id,
+        name: node.name,
+        x: Math.round(node.x),
+        y: Number(node.y.toFixed(1)),
+        z: Math.round(node.z),
+        color: node.isPresetLandmark ? '#38bdf8' : '#22c55e',
+        isCustom: !node.isPresetLandmark,
       });
-      if (next !== prev) {
-        map.set(vid, next);
-      }
     }
-  }, [vehicles, localPlayerPos.x, localPlayerPos.z]);
+    for (const wp of customWaypoints) {
+      list.push({
+        id: wp.id,
+        name: wp.name,
+        x: Math.round(wp.x),
+        y: Number(wp.y.toFixed(1)),
+        z: Math.round(wp.z),
+        color: wp.color || '#facc15',
+        isCustom: true,
+      });
+    }
+    return list;
+  }, [teleportNodes, customWaypoints]);
 
-  const activeWaypointMetrics = useMemo(() => {
-    if (!selectedWaypoint) return null;
-    return computeNavigationMetrics(localPlayerPos, selectedWaypoint);
-  }, [localPlayerPos, selectedWaypoint]);
-
-  const rulerMetrics = useMemo(() => {
-    if (!rulerPointA || !rulerPointB) return null;
-    return computeNavigationMetrics(rulerPointA, rulerPointB);
-  }, [rulerPointA, rulerPointB]);
+  const allWaypointsRef = useRef<UnifiedWaypointEntry[]>(allWaypoints);
+  allWaypointsRef.current = allWaypoints;
 
   const routeSummary = useMemo(() => computeMultiRouteSummary(routePoints), [routePoints]);
 
-  const playerCompassDeg = useMemo(() => {
-    let dirX = -Math.sin(localPlayerYawRad);
-    let dirZ = -Math.cos(localPlayerYawRad);
-    if (isSeatedInRig && localVehicle) {
-      _fwdTmp.set(0, 0, 1).applyQuaternion(localVehicle.quaternion);
-      dirX = _fwdTmp.x;
-      dirZ = _fwdTmp.z;
-    }
-    const raw = (Math.atan2(dirX, -dirZ) * 180) / Math.PI;
-    return Math.round((raw + 360) % 360);
-  }, [isSeatedInRig, localPlayerYawRad, localVehicle]);
+  const handleTeleportToWaypoint = useCallback(
+    (wp: UnifiedWaypointEntry) => {
+      if (onTeleportToCoords) {
+        onTeleportToCoords(wp.x, wp.y, wp.z);
+        return;
+      }
+      if (wp.nodeId && onTeleportToNode) {
+        onTeleportToNode(wp.nodeId);
+      }
+    },
+    [onTeleportToCoords, onTeleportToNode],
+  );
 
-  // Raycast from screen mouse coords onto real 3D terrain
   const raycastScreenToTerrain = useCallback(
     (clientX: number, clientY: number) => {
       const canvas = canvasRef.current;
@@ -868,15 +652,14 @@ export const FullScreenMap: React.FC<FullScreenMapProps> = ({
       _raycaster.setFromCamera(_mouseNDCTmp, camera);
       const ray = _raycaster.ray;
 
-      // Fast O(1) non-allocating surface height probe (never creates 512KB chunks!)
       const sampleH = (wx: number, wz: number): number => {
-        if (typeof (world as any).sampleSurfaceHeightFast === 'function') {
-          return (world as any).sampleSurfaceHeightFast(wx, wz);
+        if (typeof (world as unknown as { sampleSurfaceHeightFast?: (x: number, z: number) => number }).sampleSurfaceHeightFast === 'function') {
+          return (world as unknown as { sampleSurfaceHeightFast: (x: number, z: number) => number }).sampleSurfaceHeightFast(wx, wz);
         }
         return world.probeGroundBelow(wx, 80, wz, 0.4).y;
       };
 
-      const denom = Math.max(0.001, -ray.direction.y);
+      const denom = Math.max(0.0001, -ray.direction.y);
       let t = (camera.position.y - 0) / denom;
       let hitX = ray.origin.x + ray.direction.x * t;
       let hitZ = ray.origin.z + ray.direction.z * t;
@@ -887,14 +670,10 @@ export const FullScreenMap: React.FC<FullScreenMapProps> = ({
       hitZ = ray.origin.z + ray.direction.z * t;
       const finalY = sampleH(hitX, hitZ);
 
-      const genMode = world.worldGenMode || 'DEFAULT_PARK';
-      const terrain = sampleTacticalMapTerrain(hitX, hitZ, genMode);
-
       return {
         x: Number(hitX.toFixed(1)),
         y: Number(finalY.toFixed(1)),
         z: Number(hitZ.toFixed(1)),
-        terrain,
       };
     },
     [camera, world],
@@ -904,7 +683,7 @@ export const FullScreenMap: React.FC<FullScreenMapProps> = ({
     (e: React.WheelEvent<HTMLCanvasElement>) => {
       e.stopPropagation();
       e.preventDefault();
-      const factor = e.deltaY < 0 ? 0.82 : 1.22;
+      const factor = e.deltaY < 0 ? 0.78 : 1.28;
       onZoomTacticalMap?.(factor);
     },
     [onZoomTacticalMap],
@@ -918,109 +697,78 @@ export const FullScreenMap: React.FC<FullScreenMapProps> = ({
 
   const handleMouseMove = useCallback(
     (e: React.MouseEvent<HTMLCanvasElement>) => {
-      if (isDraggingRef.current) {
-        const dx = e.clientX - dragStartRef.current.clientX;
-        const dy = e.clientY - dragStartRef.current.clientY;
-        if (Math.hypot(dx, dy) > 4) {
-          hasDraggedRef.current = true;
-        }
-
-        const canvas = canvasRef.current;
-        const alt = tacticalCamState?.altitude ?? 65;
-        const rectHeight = canvas?.clientHeight ?? 600;
-        const metersPerPx = (alt * 1.5) / rectHeight;
-
-        onPanTacticalMap?.(-dx * metersPerPx, -dy * metersPerPx);
-        dragStartRef.current = { clientX: e.clientX, clientY: e.clientY };
-        return;
+      if (!isDraggingRef.current) return;
+      const dx = e.clientX - dragStartRef.current.clientX;
+      const dy = e.clientY - dragStartRef.current.clientY;
+      if (Math.hypot(dx, dy) > 4) {
+        hasDraggedRef.current = true;
       }
+      const canvas = canvasRef.current;
+      const alt = tacticalCamState?.altitude ?? 65;
+      const rectHeight = canvas?.clientHeight ?? 600;
+      const metersPerPx = (alt * 1.5) / Math.max(1, rectHeight);
 
-      const nowMs = performance.now();
-      if (nowMs - lastCursorUpdateMsRef.current < 100) {
-        return;
-      }
-      lastCursorUpdateMsRef.current = nowMs;
-
-      const hit = raycastScreenToTerrain(e.clientX, e.clientY);
-      if (hit) {
-        const rx = Math.round(hit.x);
-        const rz = Math.round(hit.z);
-        setCursorWorldCoords((prev) => {
-          if (prev && prev.x === rx && prev.z === rz) return prev;
-          return {
-            x: rx,
-            y: hit.y,
-            z: rz,
-            biome: hit.terrain.biome,
-            waterDepth: hit.terrain.waterDepthMeters,
-          };
-        });
-      }
+      onPanTacticalMap?.(-dx * metersPerPx, -dy * metersPerPx);
+      dragStartRef.current = { clientX: e.clientX, clientY: e.clientY };
     },
-    [onPanTacticalMap, raycastScreenToTerrain, tacticalCamState?.altitude],
+    [onPanTacticalMap, tacticalCamState?.altitude],
   );
 
   const executeMapPointClick = useCallback(
     (clientX: number, clientY: number) => {
+      const canvas = canvasRef.current;
+      if (canvas && camera) {
+        const rect = canvas.getBoundingClientRect();
+        const clickSX = clientX - rect.left;
+        const clickSY = clientY - rect.top;
+
+        // Check if user clicked on a waypoint pin on screen -> Instant Teleport!
+        if (activeToolRef.current === 'PAN_SELECT') {
+          let bestWp: UnifiedWaypointEntry | null = null;
+          let bestDistPx = 24;
+          for (const wp of allWaypointsRef.current) {
+            const proj = projectWorldToScreen(
+              camera,
+              wp.x,
+              wp.y + 1.5,
+              wp.z,
+              rect.width,
+              rect.height,
+            );
+            if (!proj.visible) continue;
+            const dPx = Math.hypot(proj.sx - clickSX, proj.sy - clickSY);
+            if (dPx <= bestDistPx) {
+              bestDistPx = dPx;
+              bestWp = wp;
+            }
+          }
+          if (bestWp) {
+            handleTeleportToWaypoint(bestWp);
+            return;
+          }
+        }
+      }
+
       const hit = raycastScreenToTerrain(clientX, clientY);
       if (!hit) return;
 
       const tool = activeToolRef.current;
-      if (tool === 'PAN_SELECT') {
-        const pickRadiusMeters = 8.0;
-        const clickedWp = customWaypointsRef.current.find(
-          (w) => Math.hypot(w.x - hit.x, w.z - hit.z) <= pickRadiusMeters,
-        );
-        if (clickedWp) {
-          setSelectedWaypointId(clickedWp.id);
-          setSidebarTab('WAYPOINTS');
-        }
-        return;
-      }
-
-      if (tool === 'ADD_WAYPOINT' || tool === 'ADD_CONSTRUCTION') {
-        const isConstruct = tool === 'ADD_CONSTRUCTION';
+      if (tool === 'ADD_WAYPOINT') {
         const newWp: CustomMapWaypoint = {
           id: `wp-${Date.now()}`,
-          name: isConstruct
-            ? `Build Site #${customWaypointsRef.current.length + 1}`
-            : wpDraftName.trim() || `Waypoint #${customWaypointsRef.current.length + 1}`,
+          name:
+            wpDraftName.trim() ||
+            `Waypoint #${customWaypointsRef.current.length + 1}`,
           x: Math.round(hit.x),
           y: hit.y,
           z: Math.round(hit.z),
-          color: isConstruct ? '#facc15' : wpDraftColor,
-          icon: isConstruct ? 'CONSTRUCTION' : wpDraftIcon,
-          isConstructionMarker: isConstruct,
+          color: '#facc15',
+          icon: 'FLAG',
           createdAt: Date.now(),
         };
         setCustomWaypoints((prev) => [...prev, newWp]);
-        setSelectedWaypointId(newWp.id);
-        setSidebarTab('WAYPOINTS');
-        return;
-      }
-
-      if (tool === 'LOG_CRATER') {
-        const newCrater: MapExplosionCraterMarker = {
-          id: `crater-${Date.now()}`,
-          x: Math.round(hit.x),
-          y: hit.y,
-          z: Math.round(hit.z),
-          radiusMeters: 15,
-          label: `Blast Crater (${Math.round(hit.x)}, ${Math.round(hit.z)})`,
-          timestamp: Date.now(),
-        };
-        setCraterMarkers((prev) => [...prev, newCrater]);
-        return;
-      }
-
-      if (tool === 'RULER_AB') {
-        if (!rulerRef.current.a || (rulerRef.current.a && rulerRef.current.b)) {
-          setRulerPointA({ x: hit.x, y: hit.y, z: hit.z });
-          setRulerPointB(null);
-        } else {
-          setRulerPointB({ x: hit.x, y: hit.y, z: hit.z });
-        }
-        setSidebarTab('ROUTE_RULER');
+        setWpDraftName('');
+        setActiveTool('PAN_SELECT');
         return;
       }
 
@@ -1029,16 +777,15 @@ export const FullScreenMap: React.FC<FullScreenMapProps> = ({
           ...prev,
           {
             id: `rt-${Date.now()}-${prev.length + 1}`,
-            label: `Node ${prev.length + 1}`,
+            label: `P${prev.length + 1}`,
             x: Math.round(hit.x),
             y: hit.y,
             z: Math.round(hit.z),
           },
         ]);
-        setSidebarTab('ROUTE_RULER');
       }
     },
-    [raycastScreenToTerrain, wpDraftColor, wpDraftIcon, wpDraftName],
+    [camera, handleTeleportToWaypoint, raycastScreenToTerrain, wpDraftName],
   );
 
   const handleMouseUp = useCallback(
@@ -1046,10 +793,7 @@ export const FullScreenMap: React.FC<FullScreenMapProps> = ({
       const wasDragging = isDraggingRef.current;
       const didDrag = hasDraggedRef.current;
       isDraggingRef.current = false;
-
-      if (!wasDragging || didDrag || e.button !== 0) {
-        return;
-      }
+      if (!wasDragging || didDrag || e.button !== 0) return;
       executeMapPointClick(e.clientX, e.clientY);
     },
     [executeMapPointClick],
@@ -1060,11 +804,11 @@ export const FullScreenMap: React.FC<FullScreenMapProps> = ({
       const dx = e.touches[0].clientX - e.touches[1].clientX;
       const dy = e.touches[0].clientY - e.touches[1].clientY;
       touchPinchDistRef.current = Math.hypot(dx, dy);
+      isDraggingRef.current = false;
       hasDraggedRef.current = true;
       return;
     }
     if (e.touches.length === 1) {
-      touchPinchDistRef.current = null;
       isDraggingRef.current = true;
       hasDraggedRef.current = false;
       dragStartRef.current = {
@@ -1080,39 +824,44 @@ export const FullScreenMap: React.FC<FullScreenMapProps> = ({
         const dx = e.touches[0].clientX - e.touches[1].clientX;
         const dy = e.touches[0].clientY - e.touches[1].clientY;
         const dist = Math.hypot(dx, dy);
-        if (touchPinchDistRef.current !== null && Math.abs(dist - touchPinchDistRef.current) > 4) {
-          const factor = dist > touchPinchDistRef.current ? 0.94 : 1.06;
-          onZoomTacticalMap?.(factor);
-          touchPinchDistRef.current = dist;
+        if (touchPinchDistRef.current && touchPinchDistRef.current > 8 && dist > 8) {
+          const ratio = touchPinchDistRef.current / dist;
+          const clampedFactor = Math.max(0.75, Math.min(1.35, ratio));
+          onZoomTacticalMap?.(clampedFactor);
         }
+        touchPinchDistRef.current = dist;
         hasDraggedRef.current = true;
         return;
       }
-      if (e.touches.length === 1 && isDraggingRef.current) {
-        const t = e.touches[0];
-        const dx = t.clientX - dragStartRef.current.clientX;
-        const dy = t.clientY - dragStartRef.current.clientY;
-        if (Math.hypot(dx, dy) > 6) {
-          hasDraggedRef.current = true;
-        }
-        const canvas = canvasRef.current;
-        const alt = tacticalCamState?.altitude ?? 65;
-        const rectHeight = canvas?.clientHeight ?? 600;
-        const metersPerPx = (alt * 1.5) / rectHeight;
-        onPanTacticalMap?.(-dx * metersPerPx, -dy * metersPerPx);
-        dragStartRef.current = { clientX: t.clientX, clientY: t.clientY };
+      if (!isDraggingRef.current || e.touches.length !== 1) return;
+      const t = e.touches[0];
+      const dx = t.clientX - dragStartRef.current.clientX;
+      const dy = t.clientY - dragStartRef.current.clientY;
+      if (Math.hypot(dx, dy) > 6) {
+        hasDraggedRef.current = true;
       }
+      const canvas = canvasRef.current;
+      const alt = tacticalCamState?.altitude ?? 65;
+      const rectHeight = canvas?.clientHeight ?? 600;
+      const metersPerPx = (alt * 1.5) / Math.max(1, rectHeight);
+
+      onPanTacticalMap?.(-dx * metersPerPx, -dy * metersPerPx);
+      dragStartRef.current = { clientX: t.clientX, clientY: t.clientY };
     },
     [onPanTacticalMap, onZoomTacticalMap, tacticalCamState?.altitude],
   );
 
   const handleTouchEnd = useCallback(
     (e: React.TouchEvent<HTMLCanvasElement>) => {
-      touchPinchDistRef.current = null;
+      if (e.touches.length < 2) {
+        touchPinchDistRef.current = null;
+      }
       const wasDragging = isDraggingRef.current;
       const didDrag = hasDraggedRef.current;
-      isDraggingRef.current = false;
-      if (wasDragging && !didDrag && e.changedTouches.length > 0) {
+      if (e.touches.length === 0) {
+        isDraggingRef.current = false;
+      }
+      if (wasDragging && !didDrag && e.changedTouches.length === 1) {
         const t = e.changedTouches[0];
         executeMapPointClick(t.clientX, t.clientY);
       }
@@ -1120,1507 +869,423 @@ export const FullScreenMap: React.FC<FullScreenMapProps> = ({
     [executeMapPointClick],
   );
 
-  // 30 FPS HUD Overlay Render Loop projecting 3D World onto 2D Canvas
+  const handleAddWaypointAtPlayer = useCallback(() => {
+    const newWp: CustomMapWaypoint = {
+      id: `wp-${Date.now()}`,
+      name:
+        wpDraftName.trim() ||
+        `Waypoint #${customWaypointsRef.current.length + 1}`,
+      x: Math.round(localPlayerPos.x),
+      y: Number(localPlayerPos.y.toFixed(1)),
+      z: Math.round(localPlayerPos.z),
+      color: '#facc15',
+      icon: 'FLAG',
+      createdAt: Date.now(),
+    };
+    setCustomWaypoints((prev) => [...prev, newWp]);
+    setWpDraftName('');
+  }, [localPlayerPos, wpDraftName]);
+
+  const handleDeleteWaypointEntry = useCallback(
+    (wp: UnifiedWaypointEntry, e: React.MouseEvent) => {
+      e.stopPropagation();
+      if (wp.nodeId) {
+        onDeleteTeleportNode?.(wp.nodeId);
+      } else {
+        setCustomWaypoints((prev) => prev.filter((item) => item.id !== wp.id));
+      }
+    },
+    [onDeleteTeleportNode],
+  );
+
+  // Render clean 2D overlay canvas: ONLY Marked Path + Waypoint Pins + Player Position Dot
   useEffect(() => {
     if (!isOpen) return;
-
     let rafId = 0;
-    let lastDrawTime = 0;
-    const FRAME_INTERVAL_MS = 1000 / 30;
 
-    const getCachedGroundY = (gx: number, gz: number): number => {
-      if (!world) return 0;
-      const key = `${gx},${gz}`;
-      const cached = gridHeightCacheRef.current.get(key);
-      if (cached !== undefined) return cached;
-      if (gridHeightCacheRef.current.size > 800) {
-        gridHeightCacheRef.current.clear();
-      }
-      const gy = Math.max(
-        0,
-        typeof (world as any).sampleSurfaceHeightFast === 'function'
-          ? (world as any).sampleSurfaceHeightFast(gx, gz)
-          : world.probeGroundBelow(gx, 60, gz, 0.8).y,
-      );
-      gridHeightCacheRef.current.set(key, gy);
-      return gy;
-    };
-
-    const renderOverlayFrame = (now: number) => {
-      rafId = window.requestAnimationFrame(renderOverlayFrame);
-      if (now - lastDrawTime < FRAME_INTERVAL_MS) return;
-      lastDrawTime = now;
-
+    const renderOverlay = () => {
       const canvas = canvasRef.current;
-      if (!canvas || !camera) return;
+      if (canvas && camera) {
+        const dpr = window.devicePixelRatio || 1;
+        const rect = canvas.getBoundingClientRect();
+        const w = Math.max(1, Math.floor(rect.width));
+        const h = Math.max(1, Math.floor(rect.height));
+        if (canvas.width !== Math.floor(w * dpr) || canvas.height !== Math.floor(h * dpr)) {
+          canvas.width = Math.floor(w * dpr);
+          canvas.height = Math.floor(h * dpr);
+        }
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          ctx.save();
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+          ctx.clearRect(0, 0, w, h);
 
-      const rect = canvas.getBoundingClientRect();
-      const w = Math.max(240, Math.floor(rect.width));
-      const h = Math.max(200, Math.floor(rect.height));
-      if (canvas.width !== w || canvas.height !== h) {
-        canvas.width = w;
-        canvas.height = h;
-      }
-
-      const ctx = canvas.getContext('2d');
-      if (!ctx) return;
-
-      // Transparent canvas overlay over the live 3D Three.js world
-      ctx.clearRect(0, 0, w, h);
-
-      const lyr = layersRef.current;
-      const isCompact = isMobileMapRef.current;
-
-      // 1. Grid Sector Coordinates along Canvas Edges
-      if (lyr.navigationAndGrid) {
-        ctx.save();
-        const camX = tacticalCamState?.x ?? localPlayerPos.x;
-        const camZ = tacticalCamState?.z ?? localPlayerPos.z;
-        const alt = tacticalCamState?.altitude ?? 65;
-
-        // Center reticle
-        const cx = w * 0.5;
-        const cy = h * 0.5;
-        ctx.strokeStyle = 'rgba(250, 204, 21, 0.45)';
-        ctx.lineWidth = 1;
-        ctx.beginPath();
-        ctx.moveTo(cx - 10, cy);
-        ctx.lineTo(cx + 10, cy);
-        ctx.moveTo(cx, cy - 10);
-        ctx.lineTo(cx, cy + 10);
-        ctx.stroke();
-
-        // Projected 32m / 64m terrain sector markers (using cached ground heights for 0-lag performance)
-        if (camera && !isCompact) {
-          const startX = Math.floor((camX - 160) / 32) * 32;
-          const endX = Math.floor((camX + 160) / 32) * 32;
-          const startZ = Math.floor((camZ - 160) / 32) * 32;
-          const endZ = Math.floor((camZ + 160) / 32) * 32;
-
-          ctx.font = 'bold 8px monospace';
-          ctx.textAlign = 'center';
-
-          for (let gx = startX; gx <= endX; gx += 32) {
-            for (let gz = startZ; gz <= endZ; gz += 32) {
-              const gy = getCachedGroundY(gx, gz);
-              const { sx, sy, visible } = projectWorldToScreen(camera, gx, gy + 0.1, gz, w, h);
-              if (!visible || sx < 20 || sx > w - 20 || sy < 30 || sy > h - 30) continue;
-
-              const isMajor = gx % 64 === 0 && gz % 64 === 0;
-              ctx.strokeStyle = isMajor ? 'rgba(250, 204, 21, 0.55)' : 'rgba(148, 163, 184, 0.25)';
-              ctx.lineWidth = 1;
-
-              // Draw tactical + tick
-              const tickSize = isMajor ? 5 : 3;
+          // 1. Draw Marked Path polyline & nodes
+          const pts = routePointsRef.current;
+          if (pts.length > 0) {
+            const screenPts = pts.map((p) =>
+              projectWorldToScreen(camera, p.x, p.y + 1.2, p.z, w, h),
+            );
+            if (screenPts.length >= 2) {
+              ctx.save();
+              ctx.strokeStyle = '#facc15';
+              ctx.lineWidth = 3;
+              ctx.setLineDash([8, 5]);
               ctx.beginPath();
-              ctx.moveTo(sx - tickSize, sy);
-              ctx.lineTo(sx + tickSize, sy);
-              ctx.moveTo(sx, sy - tickSize);
-              ctx.lineTo(sx, sy + tickSize);
+              let started = false;
+              for (let i = 0; i < screenPts.length; i++) {
+                const sp = screenPts[i];
+                if (!sp.visible) continue;
+                if (!started) {
+                  ctx.moveTo(sp.sx, sp.sy);
+                  started = true;
+                } else {
+                  ctx.lineTo(sp.sx, sp.sy);
+                }
+              }
+              ctx.stroke();
+              ctx.restore();
+            }
+
+            for (let i = 0; i < screenPts.length; i++) {
+              const sp = screenPts[i];
+              if (!sp.visible) continue;
+              ctx.fillStyle = '#141414';
+              ctx.strokeStyle = '#facc15';
+              ctx.lineWidth = 2;
+              ctx.beginPath();
+              ctx.arc(sp.sx, sp.sy, 6, 0, Math.PI * 2);
+              ctx.fill();
               ctx.stroke();
 
-              if (isMajor && alt <= 120) {
-                const colCode = String.fromCharCode(65 + Math.max(0, Math.min(7, Math.floor((gx + 256) / 64))));
-                const rowNum = Math.max(1, Math.min(8, Math.floor((gz + 256) / 64) + 1));
-                ctx.fillStyle = 'rgba(250, 204, 21, 0.6)';
-                ctx.fillText(`[${colCode}-${rowNum}]`, sx, sy - 6);
-              }
+              ctx.fillStyle = '#fef08a';
+              ctx.font = 'bold 10px monospace';
+              ctx.textAlign = 'center';
+              ctx.fillText(`${i + 1}`, sp.sx, sp.sy - 10);
             }
           }
-        }
-        ctx.restore();
-      }
 
-      // 2. Water Depth & Hydro Basin Visualization Layer
-      if (lyr.waterDepth) {
-        const waterZones = [
-          { x: -125, y: 0.2, z: 95, label: 'HYDRO BASIN (-6.5M DEEP)', rPx: 30 },
-          { x: -95, y: 0.2, z: 118, label: 'DEEP TRENCH (-8.0M DEEP)', rPx: 22 },
-          { x: -64, y: 0.2, z: 48, label: 'RIVER CHANNEL (-2.5M)', rPx: 18 },
-        ];
-        for (const wz of waterZones) {
-          const { sx, sy, visible } = projectWorldToScreen(camera, wz.x, wz.y, wz.z, w, h);
-          if (!visible) continue;
-          ctx.save();
-          ctx.strokeStyle = 'rgba(56, 189, 248, 0.65)';
-          ctx.fillStyle = 'rgba(14, 116, 144, 0.18)';
-          ctx.lineWidth = 1.5;
-          ctx.setLineDash([4, 3]);
-          ctx.beginPath();
-          ctx.arc(sx, sy, wz.rPx, 0, Math.PI * 2);
-          ctx.fill();
-          ctx.stroke();
-          ctx.setLineDash([]);
-          ctx.fillStyle = '#7dd3fc';
-          ctx.font = 'bold 8px monospace';
-          ctx.textAlign = 'center';
-          ctx.fillText(wz.label, sx, sy + 3);
-          ctx.restore();
-        }
-      }
+          // 2. Draw Waypoints (click any pin to teleport)
+          for (const wp of allWaypointsRef.current) {
+            const proj = projectWorldToScreen(camera, wp.x, wp.y + 1.5, wp.z, w, h);
+            if (!proj.visible) continue;
 
-      // 3. Roads, Bridges & Tunnels Overlay Layer
-      if (lyr.roadsBridgesTunnels) {
-        const roadSegments: Array<{
-          title: string;
-          color: string;
-          pts: Array<[number, number, number]>;
-        }> = [
-          {
-            title: 'WEST SUSPENSION BRIDGE',
-            color: '#fbbf24',
-            pts: [
-              [-40, 2.5, 0],
-              [-64, 9.5, 0],
-              [-88, 2.5, 0],
-            ],
-          },
-          {
-            title: 'PROVING GROUNDS RING ROAD',
-            color: '#94a3b8',
-            pts: [
-              [-36, 2.2, -36],
-              [36, 2.2, -36],
-              [36, 2.2, 36],
-              [-36, 2.2, 36],
-              [-36, 2.2, -36],
-            ],
-          },
-          {
-            title: 'EAST AIRFIELD ACCESS ROAD',
-            color: '#cbd5e1',
-            pts: [
-              [36, 2.2, -36],
-              [65, 3.5, -68],
-              [125, 4.5, -68],
-            ],
-          },
-        ];
-        for (const seg of roadSegments) {
-          ctx.save();
-          ctx.strokeStyle = seg.color;
-          ctx.lineWidth = 2.2;
-          ctx.beginPath();
-          let started = false;
-          let midSx = 0;
-          let midSy = 0;
-          const midIdx = Math.floor(seg.pts.length / 2);
-          for (let i = 0; i < seg.pts.length; i++) {
-            const [rx, ry, rz] = seg.pts[i];
-            const p = projectWorldToScreen(camera, rx, ry, rz, w, h);
-            if (!p.visible) continue;
-            if (!started) {
-              ctx.moveTo(p.sx, p.sy);
-              started = true;
-            } else {
-              ctx.lineTo(p.sx, p.sy);
-            }
-            if (i === midIdx) {
-              midSx = p.sx;
-              midSy = p.sy;
-            }
-          }
-          ctx.stroke();
-          if (midSx > 0 && midSy > 0) {
-            ctx.fillStyle = 'rgba(15, 23, 42, 0.82)';
-            const tw = ctx.measureText(seg.title).width + 8;
-            ctx.fillRect(midSx - tw * 0.5, midSy - 14, tw, 12);
-            ctx.fillStyle = seg.color;
-            ctx.font = 'bold 8px monospace';
-            ctx.textAlign = 'center';
-            ctx.fillText(seg.title, midSx, midSy - 5);
-          }
-          ctx.restore();
-        }
-      }
-
-      // 4. Terrain Landmark Tags in 3D
-      if (lyr.terrainLabels) {
-        const landmarks = [
-          { x: 0, y: 2, z: 0, title: 'PROVING GROUNDS', sub: 'FLAT TARMAC', color: '#94a3b8' },
-          { x: 115, y: 28, z: -85, title: 'RED-ROCK CANYON', sub: 'STEPPED MESAS', color: '#fdba74' },
-          { x: -115, y: 36, z: -115, title: 'ALPINE RIDGE', sub: 'HIGH PEAKS', color: '#cbd5e1' },
-          { x: 110, y: 8, z: 110, title: 'EMERALD FOREST', sub: 'DENSE CANOPY', color: '#86efac' },
-          { x: -125, y: -4, z: 95, title: 'COASTAL HYDRO BASIN', sub: 'DEEP WATER', color: '#7dd3fc' },
-          { x: 95, y: 4.5, z: -68, title: 'RUNWAY 09/27', sub: 'AIRFIELD STRIP', color: '#38bdf8' },
-          { x: 0, y: 4, z: 36, title: 'MEGA JUMP RAMP', sub: 'STUNT LAUNCH', color: '#fb923c' },
-        ];
-
-        for (const lm of landmarks) {
-          const { sx, sy, visible } = projectWorldToScreen(camera, lm.x, lm.y, lm.z, w, h);
-          if (!visible) continue;
-          ctx.save();
-          ctx.font = 'bold 9px monospace';
-          ctx.textAlign = 'center';
-          const tw = Math.max(ctx.measureText(lm.title).width, ctx.measureText(lm.sub).width) + 10;
-          ctx.fillStyle = 'rgba(9, 13, 22, 0.78)';
-          ctx.fillRect(sx - tw * 0.5, sy - 10, tw, 22);
-          ctx.fillStyle = lm.color;
-          ctx.fillText(lm.title, sx, sy);
-          ctx.font = '8px monospace';
-          ctx.fillStyle = '#a3a3a3';
-          ctx.fillText(lm.sub, sx, sy + 9);
-          ctx.restore();
-        }
-      }
-
-      // 5. Multi-point Route Lines in 3D
-      if (lyr.navigationAndGrid && routePointsRef.current.length >= 2) {
-        const pts = routePointsRef.current;
-        ctx.save();
-        ctx.strokeStyle = '#38bdf8';
-        ctx.lineWidth = 2.6;
-        ctx.setLineDash([8, 4]);
-        ctx.beginPath();
-        let started = false;
-        for (let i = 0; i < pts.length; i++) {
-          const { sx, sy, visible } = projectWorldToScreen(camera, pts[i].x, pts[i].y, pts[i].z, w, h);
-          if (!visible) continue;
-          if (!started) {
-            ctx.moveTo(sx, sy);
-            started = true;
-          } else {
-            ctx.lineTo(sx, sy);
-          }
-        }
-        ctx.stroke();
-        ctx.setLineDash([]);
-
-        for (let i = 0; i < pts.length; i++) {
-          const { sx, sy, visible } = projectWorldToScreen(camera, pts[i].x, pts[i].y, pts[i].z, w, h);
-          if (!visible) continue;
-          ctx.fillStyle = '#090d16';
-          ctx.strokeStyle = '#38bdf8';
-          ctx.lineWidth = 2;
-          ctx.fillRect(sx - 7, sy - 7, 14, 14);
-          ctx.strokeRect(sx - 7, sy - 7, 14, 14);
-          ctx.fillStyle = '#38bdf8';
-          ctx.font = 'bold 9px monospace';
-          ctx.textAlign = 'center';
-          ctx.fillText(`${i + 1}`, sx, sy + 3);
-        }
-        ctx.restore();
-      }
-
-      // 6. Ruler Measurement Line in 3D
-      if (lyr.navigationAndGrid && rulerRef.current.a) {
-        const ra = rulerRef.current.a;
-        const pA = projectWorldToScreen(camera, ra.x, ra.y, ra.z, w, h);
-        if (pA.visible) {
-          ctx.save();
-          ctx.fillStyle = '#facc15';
-          ctx.fillRect(pA.sx - 6, pA.sy - 6, 12, 12);
-          ctx.font = 'bold 9px monospace';
-          ctx.fillText(`A (${ra.y}m)`, pA.sx + 14, pA.sy - 4);
-          ctx.restore();
-        }
-
-        if (rulerRef.current.b) {
-          const rb = rulerRef.current.b;
-          const pB = projectWorldToScreen(camera, rb.x, rb.y, rb.z, w, h);
-          if (pA.visible && pB.visible) {
             ctx.save();
-            ctx.strokeStyle = '#facc15';
-            ctx.lineWidth = 2.4;
-            ctx.setLineDash([5, 4]);
-            ctx.beginPath();
-            ctx.moveTo(pA.sx, pA.sy);
-            ctx.lineTo(pB.sx, pB.sy);
-            ctx.stroke();
-            ctx.setLineDash([]);
-            ctx.fillStyle = '#facc15';
-            ctx.fillRect(pB.sx - 6, pB.sy - 6, 12, 12);
+            ctx.translate(proj.sx, proj.sy);
 
-            const m = computeNavigationMetrics(ra, rb);
-            const mx = (pA.sx + pB.sx) * 0.5;
-            const my = (pA.sy + pB.sy) * 0.5;
-            const dSign = m.elevationDeltaMeters >= 0 ? '+' : '';
-            const label = `RULER: ${m.distance2DMeters}m · ΔY ${dSign}${m.elevationDeltaMeters}m · ${m.bearingDegrees}°`;
-            ctx.font = 'bold 9px monospace';
-            const tw = ctx.measureText(label).width + 10;
-            ctx.fillStyle = '#18181b';
-            ctx.strokeStyle = '#facc15';
-            ctx.fillRect(mx - tw * 0.5, my - 12, tw, 16);
-            ctx.strokeRect(mx - tw * 0.5, my - 12, tw, 16);
-            ctx.fillStyle = '#facc15';
-            ctx.textAlign = 'center';
-            ctx.fillText(label, mx, my - 1);
-            ctx.restore();
-          }
-        }
-      }
-
-      // 7. Engineering Features: Runways, Test Tracks, Landing Zones, Recovery Stations & Blast Craters
-      if (lyr.engineeringFeatures) {
-        // Draw Runway 09/27 Centerline Strip
-        const rStart = projectWorldToScreen(camera, 65, 4.5, -68, w, h);
-        const rEnd = projectWorldToScreen(camera, 125, 4.5, -68, w, h);
-        if (rStart.visible && rEnd.visible) {
-          ctx.save();
-          ctx.strokeStyle = '#38bdf8';
-          ctx.lineWidth = 3;
-          ctx.setLineDash([6, 4]);
-          ctx.beginPath();
-          ctx.moveTo(rStart.sx, rStart.sy);
-          ctx.lineTo(rEnd.sx, rEnd.sy);
-          ctx.stroke();
-          ctx.setLineDash([]);
-          ctx.restore();
-        }
-
-        const engStations = [
-          { x: 24, y: 2.2, z: -18, badge: '[H] VTOL LANDING ZONE', color: '#4ade80' },
-          { x: -18, y: 2.2, z: -14, badge: '[R] RECOVERY & REPAIR STATION', color: '#facc15' },
-          { x: 0, y: 2.2, z: -55, badge: '[T] HIGH-SPEED TEST TRACK', color: '#fb923c' },
-          { x: -115, y: 0.5, z: 90, badge: '[W] MARINE BUOYANCY TEST BASIN', color: '#38bdf8' },
-        ];
-        for (const st of engStations) {
-          const p = projectWorldToScreen(camera, st.x, st.y, st.z, w, h);
-          if (!p.visible) continue;
-          ctx.save();
-          ctx.strokeStyle = st.color;
-          ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
-          ctx.lineWidth = 1.8;
-          ctx.strokeRect(p.sx - 8, p.sy - 8, 16, 16);
-          ctx.font = 'bold 8px monospace';
-          ctx.fillStyle = st.color;
-          ctx.textAlign = 'center';
-          ctx.fillText(st.badge, p.sx, p.sy - 12);
-          ctx.restore();
-        }
-
-        for (const crater of craterMarkersRef.current) {
-          const { sx, sy, visible } = projectWorldToScreen(camera, crater.x, crater.y, crater.z, w, h);
-          if (!visible) continue;
-          ctx.save();
-          ctx.fillStyle = 'rgba(220, 38, 38, 0.2)';
-          ctx.strokeStyle = '#ef4444';
-          ctx.lineWidth = 2;
-          ctx.beginPath();
-          ctx.arc(sx, sy, 22, 0, Math.PI * 2);
-          ctx.fill();
-          ctx.stroke();
-          ctx.fillStyle = '#fca5a5';
-          ctx.font = 'bold 8px monospace';
-          ctx.textAlign = 'center';
-          ctx.fillText(`✸ ${crater.label}`, sx, sy + 32);
-          ctx.restore();
-        }
-      }
-
-      // 8. Custom Waypoints in 3D & Fast-Travel Beacons
-      const activeWpId = selectedWaypointIdRef.current;
-      for (const wp of customWaypointsRef.current) {
-        const { sx, sy, visible } = projectWorldToScreen(camera, wp.x, wp.y, wp.z, w, h);
-        if (!visible) continue;
-        const isSelected = wp.id === activeWpId;
-
-        if (isSelected && lyr.navigationAndGrid) {
-          const pPlayer = projectWorldToScreen(
-            camera,
-            localPlayerPos.x,
-            localPlayerPos.y,
-            localPlayerPos.z,
-            w,
-            h,
-          );
-          if (pPlayer.visible) {
-            ctx.save();
+            // Pin box
+            ctx.fillStyle = 'rgba(20, 20, 20, 0.92)';
             ctx.strokeStyle = wp.color;
-            ctx.lineWidth = 2.4;
-            ctx.setLineDash([8, 5]);
-            ctx.beginPath();
-            ctx.moveTo(pPlayer.sx, pPlayer.sy);
-            ctx.lineTo(sx, sy);
-            ctx.stroke();
-            ctx.setLineDash([]);
-            ctx.restore();
-          }
-          ctx.strokeStyle = '#ffffff';
-          ctx.lineWidth = 2;
-          ctx.strokeRect(sx - 14, sy - 14, 28, 28);
-        }
-
-        drawWaypointSymbol(ctx, wp.icon, sx, sy, 11, wp.color);
-
-        ctx.save();
-        ctx.font = isSelected ? 'bold 10px monospace' : '9px monospace';
-        ctx.textAlign = 'center';
-        const label = `${wp.name} (${wp.y >= 0 ? '+' : ''}${wp.y}m)`;
-        const tw = ctx.measureText(label).width + 8;
-        ctx.fillStyle = 'rgba(9, 13, 22, 0.85)';
-        ctx.fillRect(sx - tw * 0.5, sy + 12, tw, 13);
-        ctx.fillStyle = wp.color;
-        ctx.fillText(label, sx, sy + 22);
-        ctx.restore();
-      }
-
-      for (const node of teleportNodes) {
-        const p = projectWorldToScreen(camera, node.x, node.y, node.z, w, h);
-        if (!p.visible) continue;
-        ctx.save();
-        ctx.strokeStyle = '#a855f7';
-        ctx.fillStyle = 'rgba(88, 28, 135, 0.65)';
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        ctx.arc(p.sx, p.sy, 8, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.stroke();
-        ctx.fillStyle = '#e9d5ff';
-        ctx.font = 'bold 8px monospace';
-        ctx.textAlign = 'center';
-        ctx.fillText(`⚡ ${node.name}`, p.sx, p.sy - 11);
-        ctx.restore();
-      }
-
-      // 9. Active 3D Vehicles, Trails, Player Indicator & Remote Players
-      if (lyr.vehiclesAndTrails) {
-        // Draw Vehicle Trails
-        vehicleTrailsRef.current.forEach((trail) => {
-          if (trail.length < 2) return;
-          ctx.save();
-          ctx.strokeStyle = 'rgba(250, 204, 21, 0.5)';
-          ctx.lineWidth = 2;
-          ctx.beginPath();
-          let started = false;
-          for (let i = 0; i < trail.length; i++) {
-            const pt = trail[i];
-            const p = projectWorldToScreen(camera, pt.x, pt.y + 0.2, pt.z, w, h);
-            if (!p.visible) continue;
-            if (!started) {
-              ctx.moveTo(p.sx, p.sy);
-              started = true;
-            } else {
-              ctx.lineTo(p.sx, p.sy);
-            }
-          }
-          ctx.stroke();
-          ctx.restore();
-        });
-
-        for (let i = 0; i < vehicles.length; i++) {
-          const veh = vehicles[i];
-          const isLocal = veh === localVehicle;
-          const { sx, sy, visible } = projectWorldToScreen(
-            camera,
-            veh.position.x,
-            veh.position.y,
-            veh.position.z,
-            w,
-            h,
-          );
-          if (!visible) continue;
-
-          const paintHex =
-            typeof veh.getPrimaryPaintColorHex === 'function'
-              ? veh.getPrimaryPaintColorHex()
-              : '#38bdf8';
-
-          // 2.5D Tactical Brackets + Heading Arrow over real vehicle
-          ctx.save();
-          ctx.strokeStyle = isLocal ? '#facc15' : paintHex;
-          ctx.lineWidth = isLocal ? 2.6 : 1.8;
-          ctx.strokeRect(sx - 14, sy - 14, 28, 28);
-
-          // Draw Vehicle Heading Vector
-          _fwdTmp.set(0, 0, 1).applyQuaternion(veh.quaternion);
-          const pHead = projectWorldToScreen(
-            camera,
-            veh.position.x + _fwdTmp.x * 6,
-            veh.position.y,
-            veh.position.z + _fwdTmp.z * 6,
-            w,
-            h,
-          );
-          if (pHead.visible) {
-            ctx.beginPath();
-            ctx.moveTo(sx, sy);
-            ctx.lineTo(pHead.sx, pHead.sy);
-            ctx.stroke();
-          }
-
-          // Altitude Badge
-          const altMeters = Number(veh.position.y.toFixed(1));
-          const altBadge = `ALT ${altMeters}m`;
-          ctx.font = 'bold 8px monospace';
-          const bw = ctx.measureText(altBadge).width + 8;
-          ctx.fillStyle = altMeters > 8 ? '#0284c7' : '#18181b';
-          ctx.strokeStyle = '#38bdf8';
-          ctx.fillRect(sx + 16, sy - 6, bw, 13);
-          ctx.strokeRect(sx + 16, sy - 6, bw, 13);
-          ctx.fillStyle = '#f8fafc';
-          ctx.textAlign = 'left';
-          ctx.fillText(altBadge, sx + 20, sy + 3);
-
-          if (isLocal) {
-            ctx.fillStyle = '#facc15';
-            ctx.textAlign = 'center';
-            ctx.fillText(localPlayerName || 'LOCAL VEHICLE', sx, sy - 18);
-          }
-          ctx.restore();
-        }
-
-        // Draw On-Foot Player Marker & Heading when walking
-        if (!isSeatedInRig) {
-          const pWalk = projectWorldToScreen(
-            camera,
-            localPlayerPos.x,
-            localPlayerPos.y,
-            localPlayerPos.z,
-            w,
-            h,
-          );
-          if (pWalk.visible) {
-            ctx.save();
-            ctx.fillStyle = localPlayerColor || '#facc15';
-            ctx.strokeStyle = '#18181b';
             ctx.lineWidth = 2;
             ctx.beginPath();
-            ctx.arc(pWalk.sx, pWalk.sy, 6, 0, Math.PI * 2);
+            ctx.arc(0, 0, 9, 0, Math.PI * 2);
             ctx.fill();
             ctx.stroke();
-            ctx.fillStyle = '#facc15';
-            ctx.font = 'bold 9px monospace';
+
+            ctx.fillStyle = wp.color;
+            ctx.beginPath();
+            ctx.arc(0, 0, 4, 0, Math.PI * 2);
+            ctx.fill();
+
+            // Label pill
+            ctx.font = 'bold 10px monospace';
+            const labelText = wp.name;
+            const tw = ctx.measureText(labelText).width;
+            ctx.fillStyle = 'rgba(20, 20, 20, 0.88)';
+            ctx.fillRect(-tw * 0.5 - 5, -26, tw + 10, 14);
+            ctx.strokeStyle = wp.color;
+            ctx.lineWidth = 1;
+            ctx.strokeRect(-tw * 0.5 - 5, -26, tw + 10, 14);
+
+            ctx.fillStyle = '#f8fafc';
             ctx.textAlign = 'center';
-            ctx.fillText(`${localPlayerName || 'PILOT'} (ON FOOT)`, pWalk.sx, pWalk.sy - 10);
+            ctx.textBaseline = 'middle';
+            ctx.fillText(labelText, 0, -19);
             ctx.restore();
           }
-        }
 
-        // Draw Remote Multiplayer Peers
-        for (const rp of remotePlayers) {
-          if (rp.x === undefined || rp.z === undefined) continue;
-          const pRem = projectWorldToScreen(camera, rp.x, rp.y ?? 2, rp.z, w, h);
-          if (!pRem.visible) continue;
-          ctx.save();
-          ctx.fillStyle = rp.color || '#38bdf8';
-          ctx.strokeStyle = '#090d16';
-          ctx.lineWidth = 2;
-          ctx.beginPath();
-          ctx.arc(pRem.sx, pRem.sy, 6, 0, Math.PI * 2);
-          ctx.fill();
-          ctx.stroke();
-          ctx.fillStyle = rp.color || '#38bdf8';
-          ctx.font = 'bold 9px monospace';
-          ctx.textAlign = 'center';
-          ctx.fillText(rp.name, pRem.sx, pRem.sy - 10);
+          // 3. Draw Local Player indicator
+          const pProj = projectWorldToScreen(
+            camera,
+            localPlayerPos.x,
+            localPlayerPos.y + 1.5,
+            localPlayerPos.z,
+            w,
+            h,
+          );
+          if (pProj.visible) {
+            ctx.save();
+            ctx.translate(pProj.sx, pProj.sy);
+            ctx.fillStyle = '#38bdf8';
+            ctx.strokeStyle = '#ffffff';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.arc(0, 0, 7, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.stroke();
+
+            ctx.font = 'bold 10px monospace';
+            ctx.fillStyle = '#38bdf8';
+            ctx.textAlign = 'center';
+            ctx.fillText(localPlayerName || 'YOU', 0, 18);
+            ctx.restore();
+          }
+
           ctx.restore();
         }
       }
-
-      // 10. Compass Rose & 11. Scale Bar (Desktop only — hidden on mobile so floating corner controls stay minimal)
-      if (!isCompact) {
-        ctx.save();
-        const compCx = w - 46;
-        const compCy = 46;
-        const compR = 26;
-        ctx.fillStyle = 'rgba(18, 20, 24, 0.9)';
-        ctx.strokeStyle = '#444444';
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        ctx.arc(compCx, compCy, compR, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.stroke();
-
-        ctx.fillStyle = '#facc15';
-        ctx.font = 'bold 9px monospace';
-        ctx.textAlign = 'center';
-        ctx.fillText('N', compCx, compCy - compR + 9);
-        ctx.fillStyle = '#a3a3a3';
-        ctx.fillText('S', compCx, compCy + compR - 3);
-        ctx.fillText('E', compCx + compR - 6, compCy + 3);
-        ctx.fillText('W', compCx - compR + 6, compCy + 3);
-        ctx.restore();
-
-        const alt = tacticalCamState?.altitude ?? 65;
-        const scaleMeters = alt > 140 ? 100 : alt > 60 ? 50 : 25;
-        const barPx = Math.max(50, Math.min(160, (scaleMeters / alt) * 120));
-        ctx.save();
-        ctx.fillStyle = 'rgba(18, 20, 24, 0.88)';
-        ctx.strokeStyle = '#444444';
-        ctx.lineWidth = 1.5;
-        ctx.fillRect(14, h - 38, barPx + 20, 26);
-        ctx.strokeRect(14, h - 38, barPx + 20, 26);
-
-        ctx.strokeStyle = '#fbbf24';
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        ctx.moveTo(22, h - 19);
-        ctx.lineTo(22 + barPx, h - 19);
-        ctx.moveTo(22, h - 24);
-        ctx.lineTo(22, h - 14);
-        ctx.moveTo(22 + barPx, h - 24);
-        ctx.lineTo(22 + barPx, h - 14);
-        ctx.stroke();
-        ctx.fillStyle = '#e5e5e5';
-        ctx.font = 'bold 9px monospace';
-        ctx.textAlign = 'left';
-        ctx.fillText(`SCALE: ${scaleMeters}M`, 22, h - 26);
-        ctx.restore();
-      }
+      rafId = window.requestAnimationFrame(renderOverlay);
     };
 
-    rafId = window.requestAnimationFrame(renderOverlayFrame);
-    return () => {
-      window.cancelAnimationFrame(rafId);
-    };
-  }, [
-    isOpen,
-    camera,
-    world,
-    tacticalCamState,
-    localPlayerPos,
-    vehicles,
-    localVehicle,
-    localPlayerName,
-    localPlayerColor,
-    isSeatedInRig,
-    remotePlayers,
-    teleportNodes,
-  ]);
+    rafId = window.requestAnimationFrame(renderOverlay);
+    return () => window.cancelAnimationFrame(rafId);
+  }, [isOpen, camera, localPlayerPos, localPlayerName]);
 
   if (!isOpen) return null;
 
-  const isTopDown = tacticalCamState?.isTopDown ?? false;
-  const currentAlt = Math.round(tacticalCamState?.altitude ?? 65);
-  const mapRenderRadiusChunks =
-    world?.activeMapRenderRadiusChunks ??
-    computeTacticalMapRenderRadiusChunks(
-      currentAlt,
-      world?.customRenderDistance ?? 4,
-      isTopDown,
-      typeof window !== 'undefined' && window.innerHeight > 0
-        ? window.innerWidth / window.innerHeight
-        : 1.78,
-    );
-  const mapRenderRadiusMeters = mapRenderRadiusChunks * 16;
+  const altMeters = Math.round(tacticalCamState?.altitude ?? 65);
+  const altLabel =
+    altMeters >= 1000
+      ? `${(altMeters / 1000).toFixed(1)} km`
+      : `${altMeters} m`;
+  const activeLodLayers = world?.activeTotalLodLayers ?? 1;
 
-  // Shared Tactical Panel Content (used in collapsible floating drawer on Mobile and right sidebar on Desktop)
-  const renderTacticalSidebarContent = () => (
-    <>
-      {/* Sidebar Tabs */}
-      <div className="grid grid-cols-4 border-b-2 border-[#444444] bg-[#242424] shrink-0">
-        {(
-          [
-            { id: 'WAYPOINTS', label: 'WAYPOINTS' },
-            { id: 'FAST_TRAVEL', label: 'BEACONS' },
-            { id: 'ROUTE_RULER', label: 'ROUTE' },
-            { id: 'LEGEND_LAYERS', label: 'LAYERS' },
-          ] as const
-        ).map((tab) => (
-          <button
-            key={tab.id}
-            type="button"
-            data-testid={`map-sidebar-tab-${tab.id}`}
-            onClick={() => setSidebarTab(tab.id)}
-            className={`py-2 text-[10px] font-display font-bold uppercase border-r border-[#444444] last:border-r-0 cursor-pointer ${
-              sidebarTab === tab.id
-                ? 'bg-[#fbbf24] text-[#1a1a1a]'
-                : 'bg-[#242424] text-[#e5e5e5] hover:bg-[#333333]'
-            }`}
-          >
-            {tab.label}
-          </button>
-        ))}
-      </div>
-
-      {/* Quick Zoom Presets inside mobile drawer for easy 1-tap access */}
-      {isMobileMap && (
-        <div className="grid grid-cols-4 gap-1 border-b border-[#444444] bg-[#1e1e1e] p-1.5 shrink-0">
-          {[
-            { label: 'REGIONAL', short: '180M', alt: 180 },
-            { label: 'TACTICAL', short: '90M', alt: 90 },
-            { label: 'AREA', short: '45M', alt: 45 },
-            { label: 'CLOSE 2.5D', short: '22M', alt: 22 },
-          ].map((preset) => (
-            <button
-              key={preset.label}
-              type="button"
-              data-testid={`map-zoom-preset-${preset.label}`}
-              onClick={() => onSetTacticalMapAltitude?.(preset.alt)}
-              className="rounded-[2px] border border-[#444444] bg-[#262626] active:bg-[#fbbf24] active:text-[#1a1a1a] py-1 text-[9px] font-mono-num font-bold text-[#e5e5e5] cursor-pointer"
-            >
-              {preset.short}
-            </button>
-          ))}
-        </div>
-      )}
-
-      <div className="flex-1 overflow-y-auto p-2.5 flex flex-col gap-2.5">
-        {/* TAB 1: WAYPOINTS */}
-        {sidebarTab === 'WAYPOINTS' && (
-          <div data-testid="map-waypoints-panel" className="flex flex-col gap-2">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-display font-bold uppercase text-[#fbbf24]">
-                WAYPOINTS ({customWaypoints.length})
-              </span>
-              <button
-                type="button"
-                data-testid="map-add-waypoint-at-player-btn"
-                onClick={() => {
-                  const newWp: CustomMapWaypoint = {
-                    id: `wp-${Date.now()}`,
-                    name: wpDraftName.trim() || `Waypoint #${customWaypoints.length + 1}`,
-                    x: Math.round(localPlayerPos.x),
-                    y: Number(localPlayerPos.y.toFixed(1)),
-                    z: Math.round(localPlayerPos.z),
-                    color: wpDraftColor,
-                    icon: wpDraftIcon,
-                    createdAt: Date.now(),
-                  };
-                  setCustomWaypoints((prev) => [...prev, newWp]);
-                  setSelectedWaypointId(newWp.id);
-                }}
-                className="rounded-[2px] border-2 border-[#444444] bg-[#fbbf24] px-2 py-0.5 text-[10px] font-display font-bold uppercase text-[#1a1a1a] cursor-pointer"
-              >
-                + MARK PLAYER
-              </button>
-            </div>
-
-            <div className="rounded-[2px] border-2 border-[#444444] bg-[#242424] p-2 flex flex-col gap-2">
-              <input
-                type="text"
-                data-testid="map-waypoint-name-input"
-                value={wpDraftName}
-                onChange={(e) => {
-                  const val = e.target.value;
-                  setWpDraftName(val);
-                  if (selectedWaypointId) {
-                    setCustomWaypoints((prev) =>
-                      prev.map((w) =>
-                        w.id === selectedWaypointId ? { ...w, name: val } : w,
-                      ),
-                    );
-                  }
-                }}
-                placeholder="WAYPOINT NAME..."
-                className="w-full rounded-[2px] border-2 border-[#444444] bg-[#1a1a1a] px-2 py-1 text-xs font-mono-num text-[#e5e5e5]"
-              />
-
-              {/* Color Swatches */}
-              <div className="flex items-center gap-1.5">
-                {WAYPOINT_COLOR_PALETTE.map((sw) => (
-                  <button
-                    key={sw.hex}
-                    type="button"
-                    onClick={() => {
-                      setWpDraftColor(sw.hex);
-                      if (selectedWaypointId) {
-                        setCustomWaypoints((prev) =>
-                          prev.map((w) =>
-                            w.id === selectedWaypointId ? { ...w, color: sw.hex } : w,
-                          ),
-                        );
-                      }
-                    }}
-                    style={{ backgroundColor: sw.hex }}
-                    className={`h-4 w-4 rounded-[2px] border cursor-pointer ${
-                      wpDraftColor === sw.hex ? 'border-white scale-110' : 'border-[#444444]'
-                    }`}
-                    title={sw.label}
-                  />
-                ))}
-              </div>
-
-              {/* Icon Glyphs */}
-              <div className="grid grid-cols-4 gap-1">
-                {WAYPOINT_ICON_OPTIONS.map((ic) => (
-                  <button
-                    key={ic.id}
-                    type="button"
-                    onClick={() => {
-                      setWpDraftIcon(ic.id);
-                      if (selectedWaypointId) {
-                        setCustomWaypoints((prev) =>
-                          prev.map((w) =>
-                            w.id === selectedWaypointId ? { ...w, icon: ic.id } : w,
-                          ),
-                        );
-                      }
-                    }}
-                    className={`rounded-[2px] border border-[#444444] px-1 py-0.5 text-[9px] font-mono-num font-bold uppercase cursor-pointer ${
-                      wpDraftIcon === ic.id
-                        ? 'bg-[#facc15] text-[#1a1a1a]'
-                        : 'bg-[#1a1a1a] text-[#e5e5e5]'
-                    }`}
-                  >
-                    {ic.shortGlyph} {ic.label}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            {/* Waypoints List */}
-            <div className="flex flex-col gap-1.5">
-              {customWaypoints.map((wp) => {
-                const isSel = wp.id === selectedWaypointId;
-                const nav = computeNavigationMetrics(localPlayerPos, wp);
-                const iconMeta =
-                  WAYPOINT_ICON_OPTIONS.find((i) => i.id === wp.icon) ??
-                  WAYPOINT_ICON_OPTIONS[0];
-                return (
-                  <div
-                    key={wp.id}
-                    data-testid={`map-waypoint-row-${wp.id}`}
-                    onClick={() => {
-                      setSelectedWaypointId(wp.id);
-                      onFocusTacticalMapOn?.(wp.x, wp.z);
-                      if (isMobileMap) setMobileDrawerOpen(false);
-                    }}
-                    className={`flex items-center justify-between gap-1.5 rounded-[2px] border-2 px-2 py-1.5 cursor-pointer ${
-                      isSel
-                        ? 'border-[#facc15] bg-[#2a2a2a]'
-                        : 'border-[#444444] bg-[#222222] hover:bg-[#292929]'
-                    }`}
-                  >
-                    <div className="min-w-0 flex-1">
-                      <div className="flex items-center gap-1.5">
-                        <span
-                          className="inline-block px-1 text-[10px] font-bold text-[#090d16]"
-                          style={{ backgroundColor: wp.color }}
-                        >
-                          {iconMeta.shortGlyph}
-                        </span>
-                        <span className="truncate text-xs font-display font-bold uppercase text-[#e5e5e5]">
-                          {wp.name}
-                        </span>
-                      </div>
-                      <div className="text-[10px] font-mono-num text-[#a3a3a3]">
-                        ({wp.x}m, {wp.z}m) · {nav.distance2DMeters}m · ΔY{' '}
-                        {nav.elevationDeltaMeters >= 0 ? '+' : ''}
-                        {nav.elevationDeltaMeters}m
-                      </div>
-                    </div>
-                    <button
-                      type="button"
-                      data-testid={`map-delete-waypoint-${wp.id}`}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setCustomWaypoints((prev) => prev.filter((item) => item.id !== wp.id));
-                        if (selectedWaypointId === wp.id) setSelectedWaypointId(null);
-                      }}
-                      className="rounded-[2px] border border-[#444444] bg-[#dc2626] px-1.5 py-0.5 text-[10px] font-mono-num text-[#e5e5e5] cursor-pointer"
-                    >
-                      DEL
-                    </button>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-        )}
-
-        {/* TAB 2: ROUTE / RULER */}
-        {sidebarTab === 'ROUTE_RULER' && (
-          <div data-testid="map-route-ruler-panel" className="flex flex-col gap-2.5">
-            <div className="rounded-[2px] border-2 border-[#444444] bg-[#242424] p-2 flex flex-col gap-1.5">
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-display font-bold uppercase text-[#fbbf24]">
-                  DISTANCE RULER [A → B]
-                </span>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setRulerPointA(null);
-                    setRulerPointB(null);
-                  }}
-                  className="rounded-[2px] border border-[#444444] bg-[#6b7280] px-1.5 py-0.5 text-[10px] font-mono-num text-[#e5e5e5] cursor-pointer"
-                >
-                  CLEAR
-                </button>
-              </div>
-              {rulerMetrics && rulerPointA && rulerPointB ? (
-                <div className="text-[11px] font-mono-num text-[#e5e5e5] flex flex-col gap-0.5">
-                  <div>
-                    2D DIST: <strong className="text-[#facc15]">{rulerMetrics.distance2DMeters}m</strong> · 3D:{' '}
-                    <strong>{rulerMetrics.distance3DMeters}m</strong>
-                  </div>
-                  <div>
-                    ELEV ΔY: <strong className="text-[#38bdf8]">{rulerMetrics.elevationDeltaMeters}m</strong> ({rulerMetrics.slopeDegrees}° SLOPE)
-                  </div>
-                </div>
-              ) : (
-                <div className="text-[10px] font-mono-num text-[#a3a3a3]">
-                  Tap two points on the 3D terrain in RULER mode.
-                </div>
-              )}
-            </div>
-
-            <div className="rounded-[2px] border-2 border-[#444444] bg-[#242424] p-2 flex flex-col gap-2">
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-display font-bold uppercase text-[#38bdf8]">
-                  MULTI-POINT ROUTE ({routePoints.length})
-                </span>
-                <button
-                  type="button"
-                  data-testid="map-clear-route-btn"
-                  onClick={() => setRoutePoints([])}
-                  className="rounded-[2px] border border-[#444444] bg-[#dc2626] px-1.5 py-0.5 text-[10px] font-mono-num text-[#e5e5e5] cursor-pointer"
-                >
-                  CLEAR
-                </button>
-              </div>
-              <div
-                data-testid="map-route-summary-box"
-                className="rounded-[2px] border border-[#444444] bg-[#1a1a1a] p-2 text-[11px] font-mono-num text-[#e5e5e5]"
-              >
-                <div>
-                  TOTAL 2D: <strong className="text-[#fbbf24]">{routeSummary.totalDistance2DMeters}m</strong> · 3D:{' '}
-                  <strong>{routeSummary.totalDistance3DMeters}m</strong>
-                </div>
-                <div>
-                  NET ΔY: {routeSummary.netElevationDeltaMeters}m (▲+{routeSummary.totalClimbMeters}m / ▼-{routeSummary.totalDescentMeters}m)
-                </div>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* TAB 3: LAYERS */}
-        {sidebarTab === 'LEGEND_LAYERS' && (
-          <div data-testid="map-legend-layers-panel" className="flex flex-col gap-2">
-            <div className="text-xs font-display font-bold uppercase text-[#fbbf24]">
-              TACTICAL OVERLAY LAYERS
-            </div>
-            {(
-              [
-                { key: 'vehiclesAndTrails', label: '3D Vehicles & Altitude Badges' },
-                { key: 'navigationAndGrid', label: 'Sector Grid, Route & Ruler' },
-                { key: 'terrainLabels', label: 'Landmark & Biome Labels' },
-                { key: 'engineeringFeatures', label: 'Runways & Craters' },
-                { key: 'roadsBridgesTunnels', label: 'Road & Bridge Overlays' },
-                { key: 'waterDepth', label: 'Water Depth & Basin Tags' },
-              ] as const
-            ).map((item) => (
-              <label
-                key={item.key}
-                className="flex items-center justify-between rounded-[2px] border border-[#444444] bg-[#242424] px-2 py-1.5 text-xs font-mono-num text-[#e5e5e5] cursor-pointer"
-              >
-                <span>{item.label}</span>
-                <input
-                  type="checkbox"
-                  checked={layers[item.key]}
-                  onChange={(e) =>
-                    setLayers((prev) => ({ ...prev, [item.key]: e.target.checked }))
-                  }
-                  className="accent-[#fbbf24]"
-                />
-              </label>
-            ))}
-          </div>
-        )}
-
-        {/* TAB 4: FAST-TRAVEL BEACONS */}
-        {sidebarTab === 'FAST_TRAVEL' && (
-          <div className="flex flex-col gap-2">
-            <div
-              data-testid="teleport-beacon-count-badge"
-              className="text-xs font-display font-bold uppercase tracking-wider text-[#fbbf24]"
-            >
-              FAST-TRAVEL BEACONS ({teleportNodes.length})
-            </div>
-            {combatCooldownSec > 0 && (
-              <div className="rounded-[2px] border-2 border-[#dc2626] bg-[#dc2626]/20 px-2 py-1 text-[11px] font-mono-num text-[#e5e5e5]">
-                COMBAT LOCK: {combatCooldownSec.toFixed(1)}S
-              </div>
-            )}
-            <div className="flex flex-col gap-1.5">
-              {teleportNodes.map((node) => {
-                const isSpinning = activeSpinupNodeId === node.id;
-                return (
-                  <div
-                    key={node.id}
-                    data-testid={`teleport-node-row-${node.id}`}
-                    onClick={() => {
-                      onFocusTacticalMapOn?.(node.x, node.z);
-                      if (isMobileMap) setMobileDrawerOpen(false);
-                    }}
-                    className="flex items-center justify-between gap-1.5 rounded-[2px] border-2 border-[#444444] bg-[#262626] hover:bg-[#2f2f2f] px-2.5 py-1.5 cursor-pointer"
-                  >
-                    <div className="min-w-0 flex-1">
-                      <div className="truncate text-xs font-display font-bold uppercase text-[#e5e5e5]">
-                        {node.name}
-                      </div>
-                      <div className="text-[10px] font-mono-num text-[#e5e5e5]/80">
-                        ({Math.round(node.x)}M, {Math.round(node.z)}M)
-                      </div>
-                    </div>
-                    {onTeleportToNode && (
-                      <button
-                        type="button"
-                        data-testid={`teleport-to-node-${node.id}`}
-                        disabled={combatCooldownSec > 0}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          onTeleportToNode(node.id);
-                        }}
-                        className="rounded-[2px] bg-[#fbbf24] border-2 border-[#444444] px-2 py-1 text-[11px] font-display font-bold text-[#1a1a1a] disabled:opacity-40 cursor-pointer"
-                      >
-                        {isSpinning ? `${Math.round(spinupProgress * 100)}%` : 'WARP'}
-                      </button>
-                    )}
-                    {(onRemoveBeacon || onDeleteTeleportNode) && (
-                      <button
-                        type="button"
-                        data-testid={`delete-teleport-node-${node.id}`}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          (onRemoveBeacon ?? onDeleteTeleportNode)?.(node.id);
-                        }}
-                        className="rounded-[2px] bg-[#dc2626] border-2 border-[#444444] px-1.5 py-1 text-[10px] font-mono-num text-[#e5e5e5] cursor-pointer"
-                      >
-                        ✕
-                      </button>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-            {(onDropBeaconHere || onPlaceBeaconAtPlayer) && (
-              <div className="border-t-2 border-[#444444] pt-2 flex flex-col gap-1.5">
-                <input
-                  type="text"
-                  value={beaconNameInput}
-                  onChange={(e) => setBeaconNameInput(e.target.value)}
-                  placeholder="BEACON NAME..."
-                  className="w-full rounded-[2px] border-2 border-[#444444] bg-[#262626] px-2 py-1 text-xs font-mono-num text-[#e5e5e5]"
-                />
-                <button
-                  type="button"
-                  data-testid="place-beacon-at-player-btn"
-                  onClick={() =>
-                    (onDropBeaconHere ?? onPlaceBeaconAtPlayer)?.(beaconNameInput)
-                  }
-                  className="w-full rounded-[2px] bg-[#fbbf24] border-2 border-[#444444] px-2.5 py-1.5 text-xs font-display font-bold uppercase text-[#1a1a1a] cursor-pointer"
-                >
-                  + DROP BEACON AT CURRENT POS
-                </button>
-              </div>
-            )}
-          </div>
-        )}
-      </div>
-    </>
-  );
-
-  // ===========================================================================
-  // MINIMAL MOBILE TACTICAL MAP HUD (Matches MobileTouchControls aesthetic)
-  // ===========================================================================
-  if (isMobileMap) {
-    return (
-      <div
-        data-testid="fullscreen-map-overlay"
-        className="fixed inset-0 z-[90] pointer-events-none select-none overflow-hidden"
-        onContextMenu={(e) => e.preventDefault()}
-      >
-        {/* Full-Screen Transparent Raycasting & HUD Canvas Overlay */}
-        <canvas
-          ref={canvasRef}
-          data-testid="fullscreen-map-canvas"
-          onWheel={handleWheel}
-          onMouseDown={handleMouseDown}
-          onMouseMove={handleMouseMove}
-          onMouseUp={handleMouseUp}
-          onTouchStart={handleTouchStart}
-          onTouchMove={handleTouchMove}
-          onTouchEnd={handleTouchEnd}
-          onContextMenu={(e) => e.preventDefault()}
-          className="absolute inset-0 w-full h-full pointer-events-auto cursor-crosshair block touch-none"
-        />
-
-        {/* Minimal Top Corner Bar */}
-        <div className="absolute top-2 left-2 right-2 z-20 flex items-center justify-between gap-1.5 pointer-events-none">
-          {/* Top-Left: Compact Coords + Dynamic Render Distance Pill */}
-          <div className="pointer-events-auto flex items-center gap-1.5 rounded-[2px] border-2 border-[#444444] bg-[#1a1a1a]/90 px-2 py-1 shadow-md">
-            <span className="inline-block h-2 w-2 bg-[#fbbf24]" />
-            <span
-              data-testid="map-player-coords-readout"
-              className="text-[10px] font-mono-num font-bold text-[#e5e5e5]"
-            >
-              X:{Math.round(localPlayerPos.x)} Z:{Math.round(localPlayerPos.z)}
-            </span>
-            <span className="text-[10px] font-mono-num text-[#fbbf24]">
-              ALT {currentAlt}m
-            </span>
-            <span
-              data-testid="map-render-distance-readout"
-              className="hidden sm:inline text-[9px] font-mono-num text-[#a3a3a3]"
-            >
-              · RAD {mapRenderRadiusMeters}m
-            </span>
-            {selectedWaypoint && activeWaypointMetrics && (
-              <span
-                data-testid="map-active-waypoint-hud"
-                className="border-l border-[#444444] pl-1.5 text-[10px] font-mono-num font-bold text-[#fbbf24] truncate max-w-[110px]"
-              >
-                → {activeWaypointMetrics.distance2DMeters}m {activeWaypointMetrics.cardinalDirection}
-              </span>
-            )}
-          </div>
-
-          {/* Top-Right: Minimal Action Buttons (2.5D, Grid, Waypoints Drawer, Close) */}
-          <div className="pointer-events-auto flex items-center gap-1">
-            <button
-              type="button"
-              data-testid="map-toggle-25d-btn"
-              onClick={() => onSetTacticalMapTopDown?.(!isTopDown)}
-              className={`h-8 px-2 rounded-[2px] border-2 border-[#444444] text-[10px] font-display font-bold uppercase cursor-pointer ${
-                !isTopDown
-                  ? 'bg-[#fbbf24] text-[#1a1a1a]'
-                  : 'bg-[#1a1a1a]/90 text-[#e5e5e5]'
-              }`}
-            >
-              {!isTopDown ? '2.5D' : '2D'}
-            </button>
-
-            <button
-              type="button"
-              data-testid="map-toggle-grid-btn"
-              onClick={() => {
-                onToggleGrid?.();
-                setLayers((prev) => ({
-                  ...prev,
-                  navigationAndGrid: !prev.navigationAndGrid,
-                }));
-              }}
-              className={`h-8 px-2 rounded-[2px] border-2 border-[#444444] text-[10px] font-display font-bold uppercase cursor-pointer ${
-                (tacticalGridVisible ?? layers.navigationAndGrid)
-                  ? 'bg-[#fbbf24] text-[#1a1a1a]'
-                  : 'bg-[#1a1a1a]/90 text-[#a3a3a3]'
-              }`}
-            >
-              GRID
-            </button>
-
-            <button
-              type="button"
-              data-testid="mobile-map-drawer-btn"
-              onClick={() => setMobileDrawerOpen((v) => !v)}
-              className={`h-8 px-2.5 rounded-[2px] border-2 border-[#444444] text-[10px] font-display font-bold uppercase cursor-pointer ${
-                mobileDrawerOpen
-                  ? 'bg-[#fbbf24] text-[#1a1a1a]'
-                  : 'bg-[#1a1a1a]/90 text-[#e5e5e5]'
-              }`}
-            >
-              PANEL {mobileDrawerOpen ? '▴' : '▾'}
-            </button>
-
-            <button
-              type="button"
-              data-testid="close-fullscreen-map-btn"
-              onClick={onClose}
-              className="h-8 px-2.5 rounded-[2px] border-2 border-[#444444] bg-[#dc2626] active:bg-[#b91c1c] text-[10px] font-display font-bold uppercase text-[#e5e5e5] cursor-pointer"
-            >
-              ✕
-            </button>
-          </div>
-        </div>
-
-        {/* Collapsible Mobile Tactical Drawer (Waypoints, Beacons, Route, Layers) */}
-        {mobileDrawerOpen && (
-          <div
-            data-testid="mobile-map-drawer-panel"
-            className="pointer-events-auto absolute top-12 right-2 z-30 w-[min(92vw,320px)] max-h-[calc(100dvh-96px)] flex flex-col rounded-[2px] border-2 border-[#444444] bg-[#1a1a1a]/95 shadow-2xl overflow-hidden"
-          >
-            {renderTacticalSidebarContent()}
-          </div>
-        )}
-
-        {/* Minimal Bottom Corner Controls */}
-        <div className="absolute bottom-2.5 left-2 right-2 z-20 flex items-end justify-between gap-1.5 pointer-events-none">
-          {/* Bottom-Left: Compact Tool Strip */}
-          <div className="pointer-events-auto flex items-center gap-1 rounded-[2px] border-2 border-[#444444] bg-[#1a1a1a]/90 p-1 shadow-md">
-            {(
-              [
-                { id: 'PAN_SELECT', label: 'PAN' },
-                { id: 'ADD_WAYPOINT', label: '+WP' },
-                { id: 'RULER_AB', label: 'RULER' },
-                { id: 'DRAW_ROUTE', label: 'ROUTE' },
-              ] as const
-            ).map((t) => (
-              <button
-                key={t.id}
-                type="button"
-                data-testid={`map-tool-btn-${t.id}`}
-                onClick={() => setActiveTool(t.id)}
-                className={`h-7 px-2 rounded-[2px] border border-[#444444] text-[10px] font-display font-bold uppercase cursor-pointer ${
-                  activeTool === t.id
-                    ? 'bg-[#fbbf24] text-[#1a1a1a]'
-                    : 'bg-[#262626] text-[#e5e5e5]'
-                }`}
-              >
-                {t.label}
-              </button>
-            ))}
-          </div>
-
-          {/* Bottom-Right: Compact Center + Zoom Controls */}
-          <div className="pointer-events-auto flex items-center gap-1">
-            <button
-              type="button"
-              data-testid="map-center-player-btn"
-              onClick={() => onCenterTacticalMapOnPlayer?.()}
-              className="h-8 px-2.5 rounded-[2px] border-2 border-[#444444] bg-[#1a1a1a]/90 active:bg-[#fbbf24] active:text-[#1a1a1a] text-[10px] font-display font-bold uppercase text-[#e5e5e5] cursor-pointer shadow-md"
-            >
-              CENTER
-            </button>
-            <button
-              type="button"
-              data-testid="map-zoom-out-btn"
-              onClick={() => onZoomTacticalMap?.(1.25)}
-              className="h-8 w-8 rounded-[2px] border-2 border-[#444444] bg-[#1a1a1a]/90 active:bg-[#333333] text-sm font-mono-num font-bold text-[#fbbf24] cursor-pointer shadow-md"
-            >
-              −
-            </button>
-            <button
-              type="button"
-              data-testid="map-zoom-in-btn"
-              onClick={() => onZoomTacticalMap?.(0.8)}
-              className="h-8 w-8 rounded-[2px] border-2 border-[#444444] bg-[#1a1a1a]/90 active:bg-[#333333] text-sm font-mono-num font-bold text-[#fbbf24] cursor-pointer shadow-md"
-            >
-              +
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  // ===========================================================================
-  // DESKTOP TACTICAL MAP HUD
-  // ===========================================================================
   return (
     <div
-      data-testid="fullscreen-map-overlay"
-      className="fixed inset-0 z-[90] pointer-events-none select-none flex flex-col justify-between"
-      onContextMenu={(e) => e.preventDefault()}
+      data-testid="fullscreen-map-modal"
+      className="fixed inset-0 z-[110] pointer-events-auto select-none overflow-hidden"
     >
-      {/* =====================================================================
-          TOP BAR: 2.5D REAL WORLD CAMERA CONTROLS & STATUS
-          ===================================================================== */}
-      <div className="pointer-events-auto flex flex-wrap items-center justify-between gap-2 border-b-2 border-[#444444] bg-[#1a1a1a]/95 px-3 py-2 shadow-lg">
-        <div className="flex items-center gap-2.5">
-          <span className="inline-block h-2.5 w-2.5 bg-[#fbbf24] animate-pulse" />
-          <h2 className="text-xs sm:text-sm font-display font-bold tracking-wider uppercase text-[#fbbf24]">
-            2.5D REAL WORLD TACTICAL CAMERA [F]
-          </h2>
-          <span
-            data-testid="map-player-coords-readout"
-            className="rounded-[2px] border border-[#444444] bg-[#141414] px-2 py-0.5 text-[11px] font-mono-num text-[#e5e5e5]"
-          >
-            PLAYER X:{Math.round(localPlayerPos.x)}m Y:{localPlayerPos.y.toFixed(1)}m Z:
-            {Math.round(localPlayerPos.z)}m · HDG {playerCompassDeg}°{' '}
-            {formatCompassCardinal(playerCompassDeg)}
+      {/* Interactive 2D Overlay Canvas over live 3D World Map */}
+      <canvas
+        ref={canvasRef}
+        data-testid="tactical-map-canvas"
+        onWheel={handleWheel}
+        onMouseDown={handleMouseDown}
+        onMouseMove={handleMouseMove}
+        onMouseUp={handleMouseUp}
+        onTouchStart={handleTouchStart}
+        onTouchMove={handleTouchMove}
+        onTouchEnd={handleTouchEnd}
+        className={`absolute inset-0 w-full h-full ${
+          activeTool === 'PAN_SELECT' ? 'cursor-grab active:cursor-grabbing' : 'cursor-crosshair'
+        }`}
+      />
+
+      {/* Top Bar: Clean Title, Mode Buttons (Waypoints / Mark Path), Zoom & Close */}
+      <div className="absolute top-3 left-3 right-3 flex flex-wrap items-center justify-between gap-2 pointer-events-none">
+        <div className="flex items-center gap-2 bg-[#141414]/95 border-2 border-[#444444] px-3 py-1.5 rounded-[2px] shadow-xl pointer-events-auto">
+          <span className="text-xs font-display font-bold uppercase tracking-wider text-[#facc15]">
+            WORLD MAP
           </span>
-          <span
-            data-testid="map-render-distance-readout"
-            className="rounded-[2px] border border-[#444444] bg-[#141414] px-2 py-0.5 text-[11px] font-mono-num text-[#fbbf24]"
-          >
-            ALT {currentAlt}m · RAD {mapRenderRadiusMeters}m ({mapRenderRadiusChunks} CHUNKS)
+          <span className="text-[11px] font-mono-num text-[#a3a3a3]">
+            ALT: <strong className="text-[#e5e5e5]">{altLabel}</strong> · LODs:{' '}
+            <strong className="text-[#38bdf8]">{activeLodLayers}</strong>
           </span>
         </div>
 
-        {/* Real 3D Camera Zoom Presets & View Controls */}
-        <div className="flex flex-wrap items-center gap-1.5">
-          <span className="text-[10px] font-mono-num uppercase text-[#a3a3a3]">
-            ALTITUDE:
-          </span>
-          {[
-            { label: 'REGIONAL', alt: 180 },
-            { label: 'TACTICAL', alt: 90 },
-            { label: 'AREA', alt: 45 },
-            { label: 'CLOSE 2.5D', alt: 22 },
-          ].map((preset) => (
-            <button
-              key={preset.label}
-              type="button"
-              data-testid={`map-zoom-preset-${preset.label}`}
-              onClick={() => onSetTacticalMapAltitude?.(preset.alt)}
-              className="rounded-[2px] border-2 border-[#444444] bg-[#262626] hover:bg-[#333333] px-2 py-0.5 text-[10px] font-mono-num font-bold text-[#e5e5e5] cursor-pointer"
-            >
-              {preset.label} ({preset.alt}M)
-            </button>
-          ))}
-
+        {/* Center Action Bar: Click to Teleport / Add Waypoint / Mark Path */}
+        <div className="flex items-center gap-1.5 bg-[#141414]/95 border-2 border-[#444444] p-1 rounded-[2px] shadow-xl pointer-events-auto">
           <button
             type="button"
-            data-testid="map-zoom-in-btn"
-            onClick={() => onZoomTacticalMap?.(0.8)}
-            className="rounded-[2px] border-2 border-[#444444] bg-[#262626] hover:bg-[#333333] px-2 py-0.5 text-[11px] font-mono-num font-bold text-[#fbbf24] cursor-pointer"
-          >
-            ZOOM +
-          </button>
-          <button
-            type="button"
-            data-testid="map-zoom-out-btn"
-            onClick={() => onZoomTacticalMap?.(1.25)}
-            className="rounded-[2px] border-2 border-[#444444] bg-[#262626] hover:bg-[#333333] px-2 py-0.5 text-[11px] font-mono-num font-bold text-[#fbbf24] cursor-pointer"
-          >
-            ZOOM -
-          </button>
-
-          <button
-            type="button"
-            data-testid="map-toggle-25d-btn"
-            onClick={() => onSetTacticalMapTopDown?.(!isTopDown)}
-            className={`rounded-[2px] border-2 border-[#444444] px-2.5 py-0.5 text-[10px] font-mono-num font-bold uppercase cursor-pointer ${
-              !isTopDown
-                ? 'bg-[#fbbf24] text-[#1a1a1a]'
-                : 'bg-[#262626] text-[#e5e5e5]'
+            data-testid="map-mode-teleport"
+            onClick={() => setActiveTool('PAN_SELECT')}
+            className={`px-2.5 py-1 text-[11px] font-display font-bold uppercase rounded-[2px] cursor-pointer transition-colors ${
+              activeTool === 'PAN_SELECT'
+                ? 'bg-[#38bdf8] text-[#090d16]'
+                : 'bg-[#222222] text-[#d4d4d4] hover:bg-[#333333]'
             }`}
           >
-            {!isTopDown ? 'VIEW: 2.5D PERSPECTIVE' : 'VIEW: TOP-DOWN'}
+            Waypoints (Click to TP)
           </button>
-
           <button
             type="button"
-            data-testid="map-toggle-grid-btn"
+            data-testid="map-mode-add-waypoint"
+            onClick={() =>
+              setActiveTool((prev) =>
+                prev === 'ADD_WAYPOINT' ? 'PAN_SELECT' : 'ADD_WAYPOINT',
+              )
+            }
+            className={`px-2.5 py-1 text-[11px] font-display font-bold uppercase rounded-[2px] cursor-pointer transition-colors ${
+              activeTool === 'ADD_WAYPOINT'
+                ? 'bg-[#22c55e] text-[#090d16]'
+                : 'bg-[#222222] text-[#d4d4d4] hover:bg-[#333333]'
+            }`}
+          >
+            + Place Waypoint
+          </button>
+          <button
+            type="button"
+            data-testid="map-mode-mark-path"
+            onClick={() =>
+              setActiveTool((prev) =>
+                prev === 'DRAW_ROUTE' ? 'PAN_SELECT' : 'DRAW_ROUTE',
+              )
+            }
+            className={`px-2.5 py-1 text-[11px] font-display font-bold uppercase rounded-[2px] cursor-pointer transition-colors ${
+              activeTool === 'DRAW_ROUTE'
+                ? 'bg-[#facc15] text-[#090d16]'
+                : 'bg-[#222222] text-[#d4d4d4] hover:bg-[#333333]'
+            }`}
+          >
+            Mark Path
+          </button>
+        </div>
+
+        {/* Zoom Controls (Unlimited Zoom-Out) & Close */}
+        <div className="flex items-center gap-1.5 bg-[#141414]/95 border-2 border-[#444444] p-1 rounded-[2px] shadow-xl pointer-events-auto">
+          <button
+            type="button"
+            title="Zoom In"
+            onClick={() => onZoomTacticalMap?.(0.65)}
+            className="px-2.5 py-1 bg-[#222222] hover:bg-[#333333] text-[#e5e5e5] text-xs font-mono-num font-bold rounded-[2px] cursor-pointer"
+          >
+            +
+          </button>
+          <button
+            type="button"
+            title="Zoom Out (Unlimited)"
+            onClick={() => onZoomTacticalMap?.(1.6)}
+            className="px-2.5 py-1 bg-[#222222] hover:bg-[#333333] text-[#e5e5e5] text-xs font-mono-num font-bold rounded-[2px] cursor-pointer"
+          >
+            −
+          </button>
+          <button
+            type="button"
+            title="Center on Player"
             onClick={() => {
-              onToggleGrid?.();
-              setLayers((prev) => ({
-                ...prev,
-                navigationAndGrid: !prev.navigationAndGrid,
-              }));
+              onCenterTacticalMapOnPlayer?.();
+              onSetTacticalMapAltitude?.(90);
             }}
-            className={`rounded-[2px] border-2 border-[#444444] px-2.5 py-0.5 text-[10px] font-mono-num font-bold uppercase cursor-pointer ${
-              (tacticalGridVisible ?? layers.navigationAndGrid)
-                ? 'bg-[#fbbf24] text-[#1a1a1a]'
-                : 'bg-[#262626] text-[#a3a3a3]'
-            }`}
+            className="px-2.5 py-1 bg-[#222222] hover:bg-[#333333] text-[#38bdf8] text-[11px] font-display font-bold uppercase rounded-[2px] cursor-pointer"
           >
-            GRID: {(tacticalGridVisible ?? layers.navigationAndGrid) ? 'ON' : 'OFF'}
+            Center
           </button>
-
-          <button
-            type="button"
-            data-testid="map-center-player-btn"
-            onClick={() => onCenterTacticalMapOnPlayer?.()}
-            className="rounded-[2px] border-2 border-[#444444] bg-[#6b7280] hover:bg-[#52525b] px-2 py-0.5 text-[10px] font-mono-num font-bold uppercase text-[#e5e5e5] cursor-pointer"
-          >
-            CENTER ON PLAYER
-          </button>
-
           <button
             type="button"
             data-testid="close-fullscreen-map-btn"
             onClick={onClose}
-            className="rounded-[2px] border-2 border-[#444444] bg-[#dc2626] hover:bg-[#b91c1c] px-3 py-1 text-xs font-display font-bold uppercase text-[#e5e5e5] cursor-pointer"
+            className="px-3 py-1 bg-[#dc2626] hover:bg-[#ef4444] text-white text-[11px] font-display font-bold uppercase rounded-[2px] cursor-pointer"
           >
-            CLOSE [F / ESC]
+            Close [F]
           </button>
         </div>
       </div>
 
-      {/* =====================================================================
-          MIDDLE WORKSPACE: TRANSPARENT 3D CANVAS + RIGHT HUD SIDEBAR
-          ===================================================================== */}
-      <div className="relative flex-1 min-h-0 flex justify-end overflow-hidden">
-        {/* Full-Screen Transparent Raycasting & HUD Canvas Overlay */}
-        <canvas
-          ref={canvasRef}
-          data-testid="fullscreen-map-canvas"
-          onWheel={handleWheel}
-          onMouseDown={handleMouseDown}
-          onMouseMove={handleMouseMove}
-          onMouseUp={handleMouseUp}
-          onTouchStart={handleTouchStart}
-          onTouchMove={handleTouchMove}
-          onTouchEnd={handleTouchEnd}
-          onContextMenu={(e) => e.preventDefault()}
-          className="absolute inset-0 w-full h-full pointer-events-auto cursor-crosshair block touch-none"
-        />
-
-        {/* Secondary Tool Bar (Floating Left) */}
-        <div className="pointer-events-auto absolute top-3 left-3 z-10 flex flex-col gap-1.5 rounded-[2px] border-2 border-[#444444] bg-[#1a1a1a]/95 p-2 shadow-xl">
-          <span className="text-[10px] font-mono-num uppercase text-[#a3a3a3]">
-            INTERACTION TOOL:
+      {/* Compact Side Panel: Only Waypoints (Click to Teleport) & Mark Path Controls */}
+      <div
+        className={`absolute ${
+          isMobileMap
+            ? 'bottom-3 left-3 right-3 max-h-[46vh]'
+            : 'top-16 left-3 w-72 max-h-[calc(100vh-5rem)]'
+        } bg-[#141414]/95 border-2 border-[#444444] rounded-[2px] shadow-2xl flex flex-col overflow-hidden pointer-events-auto`}
+      >
+        {/* Waypoints Section */}
+        <div className="p-2.5 border-b border-[#333333] flex items-center justify-between gap-2">
+          <span className="text-[11px] font-display font-bold uppercase text-[#e5e5e5]">
+            Waypoints (Click to Teleport)
           </span>
-          {(
-            [
-              { id: 'PAN_SELECT', label: 'PAN & SELECT' },
-              { id: 'ADD_WAYPOINT', label: '+ WAYPOINT' },
-              { id: 'ADD_CONSTRUCTION', label: '+ BUILD SITE' },
-              { id: 'RULER_AB', label: 'RULER [A→B]' },
-              { id: 'DRAW_ROUTE', label: 'DRAW ROUTE' },
-              { id: 'LOG_CRATER', label: '+ BLAST CRATER' },
-            ] as const
-          ).map((t) => (
+          <button
+            type="button"
+            onClick={handleAddWaypointAtPlayer}
+            className="px-2 py-0.5 bg-[#22c55e] hover:bg-[#16a34a] text-[#090d16] text-[10px] font-display font-bold uppercase rounded-[2px] cursor-pointer"
+          >
+            + Drop Here
+          </button>
+        </div>
+
+        {/* Optional Waypoint Name Input when adding */}
+        <div className="px-2.5 py-1.5 border-b border-[#2a2a2a] flex items-center gap-1.5">
+          <input
+            type="text"
+            value={wpDraftName}
+            onChange={(e) => setWpDraftName(e.target.value)}
+            placeholder="New waypoint name..."
+            className="flex-1 min-w-0 bg-[#1f1f1f] border border-[#3a3a3a] px-2 py-1 text-[11px] text-[#e5e5e5] rounded-[2px] focus:outline-none focus:border-[#facc15]"
+          />
+        </div>
+
+        {/* Waypoint List */}
+        <div className="flex-1 overflow-y-auto divide-y divide-[#262626] max-h-60">
+          {allWaypoints.map((wp) => (
+            <div
+              key={wp.id}
+              data-testid={`waypoint-tp-item-${wp.id}`}
+              onClick={() => handleTeleportToWaypoint(wp)}
+              className="px-2.5 py-2 hover:bg-[#222222] active:bg-[#2a2a2a] flex items-center justify-between gap-2 cursor-pointer transition-colors group"
+            >
+              <div className="flex items-center gap-2 min-w-0">
+                <span
+                  className="w-2.5 h-2.5 rounded-full shrink-0"
+                  style={{ backgroundColor: wp.color }}
+                />
+                <div className="min-w-0">
+                  <div className="text-[11px] font-display font-bold text-[#e5e5e5] truncate group-hover:text-[#facc15]">
+                    {wp.name}
+                  </div>
+                  <div className="text-[9.5px] font-mono-num text-[#9ca3af]">
+                    ({wp.x}, {wp.z}) · Click to TP
+                  </div>
+                </div>
+              </div>
+              {wp.isCustom && (
+                <button
+                  type="button"
+                  title="Remove Waypoint"
+                  onClick={(e) => handleDeleteWaypointEntry(wp, e)}
+                  className="w-5 h-5 flex items-center justify-center bg-[#262626] hover:bg-[#dc2626] text-[#a3a3a3] hover:text-white rounded-[2px] text-xs font-bold shrink-0 cursor-pointer"
+                >
+                  ×
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+
+        {/* Mark Path Section */}
+        <div className="p-2.5 border-t-2 border-[#333333] bg-[#1a1a1a] flex flex-col gap-2">
+          <div className="flex items-center justify-between">
+            <span className="text-[11px] font-display font-bold uppercase text-[#facc15]">
+              Mark Path ({routePoints.length} pts)
+            </span>
+            {routePoints.length >= 2 && (
+              <span className="text-[10px] font-mono-num text-[#38bdf8]">
+                {routeSummary.totalDistance2DMeters} m
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-1.5">
             <button
-              key={t.id}
               type="button"
-              data-testid={`map-tool-btn-${t.id}`}
-              onClick={() => setActiveTool(t.id)}
-              className={`rounded-[2px] border-2 border-[#444444] px-2 py-1 text-[10px] font-mono-num font-bold uppercase cursor-pointer text-left ${
-                activeTool === t.id
-                  ? 'bg-[#facc15] text-[#1a1a1a]'
+              onClick={() =>
+                setActiveTool((prev) =>
+                  prev === 'DRAW_ROUTE' ? 'PAN_SELECT' : 'DRAW_ROUTE',
+                )
+              }
+              className={`flex-1 py-1 text-[10.5px] font-display font-bold uppercase rounded-[2px] cursor-pointer ${
+                activeTool === 'DRAW_ROUTE'
+                  ? 'bg-[#facc15] text-[#090d16]'
                   : 'bg-[#262626] text-[#e5e5e5] hover:bg-[#333333]'
               }`}
             >
-              {t.label}
+              {activeTool === 'DRAW_ROUTE' ? 'Marking Path (Click Map)' : 'Start Marking'}
             </button>
-          ))}
-
-          {/* Active Waypoint HUD */}
-          {selectedWaypoint && activeWaypointMetrics && (
-            <div
-              data-testid="map-active-waypoint-hud"
-              className="mt-1 border-t border-[#444444] pt-1.5 flex flex-col gap-0.5 text-[10px] font-mono-num"
+            <button
+              type="button"
+              disabled={routePoints.length === 0}
+              onClick={() => setRoutePoints((prev) => prev.slice(0, -1))}
+              className="px-2 py-1 bg-[#262626] hover:bg-[#333333] disabled:opacity-40 text-[#e5e5e5] text-[10px] font-display font-bold uppercase rounded-[2px] cursor-pointer"
             >
-              <div className="font-bold text-[#fbbf24] truncate">
-                NAV → {selectedWaypoint.name}:
-              </div>
-              <div className="text-[#e5e5e5]">
-                DIST {activeWaypointMetrics.distance2DMeters}m (3D{' '}
-                {activeWaypointMetrics.distance3DMeters}m)
-              </div>
-              <div className="text-[#38bdf8]">
-                BRG {activeWaypointMetrics.bearingDegrees}°{' '}
-                {activeWaypointMetrics.cardinalDirection}
-              </div>
-              <div
-                className={
-                  activeWaypointMetrics.elevationDeltaMeters >= 0
-                    ? 'text-[#22c55e]'
-                    : 'text-[#f97316]'
-                }
-              >
-                ΔY {activeWaypointMetrics.elevationDeltaMeters >= 0 ? '+' : ''}
-                {activeWaypointMetrics.elevationDeltaMeters}m
-              </div>
-            </div>
-          )}
-        </div>
-
-        {/* Right Tactical Sidebar */}
-        <div className="pointer-events-auto relative z-10 w-80 shrink-0 border-l-2 border-[#444444] bg-[#1a1a1a]/95 flex flex-col min-h-0 shadow-2xl">
-          {renderTacticalSidebarContent()}
-        </div>
-      </div>
-
-      {/* =====================================================================
-          BOTTOM BAR: 3D CURSOR REAL-TIME TERRAIN TELEMETRY (X, Y, Z)
-          ===================================================================== */}
-      <div className="pointer-events-auto flex flex-wrap items-center justify-between border-t-2 border-[#444444] bg-[#1a1a1a]/95 px-3 py-1 text-[11px] font-mono-num text-[#e5e5e5] shadow-lg">
-        <div className="flex items-center gap-2">
-          <span>CONTROLS: WASD / DRAG TO PAN CAMERA · SCROLL TO ZOOM</span>
-          <span className="text-[#a3a3a3]">· CLICK 3D TERRAIN TO PLACE WAYPOINTS</span>
-        </div>
-        <div data-testid="map-cursor-telemetry-bar" className="flex items-center gap-2">
-          {cursorWorldCoords ? (
-            <>
-              <span data-testid="map-cursor-xyz" className="text-[#fbbf24] font-bold">
-                CURSOR X:{cursorWorldCoords.x}m Y:{cursorWorldCoords.y}m Z:{cursorWorldCoords.z}m
-              </span>
-              <span className="text-[#38bdf8]">{cursorWorldCoords.biome}</span>
-              {cursorWorldCoords.waterDepth > 0 && (
-                <span className="text-[#7dd3fc]">
-                  DEPTH: {cursorWorldCoords.waterDepth}m
-                </span>
-              )}
-            </>
-          ) : (
-            <span className="text-[#a3a3a3]">HOVER CURSOR OVER 3D WORLD FOR (X,Y,Z)</span>
-          )}
+              Undo
+            </button>
+            <button
+              type="button"
+              disabled={routePoints.length === 0}
+              onClick={() => setRoutePoints([])}
+              className="px-2 py-1 bg-[#262626] hover:bg-[#dc2626] disabled:opacity-40 text-[#e5e5e5] hover:text-white text-[10px] font-display font-bold uppercase rounded-[2px] cursor-pointer"
+            >
+              Clear
+            </button>
+          </div>
         </div>
       </div>
     </div>

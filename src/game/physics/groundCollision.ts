@@ -9,6 +9,10 @@ import {
 import type { CustomRigidBody } from './customRigidBody.ts';
 import type { SampledCollisionPoint } from './collisionPoints.ts';
 import { TerrainEntity } from './terrainEntity.ts';
+import {
+  shouldCullCollisionPointByDirection,
+  unifiedEngineTelemetry,
+} from '../unifiedVoxelEngine.ts';
 
 export interface GroundProbeWorld {
   probeGroundBelow: (
@@ -65,6 +69,8 @@ const _omegaCrossR = new THREE.Vector3();
 const _forwardDir = new THREE.Vector3();
 const _rightDir = new THREE.Vector3();
 const _pointForce = new THREE.Vector3();
+const _invQuat = new THREE.Quaternion();
+const _localDownDir = new THREE.Vector3();
 const _activeContactsScratch: ActiveGroundContact[] = [];
 const _contactObjPool: ActiveGroundContact[] = [];
 
@@ -160,9 +166,33 @@ export function resolveVehicleGroundCollisions(
   let rawTotalUpwardForce = 0;
   _activeContactsScratch.length = 0;
 
+  // Transform world down (0, -1, 0) into vehicle-local space once for 6-bit exposed-face culling
+  _invQuat.copy(body.quaternion).invert();
+  _localDownDir.set(0, -1, 0).applyQuaternion(_invQuat);
+
   // PASS 1: Gather all contacting ground points and compute raw per-point spring-damper force
   for (let i = 0; i < numPoints; i++) {
     const pt = points[i] as SampledCollisionPoint;
+
+    // Fast 6-bit exposed-face back-face cull: skip top-deck points that have zero downward/side exposure
+    if (
+      pt.exposedFaceMask !== undefined &&
+      pt.localOutwardNormal !== undefined &&
+      pt.localPos.y > 0.15 &&
+      shouldCullCollisionPointByDirection(
+        pt.exposedFaceMask,
+        pt.localOutwardNormal.x,
+        pt.localOutwardNormal.y,
+        pt.localOutwardNormal.z,
+        _localDownDir.x,
+        _localDownDir.y,
+        _localDownDir.z,
+        -0.45,
+      )
+    ) {
+      unifiedEngineTelemetry.cullSkippedCollisionPoints++;
+      continue;
+    }
 
     // 1. Transform localPos (relative to CoM) to world space
     _relPos.copy(pt.localPos).applyQuaternion(body.quaternion);
@@ -412,6 +442,24 @@ export function resolveVehicleGroundCollisions(
   if (world.probeCeilingAbove && body.velocity.y >= -0.5) {
     for (let i = 0; i < numPoints; i++) {
       const pt = points[i] as SampledCollisionPoint;
+      if (
+        pt.exposedFaceMask !== undefined &&
+        pt.localOutwardNormal !== undefined &&
+        pt.localPos.y < -0.15 &&
+        shouldCullCollisionPointByDirection(
+          pt.exposedFaceMask,
+          pt.localOutwardNormal.x,
+          pt.localOutwardNormal.y,
+          pt.localOutwardNormal.z,
+          -_localDownDir.x,
+          -_localDownDir.y,
+          -_localDownDir.z,
+          -0.45,
+        )
+      ) {
+        unifiedEngineTelemetry.cullSkippedCollisionPoints++;
+        continue;
+      }
       _relPos.copy(pt.localPos).applyQuaternion(body.quaternion);
       _worldPoint.addVectors(body.position, _relPos);
 

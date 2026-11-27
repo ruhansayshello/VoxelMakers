@@ -516,9 +516,34 @@ export class WebGLState {
   }
 
   bindFramebuffer(target: number, framebuffer: WebGLFramebuffer | null): boolean {
+    const gl = this.gl;
+    if (target === gl.FRAMEBUFFER) {
+      if (
+        this.currentBoundFramebuffers[gl.FRAMEBUFFER] !== framebuffer ||
+        this.currentBoundFramebuffers[gl.READ_FRAMEBUFFER] !== framebuffer ||
+        this.currentBoundFramebuffers[gl.DRAW_FRAMEBUFFER] !== framebuffer
+      ) {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+        this.currentBoundFramebuffers[gl.FRAMEBUFFER] = framebuffer;
+        this.currentBoundFramebuffers[gl.READ_FRAMEBUFFER] = framebuffer;
+        this.currentBoundFramebuffers[gl.DRAW_FRAMEBUFFER] = framebuffer;
+        return true;
+      }
+      return false;
+    }
+
     if (this.currentBoundFramebuffers[target] !== framebuffer) {
-      this.gl.bindFramebuffer(target, framebuffer);
+      gl.bindFramebuffer(target, framebuffer);
       this.currentBoundFramebuffers[target] = framebuffer;
+      if (target === gl.READ_FRAMEBUFFER || target === gl.DRAW_FRAMEBUFFER) {
+        const readFb = this.currentBoundFramebuffers[gl.READ_FRAMEBUFFER];
+        const drawFb = this.currentBoundFramebuffers[gl.DRAW_FRAMEBUFFER];
+        if (readFb === drawFb && readFb !== undefined) {
+          this.currentBoundFramebuffers[gl.FRAMEBUFFER] = readFb;
+        } else {
+          delete this.currentBoundFramebuffers[gl.FRAMEBUFFER];
+        }
+      }
       return true;
     }
     return false;

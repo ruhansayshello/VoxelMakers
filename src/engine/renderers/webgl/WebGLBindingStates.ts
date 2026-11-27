@@ -23,11 +23,47 @@ export class WebGLBindingStates {
   private gl: WebGL2RenderingContext;
   private attributes: WebGLAttributes;
   private bindingStates: Map<number, Map<number, BindingState>> = new Map();
+  // Separate VAO table per InstancedMesh id so multiple InstancedMeshes sharing the same
+  // geometry + program never collide on one VAO and thrash vertexAttribPointer every draw call.
+  private instancedBindingStates: Map<number, Map<number, Map<number, BindingState>>> = new Map();
   private currentVAO: WebGLVertexArrayObject | null = null;
 
   constructor(gl: WebGL2RenderingContext, attributes: WebGLAttributes) {
     this.gl = gl;
     this.attributes = attributes;
+  }
+
+  private getOrCreateProgMap(object: InstancedMeshLike, geometryId: number): Map<number, BindingState> {
+    const objectId = (object as { id?: number }).id;
+    if (object.isInstancedMesh && objectId !== undefined) {
+      let geomMap = this.instancedBindingStates.get(objectId);
+      if (geomMap === undefined) {
+        geomMap = new Map();
+        this.instancedBindingStates.set(objectId, geomMap);
+      }
+      let progMap = geomMap.get(geometryId);
+      if (progMap === undefined) {
+        progMap = new Map();
+        geomMap.set(geometryId, progMap);
+      }
+      return progMap;
+    }
+
+    let progMap = this.bindingStates.get(geometryId);
+    if (progMap === undefined) {
+      progMap = new Map();
+      this.bindingStates.set(geometryId, progMap);
+    }
+    return progMap;
+  }
+
+  private deleteVAO(vao: WebGLVertexArrayObject | null): void {
+    if (vao === null) return;
+    if (this.currentVAO === vao) {
+      this.gl.bindVertexArray(null);
+      this.currentVAO = null;
+    }
+    this.gl.deleteVertexArray(vao);
   }
 
   setup(
@@ -38,11 +74,7 @@ export class WebGLBindingStates {
     index: BufferAttribute | null,
   ): void {
     const gl = this.gl;
-    let progMap = this.bindingStates.get(geometry.id);
-    if (progMap === undefined) {
-      progMap = new Map();
-      this.bindingStates.set(geometry.id, progMap);
-    }
+    const progMap = this.getOrCreateProgMap(object, geometry.id);
 
     let state = progMap.get(program.id);
     let needsUpdate = false;
@@ -119,7 +151,10 @@ export class WebGLBindingStates {
     state: BindingState,
   ): void {
     const attrKeys = program.getAttributeKeys();
-    const cache: Record<string, { attribute: BufferAttribute; version: number }> = {};
+    const cache = state.attributes;
+    for (const key in cache) {
+      delete cache[key];
+    }
     let count = 0;
 
     for (let i = 0; i < attrKeys.length; i++) {
@@ -130,7 +165,6 @@ export class WebGLBindingStates {
       count++;
     }
 
-    state.attributes = cache;
     state.index = index;
     state.attributesNum = count;
   }
@@ -214,34 +248,66 @@ export class WebGLBindingStates {
     }
   }
 
-  releaseStatesOfGeometry(geometry: BufferGeometry): void {
-    const progMap = this.bindingStates.get(geometry.id);
-    if (progMap === undefined) return;
+  releaseStatesOfObject(objectId: number): void {
+    const geomMap = this.instancedBindingStates.get(objectId);
+    if (geomMap === undefined) return;
 
-    for (const state of progMap.values()) {
-      if (state.vao !== null) {
-        if (this.currentVAO === state.vao) {
-          this.gl.bindVertexArray(null);
-          this.currentVAO = null;
-        }
-        this.gl.deleteVertexArray(state.vao);
+    for (const progMap of geomMap.values()) {
+      for (const state of progMap.values()) {
+        this.deleteVAO(state.vao);
       }
     }
-    this.bindingStates.delete(geometry.id);
+    this.instancedBindingStates.delete(objectId);
+  }
+
+  releaseStatesOfGeometry(geometry: BufferGeometry): void {
+    const progMap = this.bindingStates.get(geometry.id);
+    if (progMap !== undefined) {
+      for (const state of progMap.values()) {
+        this.deleteVAO(state.vao);
+      }
+      this.bindingStates.delete(geometry.id);
+    }
+
+    for (const [objectId, geomMap] of this.instancedBindingStates) {
+      const instProgMap = geomMap.get(geometry.id);
+      if (instProgMap !== undefined) {
+        for (const state of instProgMap.values()) {
+          this.deleteVAO(state.vao);
+        }
+        geomMap.delete(geometry.id);
+        if (geomMap.size === 0) {
+          this.instancedBindingStates.delete(objectId);
+        }
+      }
+    }
   }
 
   releaseStatesOfProgram(program: WebGLProgram): void {
-    for (const progMap of this.bindingStates.values()) {
+    for (const [geomId, progMap] of this.bindingStates) {
       const state = progMap.get(program.id);
       if (state !== undefined) {
-        if (state.vao !== null) {
-          if (this.currentVAO === state.vao) {
-            this.gl.bindVertexArray(null);
-            this.currentVAO = null;
-          }
-          this.gl.deleteVertexArray(state.vao);
-        }
+        this.deleteVAO(state.vao);
         progMap.delete(program.id);
+        if (progMap.size === 0) {
+          this.bindingStates.delete(geomId);
+        }
+      }
+    }
+
+    for (const [objectId, geomMap] of this.instancedBindingStates) {
+      for (const [geomId, progMap] of geomMap) {
+        const state = progMap.get(program.id);
+        if (state !== undefined) {
+          this.deleteVAO(state.vao);
+          progMap.delete(program.id);
+          if (progMap.size === 0) {
+            geomMap.delete(geomId);
+          }
+        }
+      }
+      if (geomMap.size === 0) {
+        this.instancedBindingStates.delete(objectId);
       }
     }
   }
@@ -256,5 +322,16 @@ export class WebGLBindingStates {
       }
     }
     this.bindingStates.clear();
+
+    for (const geomMap of this.instancedBindingStates.values()) {
+      for (const progMap of geomMap.values()) {
+        for (const state of progMap.values()) {
+          if (state.vao !== null) {
+            this.gl.deleteVertexArray(state.vao);
+          }
+        }
+      }
+    }
+    this.instancedBindingStates.clear();
   }
 }

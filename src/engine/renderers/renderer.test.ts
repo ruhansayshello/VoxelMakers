@@ -24,6 +24,7 @@ import {
   NoBlending,
   NormalBlending,
   Object3D,
+  PerspectiveCamera,
   PointsMaterial,
   Scene,
   ShaderMaterial,
@@ -1164,5 +1165,106 @@ test('Phase 3c Fix 2 & Fix #1: per-material program cache hits & zero-reupload s
 
   renderer.dispose();
 });
+
+test('WebGLRenderer renders Scale-Space Multi-Pass bands farthest-to-nearest with DEPTH clears and BigInt RTE offsets at 10^34 m', () => {
+  const { gl, calls } = createMockWebGL2Context();
+  const renderer = new WebGLRenderer({ context: gl, logarithmicDepthBuffer: true });
+  renderer.setSize(640, 360);
+
+  const scene = new Scene();
+  const camera = new PerspectiveCamera(60, 640 / 360, 0.25, 65536);
+  camera.position.set(120, 20, -40);
+  camera.lookAt(120, 20, -140);
+  camera.updateMatrixWorld();
+
+  // Place camera at a huge BigInt macro-sector (~10^34 m from world zero)
+  const cosmicSector = 10_000_000_000_000_000_000_000_000_000_000n;
+  renderer.cameraBigSector = {
+    sectorX: cosmicSector,
+    sectorZ: cosmicSector,
+    localX: 120,
+    localY: 20,
+    localZ: -40,
+  };
+
+  const makeTri = () => {
+    const geo = new BufferGeometry();
+    geo.setAttribute('position', new BufferAttribute(new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]), 3));
+    geo.setIndex(new BufferAttribute(new Uint16Array([0, 1, 2]), 1));
+    return geo;
+  };
+
+  const drawSequence: string[] = [];
+  const makeTrackedMat = (label: string) => {
+    const mat = new MeshBasicMaterial({ color: 0x33aa55 });
+    mat.onBeforeRender = () => {
+      drawSequence.push(label);
+    };
+    return mat;
+  };
+
+  const skyDome = new Mesh(makeTri(), makeTrackedMat('SKY'));
+  skyDome.frustumCulled = false;
+  skyDome.userData.isSkyDome = true;
+  scene.add(skyDome);
+
+  const localMesh = new Mesh(makeTri(), makeTrackedMat('BAND0'));
+  localMesh.frustumCulled = false;
+  scene.add(localMesh);
+
+  const band1Scale = 1n << 12n;
+  const band1Mesh = new Mesh(makeTri(), makeTrackedMat('BAND1'));
+  band1Mesh.frustumCulled = false;
+  band1Mesh.userData.scaleBand = 1;
+  band1Mesh.userData.bandScaleMetersBig = band1Scale;
+  band1Mesh.userData.worldOriginBigInt = {
+    x: cosmicSector * 1024n + band1Scale * 100n,
+    y: 0n,
+    z: cosmicSector * 1024n - band1Scale * 250n,
+  };
+  scene.add(band1Mesh);
+
+  const band9Scale = 1n << 108n;
+  const band9Mesh = new Mesh(makeTri(), makeTrackedMat('BAND9'));
+  band9Mesh.frustumCulled = false;
+  band9Mesh.userData.scaleBand = 9;
+  band9Mesh.userData.bandScaleMetersBig = band9Scale;
+  band9Mesh.userData.worldOriginBigInt = {
+    x: cosmicSector * 1024n + band9Scale * 512n,
+    y: 0n,
+    z: cosmicSector * 1024n - band9Scale * 1024n,
+  };
+  scene.add(band9Mesh);
+
+  calls.length = 0;
+  renderer.render(scene, camera);
+
+  // 1. Verify exact render order: SkyDome -> Farthest Band (9) -> Nearer Band (1) -> Local Band (0)
+  assert.deepEqual(drawSequence, ['SKY', 'BAND9', 'BAND1', 'BAND0']);
+
+  // 2. Verify gl.clear(gl.DEPTH_BUFFER_BIT) was invoked between the cosmic scale bands!
+  const depthOnlyClears = calls.filter(
+    (c) => c.fn === 'clear' && c.args[0] === gl.DEPTH_BUFFER_BIT,
+  );
+  assert.equal(
+    depthOnlyClears.length,
+    2,
+    `Expected 2 depth-only clears (after Band 9 and after Band 1), got ${depthOnlyClears.length}`,
+  );
+
+  // 3. Verify EVERY uploaded uniformMatrix4fv (including Band 9 at 10^34 m) is finite and Float32-safe!
+  const mat4Calls = calls.filter((c) => c.fn === 'uniformMatrix4fv');
+  assert.ok(mat4Calls.length > 0);
+  for (const call of mat4Calls) {
+    const arr = call.args[2] as Float32Array | number[];
+    for (let i = 0; i < arr.length; i++) {
+      assert.ok(Number.isFinite(arr[i]), `Uploaded matrix entry ${arr[i]} must be finite`);
+      assert.ok(Math.abs(arr[i]) < 1e7, `Uploaded matrix entry ${arr[i]} must stay safely bounded in Float32`);
+    }
+  }
+
+  renderer.dispose();
+});
+
 
 

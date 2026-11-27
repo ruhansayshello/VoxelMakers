@@ -59,6 +59,29 @@ import {
 } from './physics/propRigidBody.ts';
 import { terrainEntityManager } from './physics/terrainEntity.ts';
 import {
+  isMicroVoxelDestructibleKind,
+  createMicroVoxelDamageState,
+  carveMicroVoxelModule,
+  disposeMicroVoxelDamageState,
+  getMicroVoxelBlockTemplate,
+  type MicroVoxelDamageState,
+} from './microVoxelBlocks.ts';
+import {
+  MicroHullLayer,
+  MICRO_VOXEL_SIZE,
+  MICRO_VOXEL_SUBDIV,
+  SYMMETRY_CENTER_Z,
+  clampHullScalePx,
+  getMicroHullMaterial,
+  computeScaledHullPlacementCoords,
+  computeMicroFaceExtrudeCoords,
+  computeGhostDimensionsSummary,
+  microBlockCenterMeters,
+  type MicroVoxelHit,
+  type HullMicroShape,
+  type SymmetryAxisMode,
+} from './microHullBlocks.ts';
+import {
   PHYSICS_CONFIG,
   getMaterialFrictionProfile,
   mapVoxelMatToMaterialType,
@@ -133,6 +156,7 @@ import {
 } from './logicSystem.ts';
 import {
   applyMeshMaterialPresetSwap,
+  BlobShadowInstancedManager,
   createVehicleBlobShadowMesh,
   updateVehicleBlobShadow,
   getSharedVehicleOutlineMaterial,
@@ -159,6 +183,19 @@ export interface ActiveModule
   lastCompression: number;
   health?: number;
   seatedPlayerId?: string | null;
+  /** Copy-on-Write 1px micro-voxel damage state (null until first hit = 0 extra RAM). */
+  microDamage?: MicroVoxelDamageState | null;
+  /** Remaining intact micro-voxel ratio (0..1), scales engine horsepower & module health. */
+  microIntegrity?: number;
+  /** Per-module linear actuator extension ratio (0..1) for PISTON modules. */
+  pistonExtension?: number;
+  /** Per-module toggle latch (-1, 0, or 1) when config.toggleMode is enabled. */
+  toggleLatch?: number;
+  /** Per-module held signal (-1..1) when config.autoReset === false. */
+  heldSignal?: number;
+  prevPosKeyDown?: boolean;
+  prevNegKeyDown?: boolean;
+  lastEvalTick?: number;
 }
 
 export function generateVehicleNetworkId(peerId = 'local'): string {
@@ -423,15 +460,21 @@ export class ModularVehicleRig {
   public rootGroup: THREE.Group;
   public chassisMesh: THREE.Mesh | null = null;
   public chassisTransMesh: THREE.Mesh | null = null;
+  public readonly microHull = new MicroHullLayer();
+  public microChassisMesh: THREE.Mesh | null = null;
+  private engineSparkTimer = 0;
   public modulesGroup: THREE.Group;
   public ghostGroup: THREE.Group;
-  public contactShadowMesh: THREE.Mesh;
+  public contactShadowMesh: THREE.Mesh | null = null;
+  private blobShadowManager: BlobShadowInstancedManager | null = null;
+  private blobShadowSlot = -1;
 
   public comMarker: THREE.Group;
   public cobMarker: THREE.Group;
   public cotMarker: THREE.Group;
   public hoverRingGroup: THREE.Group;
   public symmetryPlane: THREE.Mesh;
+  public symmetryPlaneZ: THREE.Mesh;
 
   public position: THREE.Vector3 = this.rigidBody.position;
   public hoverAnchorPos = new THREE.Vector3(0, 3.2 + (10 + SUBTERRANEAN_DEPTH_VY + 1) * VOXEL_SIZE, -2);
@@ -544,7 +587,27 @@ export class ModularVehicleRig {
     const fy = 2 * (qy * qz - qw * qx);
     const fz = 1 - 2 * (qx * qx + qy * qy);
 
-    if (this.contactShadowMesh) {
+    if (this.blobShadowManager && this.blobShadowSlot >= 0) {
+      const showShadow = this.blobShadowsEnabled && !this.inBuildMode;
+      if (showShadow) {
+        const floorY = this.resolveShadowFloorY(px, py, pz);
+        const footX = Math.max(2.6, (this.maxVX - this.minVX + 2) * VOXEL_SIZE);
+        const footZ = Math.max(3.4, (this.maxVZ - this.minVZ + 2) * VOXEL_SIZE);
+        this.blobShadowManager.updateSlot(
+          this.blobShadowSlot,
+          px,
+          py,
+          pz,
+          floorY,
+          footX,
+          footZ,
+          Math.atan2(fx, fz),
+          true,
+        );
+      } else {
+        this.blobShadowManager.hideSlot(this.blobShadowSlot);
+      }
+    } else if (this.contactShadowMesh) {
       const floorY = this.resolveShadowFloorY(px, py, pz);
       const footX = Math.max(2.6, (this.maxVX - this.minVX + 2) * VOXEL_SIZE);
       const footZ = Math.max(3.4, (this.maxVZ - this.minVZ + 2) * VOXEL_SIZE);
@@ -723,8 +786,104 @@ export class ModularVehicleRig {
 
   public inBuildMode = false;
   public mirrorMode = true;
+  public symmetryAxisMode: SymmetryAxisMode = 'X';
+  public xrayMode = false;
+  public lastGhostSummary: {
+    dimsLabel: string;
+    count: number;
+    massDeltaKg: number;
+  } = { dimsLabel: '', count: 0, massDeltaKg: 0 };
   public showForces = true;
   public static readonly MIN_BLOCKS_FOR_FORCE_MARKERS = 12;
+
+  public syncSymmetryPlanesVisibility(): void {
+    const showX =
+      this.inBuildMode &&
+      (this.symmetryAxisMode === 'X' || this.symmetryAxisMode === 'XZ');
+    const showZ =
+      this.inBuildMode &&
+      (this.symmetryAxisMode === 'Z' || this.symmetryAxisMode === 'XZ');
+    if (this.symmetryPlane) this.symmetryPlane.visible = showX;
+    if (this.symmetryPlaneZ) this.symmetryPlaneZ.visible = showZ;
+  }
+
+  public setSymmetryAxisMode(mode: SymmetryAxisMode): void {
+    this.symmetryAxisMode = mode;
+    this.mirrorMode = mode !== 'OFF';
+    this.lastGhostSignature = '';
+    this.syncSymmetryPlanesVisibility();
+  }
+
+  public cycleSymmetryAxisMode(): SymmetryAxisMode {
+    const order: SymmetryAxisMode[] = ['X', 'XZ', 'Z', 'OFF'];
+    const curIdx = order.indexOf(this.symmetryAxisMode);
+    const next = order[(curIdx + 1) % order.length];
+    this.setSymmetryAxisMode(next);
+    return next;
+  }
+
+  private static _sharedXrayMat: THREE.MeshBasicMaterial | null = null;
+  private getSharedXrayHullMaterial(): THREE.MeshBasicMaterial {
+    if (!ModularVehicleRig._sharedXrayMat) {
+      ModularVehicleRig._sharedXrayMat = new THREE.MeshBasicMaterial({
+        color: 0x7dd3fc,
+        vertexColors: true,
+        transparent: true,
+        opacity: 0.22,
+        depthWrite: false,
+      });
+    }
+    return ModularVehicleRig._sharedXrayMat;
+  }
+
+  public syncXrayMaterialState(): void {
+    const useXray = this.inBuildMode && this.xrayMode;
+    if (this.chassisMesh) {
+      if (useXray) {
+        this.chassisMesh.material = this.getSharedXrayHullMaterial();
+      } else {
+        this.chassisMesh.material = this.world.getActiveOpaqueVoxelMaterial();
+        const activeMode: ActiveShaderMode = this.useCartoonShader
+          ? 'CARTOON'
+          : this.usePotatoShader
+            ? 'POTATO'
+            : 'PBR';
+        if (activeMode !== 'PBR') {
+          applyMeshMaterialPresetSwap(
+            this.chassisMesh,
+            activeMode,
+            this.world.getActiveOpaqueVoxelMaterial(),
+          );
+        }
+      }
+    }
+    if (this.microChassisMesh) {
+      if (useXray) {
+        this.microChassisMesh.material = this.getSharedXrayHullMaterial();
+      } else {
+        this.microChassisMesh.material = getMicroHullMaterial();
+        const activeMode: ActiveShaderMode = this.useCartoonShader
+          ? 'CARTOON'
+          : this.usePotatoShader
+            ? 'POTATO'
+            : 'PBR';
+        if (activeMode !== 'PBR') {
+          applyMeshMaterialPresetSwap(
+            this.microChassisMesh,
+            activeMode,
+            getMicroHullMaterial(),
+          );
+        }
+      }
+    }
+  }
+
+  public setXrayMode(enabled?: boolean): boolean {
+    this.xrayMode = enabled !== undefined ? enabled : !this.xrayMode;
+    this.lastGhostSignature = '';
+    this.syncXrayMaterialState();
+    return this.xrayMode;
+  }
 
   /**
    * Returns true only when in Build Mode, `showForces` is enabled, AND the vehicle
@@ -782,6 +941,7 @@ export class ModularVehicleRig {
   public isDrifting = false;
   public intactBlueprintSnapshot: SerializedVehicleBlueprint | null = null;
   public undoStack: SerializedVehicleBlueprint[] = [];
+  public redoStack: SerializedVehicleBlueprint[] = [];
   public static readonly MAX_UNDO_HISTORY = 32;
 
   public engineCount = 0;
@@ -971,9 +1131,18 @@ export class ModularVehicleRig {
       this.scene.add(this.hoverRingGroup);
     }
 
-    // Shared 64x64 Radial Gradient Blob Shadow Grounding Plane (1 draw call per vehicle, no shadow map pass needed)
-    this.contactShadowMesh = createVehicleBlobShadowMesh();
-    this.scene.add(this.contactShadowMesh);
+    // Pooled InstancedMesh Blob Shadow Grounding Plane (1 draw call for ALL vehicles & voxel entities)
+    const sharedShadowMgr = this.scene.userData?.blobShadowManager as
+      | BlobShadowInstancedManager
+      | undefined;
+    if (sharedShadowMgr) {
+      this.blobShadowManager = sharedShadowMgr;
+      this.blobShadowSlot = sharedShadowMgr.acquireSlot();
+      this.contactShadowMesh = null;
+    } else {
+      this.contactShadowMesh = createVehicleBlobShadowMesh();
+      this.scene.add(this.contactShadowMesh);
+    }
 
     // Trailmakers Center Symmetry Plane (dynamically scales with unbounded vehicle length!)
     const symGeo = new THREE.PlaneGeometry(18.0, 8.0);
@@ -992,8 +1161,22 @@ export class ModularVehicleRig {
       VEH_DIM_Z * 0.5 * VOXEL_SIZE,
     );
     this.symmetryPlane.visible = false;
+    const symMatZ = new THREE.MeshBasicMaterial({
+      color: 0xfbbf24,
+      transparent: true,
+      opacity: 0.13,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    });
+    this.symmetryPlaneZ = new THREE.Mesh(symGeo, symMatZ);
+    this.symmetryPlaneZ.position.set(
+      VEH_DIM_X * 0.5 * VOXEL_SIZE,
+      VEH_DIM_Y * 0.5 * VOXEL_SIZE,
+      SYMMETRY_CENTER_Z * VOXEL_SIZE,
+    );
+    this.symmetryPlaneZ.visible = false;
     if (!isVoxelEntity) {
-      this.rootGroup.add(this.symmetryPlane);
+      this.rootGroup.add(this.symmetryPlane, this.symmetryPlaneZ);
     }
 
     // Grappling Winch Cable Line + Taut 3D Cylindrical Steel Cable & Hook
@@ -1690,6 +1873,10 @@ export class ModularVehicleRig {
 
   clearAll(): void {
     this.voxelMap.clear();
+    this.microHull.clear();
+    if (this.microChassisMesh) {
+      this.microChassisMesh.visible = false;
+    }
     this.voxelHealthMap.clear();
     this.voxelDestructionMap.clear();
     this.fallingOffVoxels.clear();
@@ -1701,6 +1888,9 @@ export class ModularVehicleRig {
     this.structuralIntegrityPct = 100;
     this.damagedBlockCount = 0;
     for (const m of this.modules) {
+      disposeMicroVoxelDamageState(m.microDamage);
+      m.microDamage = null;
+      m.microIntegrity = 1.0;
       if (m.mesh) {
         this.modulesGroup.remove(m.mesh);
         disposeModuleGroupGeometries(m.mesh);
@@ -1720,7 +1910,7 @@ export class ModularVehicleRig {
   }
 
   private recomputeActiveBounds(): void {
-    if (this.voxelMap.size === 0 && this.modules.length === 0) {
+    if (this.voxelMap.size === 0 && this.microHull.size === 0 && this.modules.length === 0) {
       this.minVX = 10;
       this.maxVX = 14;
       this.minVY = 4;
@@ -1754,6 +1944,22 @@ export class ModularVehicleRig {
       if (m.vz + 2 > maxZ) maxZ = m.vz + 2;
     }
 
+    const microBounds = this.microHull.computeBounds();
+    if (microBounds) {
+      const mMinX = Math.floor(microBounds.minMX / MICRO_VOXEL_SUBDIV);
+      const mMaxX = Math.floor(microBounds.maxMX / MICRO_VOXEL_SUBDIV);
+      const mMinY = Math.floor(microBounds.minMY / MICRO_VOXEL_SUBDIV);
+      const mMaxY = Math.floor(microBounds.maxMY / MICRO_VOXEL_SUBDIV);
+      const mMinZ = Math.floor(microBounds.minMZ / MICRO_VOXEL_SUBDIV);
+      const mMaxZ = Math.floor(microBounds.maxMZ / MICRO_VOXEL_SUBDIV);
+      if (mMinX < minX) minX = mMinX;
+      if (mMaxX > maxX) maxX = mMaxX;
+      if (mMinY < minY) minY = mMinY;
+      if (mMaxY > maxY) maxY = mMaxY;
+      if (mMinZ < minZ) minZ = mMinZ;
+      if (mMaxZ > maxZ) maxZ = mMaxZ;
+    }
+
     this.minVX = Number.isFinite(minX) ? minX : 0;
     this.maxVX = Number.isFinite(maxX) ? maxX : 23;
     this.minVY = Number.isFinite(minY) ? minY : 0;
@@ -1768,13 +1974,19 @@ export class ModularVehicleRig {
       Math.hypot(halfSpanX, halfSpanY, halfSpanZ),
     );
 
-    // Keep symmetry plane centered on the vehicle's Z/Y span
+    // Keep symmetry plane centered on the vehicle's Z/Y and X/Y span
+    const centerX = (this.minVX + this.maxVX + 1) * 0.5 * VOXEL_SIZE;
     const centerZ = (this.minVZ + this.maxVZ + 1) * 0.5 * VOXEL_SIZE;
     const centerY = (this.minVY + this.maxVY + 1) * 0.5 * VOXEL_SIZE;
+    const spanX = Math.max(12.0, (this.maxVX - this.minVX + 12) * VOXEL_SIZE);
     const spanZ = Math.max(12.0, (this.maxVZ - this.minVZ + 12) * VOXEL_SIZE);
     const spanY = Math.max(6.0, (this.maxVY - this.minVY + 8) * VOXEL_SIZE);
     this.symmetryPlane.position.set(SYMMETRY_CENTER_X * VOXEL_SIZE, centerY, centerZ);
     this.symmetryPlane.scale.set(spanZ / 18.0, spanY / 8.0, 1);
+    if (this.symmetryPlaneZ) {
+      this.symmetryPlaneZ.position.set(centerX, centerY, SYMMETRY_CENTER_Z * VOXEL_SIZE);
+      this.symmetryPlaneZ.scale.set(spanX / 18.0, spanY / 8.0, 1);
+    }
   }
 
   fillBox(
@@ -2467,14 +2679,16 @@ export class ModularVehicleRig {
       rollIdx: m.rollIdx || 0,
       config: m.config ? { ...m.config } : undefined,
     }));
+    const microVoxels = this.microHull.size > 0 ? this.microHull.exportArray() : undefined;
     return {
       id: `bp_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
       name: name.trim() || 'Custom Voxel Rig',
       createdAt: new Date().toLocaleDateString(),
       massKg: Math.round(this.totalMass),
-      blockCount: this.voxelCount + this.modules.length,
+      blockCount: this.voxelCount + Math.ceil(this.microHull.size / 16) + this.modules.length,
       powerCores: this.powerCores,
       voxels,
+      microVoxels,
       modules,
       ecuPrograms: Object.keys(this.ecuPrograms).length > 0 ? JSON.parse(JSON.stringify(this.ecuPrograms)) : undefined,
     };
@@ -2643,6 +2857,7 @@ export class ModularVehicleRig {
     if (this.undoStack.length > ModularVehicleRig.MAX_UNDO_HISTORY) {
       this.undoStack.shift();
     }
+    this.redoStack.length = 0;
   }
 
   /**
@@ -2651,7 +2866,27 @@ export class ModularVehicleRig {
   undoBuildStep(): boolean {
     const prev = this.undoStack.pop();
     if (!prev) return false;
+    const curSnap = this.exportBlueprint(this.customBlueprintName || 'Redo Step');
+    this.redoStack.push(curSnap);
+    if (this.redoStack.length > ModularVehicleRig.MAX_UNDO_HISTORY) {
+      this.redoStack.shift();
+    }
     this.importBlueprint(prev, true);
+    return true;
+  }
+
+  /**
+   * Re-applies an undone Build Mode operation from the Redo stack!
+   */
+  redoBuildStep(): boolean {
+    const next = this.redoStack.pop();
+    if (!next) return false;
+    const curSnap = this.exportBlueprint(this.customBlueprintName || 'Undo Step');
+    this.undoStack.push(curSnap);
+    if (this.undoStack.length > ModularVehicleRig.MAX_UNDO_HISTORY) {
+      this.undoStack.shift();
+    }
+    this.importBlueprint(next, true);
     return true;
   }
 
@@ -2809,6 +3044,9 @@ export class ModularVehicleRig {
     for (const [vx, vy, vz, mat] of validVoxels) {
       this.setVoxel(vx, vy, vz, mat);
     }
+    if (Array.isArray(bp.microVoxels) && bp.microVoxels.length > 0) {
+      this.microHull.importArray(bp.microVoxels);
+    }
     for (const mod of validModules) {
       this.addModule(
         mod.kind,
@@ -2821,7 +3059,7 @@ export class ModularVehicleRig {
         mod.rollIdx || 0,
       );
     }
-    if (this.voxelMap.size === 0 && this.modules.length === 0) {
+    if (this.voxelMap.size === 0 && this.microHull.size === 0 && this.modules.length === 0) {
       this.setVoxel(12, 6, 18, MAT.ALLOY_BLUE);
     }
     if (bp.ecuPrograms) {
@@ -3089,6 +3327,13 @@ export class ModularVehicleRig {
         this.world.sharedVoxelMaterial,
       );
     }
+    if (this.microChassisMesh) {
+      applyMeshMaterialPresetSwap(
+        this.microChassisMesh,
+        mode,
+        getMicroHullMaterial(),
+      );
+    }
     this.syncChassisOutlineMesh(false);
     this.applyShaderModeToModuleGroup(this.modulesGroup, mode);
   }
@@ -3108,13 +3353,25 @@ export class ModularVehicleRig {
         this.world.sharedVoxelMaterial,
       );
     }
+    if (this.microChassisMesh) {
+      applyMeshMaterialPresetSwap(
+        this.microChassisMesh,
+        mode,
+        getMicroHullMaterial(),
+      );
+    }
     this.syncChassisOutlineMesh(false);
     this.applyShaderModeToModuleGroup(this.modulesGroup, mode);
   }
 
   public setBlobShadowVisible(visible: boolean): void {
     this.blobShadowsEnabled = visible;
-    if (this.contactShadowMesh) {
+    this.lastAuxFlags = -1;
+    if (this.blobShadowManager && this.blobShadowSlot >= 0) {
+      if (!visible || this.inBuildMode) {
+        this.blobShadowManager.hideSlot(this.blobShadowSlot);
+      }
+    } else if (this.contactShadowMesh) {
       this.contactShadowMesh.visible = visible && !this.inBuildMode;
     }
   }
@@ -3255,6 +3512,44 @@ export class ModularVehicleRig {
         this.mergedQuads = res.mergedQuads + transRes.mergedQuads;
       }
     }
+
+    // Rebuild 1px (0.0625m) scalable hull detail mesh when dirty (1 greedy-meshed draw call, 0 cost when unused!)
+    if (this.microHull.dirty || (!this.microChassisMesh && this.microHull.size > 0)) {
+      const microGeo = this.microHull.buildMeshGeometry();
+      if (!microGeo) {
+        if (this.microChassisMesh) {
+          this.microChassisMesh.visible = false;
+        }
+      } else {
+        if (!this.microChassisMesh) {
+          this.microChassisMesh = new THREE.Mesh(microGeo, getMicroHullMaterial());
+          this.microChassisMesh.name = 'MicroHull1pxMesh';
+          this.microChassisMesh.castShadow = !this.usePotatoShader;
+          this.microChassisMesh.receiveShadow = !this.usePotatoShader;
+          this.rootGroup.add(this.microChassisMesh);
+        } else {
+          const prevGeo = this.microChassisMesh.geometry;
+          this.microChassisMesh.geometry = microGeo;
+          if (prevGeo && !prevGeo.userData?.isSharedPrimitive) {
+            prevGeo.dispose();
+          }
+          this.microChassisMesh.visible = true;
+        }
+        const activeMode: ActiveShaderMode = this.useCartoonShader
+          ? 'CARTOON'
+          : this.usePotatoShader
+            ? 'POTATO'
+            : 'PBR';
+        if (activeMode !== 'PBR') {
+          applyMeshMaterialPresetSwap(
+            this.microChassisMesh,
+            activeMode,
+            getMicroHullMaterial(),
+          );
+        }
+      }
+    }
+    this.syncXrayMaterialState();
 
     // Reuse existing module meshes whenever possible and dispose any removed module meshes to prevent WebGL buffer leaks with 50+ guns!
     const activeMeshes = new Set<THREE.Object3D>();
@@ -3915,6 +4210,31 @@ export class ModularVehicleRig {
     let brokenCount = 0;
     let damagedCount = 0;
 
+    // Carve any existing 1px micro-hull voxels inside the blast sphere & spawn 1px colored chips
+    if (this.microHull.size > 0) {
+      const microCarved = this.microHull.carveMicroSphere(
+        loc.x,
+        loc.y,
+        loc.z,
+        Math.max(0.18, radiusVoxels * VOXEL_SIZE),
+        this.usePotatoShader,
+        this.usePotatoShader ? 6 : 14,
+      );
+      if (microCarved.carvedCount > 0) {
+        brokenCount += Math.max(1, Math.ceil(microCarved.carvedCount / 16));
+        for (let ci = 0; ci < microCarved.chips.length; ci++) {
+          const chip = microCarved.chips[ci];
+          const wp = this.localVoxelToWorld(
+            chip.lx / VOXEL_SIZE - 0.5,
+            chip.ly / VOXEL_SIZE - 0.5,
+            chip.lz / VOXEL_SIZE - 0.5,
+          );
+          this.fx.spawnDebris(wp.x, wp.y, wp.z, chip.color, 7.6, 0.34);
+        }
+      }
+    }
+
+    let splitRimBudget = this.usePotatoShader ? 3 : 7;
     for (let i = 0; i < offsets.length; i++) {
       const off = offsets[i];
       const vx = cx + off.dx;
@@ -3941,6 +4261,38 @@ export class ModularVehicleRig {
         ) {
           this.voxelHealthMap.set(key, 0.32);
           damagedCount++;
+          continue;
+        }
+        // Crater rim fracture: split edge coarse blocks into 1px micro-voxels so hull holes have jagged 1px chipped edges!
+        if (
+          splitRimBudget > 0 &&
+          dist >= radiusVoxels * 0.58 &&
+          radiusVoxels <= 4.5 &&
+          this.microHull.size < 14000
+        ) {
+          splitRimBudget--;
+          this.microHull.splitCoarseVoxelToMicro(vx, vy, vz, mat);
+          this.setVoxel(vx, vy, vz, MAT.AIR);
+          const rimRes = this.microHull.carveMicroSphere(
+            loc.x,
+            loc.y,
+            loc.z,
+            radiusVoxels * VOXEL_SIZE * 0.92,
+            this.usePotatoShader,
+            4,
+          );
+          if (rimRes.carvedCount > 0) {
+            brokenCount++;
+            for (let ci = 0; ci < rimRes.chips.length; ci++) {
+              const chip = rimRes.chips[ci];
+              const wp = this.localVoxelToWorld(
+                chip.lx / VOXEL_SIZE - 0.5,
+                chip.ly / VOXEL_SIZE - 0.5,
+                chip.lz / VOXEL_SIZE - 0.5,
+              );
+              this.fx.spawnDebris(wp.x, wp.y, wp.z, chip.color, 7.2, 0.32);
+            }
+          }
           continue;
         }
         this.setVoxel(vx, vy, vz, MAT.AIR);
@@ -3970,6 +4322,10 @@ export class ModularVehicleRig {
     }
 
     const rModDestroySq = (radiusVoxels + 0.9) * (radiusVoxels + 0.9);
+    const rModDirectObliterateSq =
+      radiusVoxels >= 4.5
+        ? (radiusVoxels * 0.42) * (radiusVoxels * 0.42)
+        : 0;
     const rModDamageSq = (outerShockRad + 1.2) * (outerShockRad + 1.2);
     const blastCenterWorld = new THREE.Vector3(wx, wy, wz);
     const beforeMods = this.modules.length;
@@ -3993,6 +4349,40 @@ export class ModularVehicleRig {
         );
         damagedCount++;
         return true; // Keep the module on the chassis so its shot-out corner drags on the ground!
+      }
+
+      // Part 2: 1px Micro-Voxel Copy-on-Write chipping for hero functional blocks (V8 engines, thrusters, cannons, headlights, cockpits)!
+      if (isMicroVoxelDestructibleKind(m.kind) && dSq <= rModDamageSq) {
+        const directObliterate =
+          rModDirectObliterateSq > 0 && dSq <= rModDirectObliterateSq;
+        const carveRadiusMeters = directObliterate
+          ? 0.95
+          : dSq <= rModDestroySq
+            ? Math.min(0.46, Math.max(0.28, radiusVoxels * VOXEL_SIZE * 0.42))
+            : 0.24;
+        const microRes = this.applyMicroVoxelModuleDamage(
+          m,
+          loc.x,
+          loc.y,
+          loc.z,
+          carveRadiusMeters,
+        );
+        if (microRes.destroyed || directObliterate) {
+          disposeMicroVoxelDamageState(m.microDamage);
+          m.microDamage = null;
+          if (m.mesh) {
+            this.modulesGroup.remove(m.mesh);
+            disposeModuleGroupGeometries(m.mesh);
+            m.mesh = null;
+          }
+          const wp = this.localVoxelToWorld(m.vx, m.vy, m.vz);
+          this.fx.spawnDebris(wp.x, wp.y, wp.z, 0xf59e0b, 10.5, 1.45);
+          return false;
+        }
+        if (microRes.carved > 0) {
+          damagedCount++;
+        }
+        return true;
       }
 
       if (dSq <= rModDestroySq) {
@@ -4031,6 +4421,7 @@ export class ModularVehicleRig {
       const { detachedIslands } = findDisconnectedVoxelIslands(
         this.voxelMap,
         cockpitMod,
+        this.modules,
       );
       if (detachedIslands.length > 0) {
         for (const island of detachedIslands) {
@@ -4290,7 +4681,8 @@ export class ModularVehicleRig {
     }
 
     this.syncForceMarkersVisibility();
-    this.symmetryPlane.visible = enabled && this.mirrorMode;
+    this.syncSymmetryPlanesVisibility();
+    this.syncXrayMaterialState();
     this.syncPhysicsSnapshot();
   }
 
@@ -4317,7 +4709,132 @@ export class ModularVehicleRig {
     this.syncPhysicsSnapshot();
   }
 
+  /**
+   * Carves 1px (0.0625m) micro-voxels off a functional block (V8 engine, thruster, cannon, headlight, cockpit)
+   * using Copy-on-Write so outer casing breaks away, inner glowing pistons/core appear, 1px chips fly off,
+   * and intact modules cost zero extra RAM.
+   */
+  public applyMicroVoxelModuleDamage(
+    mod: ActiveModule,
+    vehicleLocalHitX: number,
+    vehicleLocalHitY: number,
+    vehicleLocalHitZ: number,
+    carveRadiusMeters = 0.34,
+  ): { carved: number; destroyed: boolean; integrity: number } {
+    if (!isMicroVoxelDestructibleKind(mod.kind)) {
+      return { carved: 0, destroyed: false, integrity: mod.microIntegrity ?? 1.0 };
+    }
+    if (!mod.microDamage) {
+      mod.microDamage = createMicroVoxelDamageState(mod.kind);
+    }
+
+    const modCenterX = (mod.vx + 0.5) * VOXEL_SIZE;
+    const modCenterY = (mod.vy + 0.5) * VOXEL_SIZE;
+    const modCenterZ = (mod.vz + 0.5) * VOXEL_SIZE;
+
+    // Express hit point relative to module pivot in vehicle-local meters
+    _v1.set(
+      vehicleLocalHitX - modCenterX,
+      vehicleLocalHitY - modCenterY,
+      vehicleLocalHitZ - modCenterZ,
+    );
+    // Clamp distant shockwave hits onto the blast-facing surface of the module so shrapnel chips that side!
+    const hitDist = _v1.length();
+    if (hitDist > 0.42) {
+      _v1.multiplyScalar(0.28 / hitDist);
+    }
+
+    // Undo module placement rotation (YXZ) into module-local frame
+    _modEuler.set(
+      ((mod.pitchIdx || 0) & 3) * (Math.PI / 2),
+      ((mod.yawIdx || 0) & 3) * (Math.PI / 2),
+      ((mod.rollIdx || 0) & 3) * (Math.PI / 2),
+      'YXZ',
+    );
+    _q1.setFromEuler(_modEuler).invert();
+    _v1.applyQuaternion(_q1);
+
+    // Undo horizontal thruster bodyGroup.rotation.x = +PI/2 so local carve aligns with visual orientation
+    const isHorizontalThruster =
+      mod.kind === 'THRUSTER' ||
+      mod.kind === 'THRUSTER_MINI' ||
+      mod.kind === 'THRUSTER_ROCKET' ||
+      mod.kind === 'JET_RAW';
+    let lx = _v1.x;
+    let ly = _v1.y;
+    let lz = _v1.z;
+    if (isHorizontalThruster) {
+      const tmpY = lz;
+      const tmpZ = -ly;
+      ly = tmpY;
+      lz = tmpZ;
+    }
+
+    const res = carveMicroVoxelModule(mod.microDamage, lx, ly, lz, carveRadiusMeters, {
+      coarseStep: this.usePotatoShader,
+      maxChips: this.usePotatoShader ? 6 : 14,
+    });
+
+    mod.microIntegrity = res.integrity;
+    mod.health = res.integrity;
+
+    // Spawn 1px micro-voxel chips flying off the damaged block in world space
+    if (res.chips.length > 0 && this.fx) {
+      _q2.setFromEuler(_modEuler);
+      for (let i = 0; i < res.chips.length; i++) {
+        const chip = res.chips[i];
+        let cx = chip.lx;
+        let cy = chip.ly;
+        let cz = chip.lz;
+        if (isHorizontalThruster) {
+          const rY = -cz;
+          const rZ = cy;
+          cy = rY;
+          cz = rZ;
+        }
+        _v2.set(cx, cy, cz).applyQuaternion(_q2);
+        const worldPos = this.localVoxelToWorld(
+          mod.vx + _v2.x / VOXEL_SIZE,
+          mod.vy + _v2.y / VOXEL_SIZE,
+          mod.vz + _v2.z / VOXEL_SIZE,
+        );
+        this.fx.spawnDebris(worldPos.x, worldPos.y, worldPos.z, chip.color, 7.2, 0.34);
+      }
+    }
+
+    // Swap mesh geometry live to the chipped greedy-meshed BufferGeometry!
+    if (mod.mesh && res.geometry && !res.destroyed) {
+      const microBody = mod.mesh.userData.microVoxelMesh as THREE.Mesh | undefined;
+      if (microBody && microBody.geometry !== res.geometry) {
+        microBody.geometry = res.geometry;
+        if (this.useCartoonShader) {
+          const outlineChild = microBody.userData.cartoonOutlineChild as THREE.Mesh | undefined;
+          if (outlineChild) {
+            outlineChild.geometry = getSmoothedOutlineGeometry(res.geometry);
+          }
+        }
+      }
+    }
+
+    return {
+      carved: res.carvedCount + res.detachedCount,
+      destroyed: res.destroyed,
+      integrity: res.integrity,
+    };
+  }
+
   repairVehicle(): void {
+    for (const mod of this.modules) {
+      disposeMicroVoxelDamageState(mod.microDamage);
+      mod.microDamage = null;
+      mod.microIntegrity = 1.0;
+      if (mod.mesh && isMicroVoxelDestructibleKind(mod.kind)) {
+        const microBody = mod.mesh.userData.microVoxelMesh as THREE.Mesh | undefined;
+        if (microBody) {
+          microBody.geometry = getMicroVoxelBlockTemplate(mod.kind).intactGeometry;
+        }
+      }
+    }
     if (this.intactBlueprintSnapshot) {
       this.importBlueprint(this.intactBlueprintSnapshot);
     } else {
@@ -4470,14 +4987,15 @@ export class ModularVehicleRig {
     this.fireCannons();
   }
 
-  fireCannons(): void {
+  fireCannons(onlyTriggeredMods?: ActiveModule[]): void {
     if (this.cannonCooldown > 0 || this.cannonCount === 0) return;
-    const weaponMods = this.modules.filter(
+    const weaponMods = (onlyTriggeredMods ?? this.modules).filter(
       (m) =>
-        m.kind === 'PLASMA_CANNON' ||
-        m.kind === 'WEAPON_MINIGUN' ||
-        m.kind === 'WEAPON_ROCKET' ||
-        m.kind === 'WEAPON_BOMB_BAY',
+        (m.health ?? 1.0) > 0 &&
+        (m.kind === 'PLASMA_CANNON' ||
+          m.kind === 'WEAPON_MINIGUN' ||
+          m.kind === 'WEAPON_ROCKET' ||
+          m.kind === 'WEAPON_BOMB_BAY'),
     );
     if (weaponMods.length === 0) return;
 
@@ -4516,7 +5034,11 @@ export class ModularVehicleRig {
       );
       const aimedDir = mod.mesh?.userData?.aimWorldDir as THREE.Vector3 | null | undefined;
       if (k === 'WEAPON_BOMB_BAY') {
-        _v2.set(0, -1, 0.18).applyQuaternion(this.quaternion).normalize();
+        _v2
+          .set(0, -1, 0.18)
+          .applyQuaternion(_q1)
+          .applyQuaternion(this.quaternion)
+          .normalize();
       } else if (aimedDir) {
         _v2.copy(aimedDir).normalize();
       } else {
@@ -4526,10 +5048,17 @@ export class ModularVehicleRig {
           .normalize();
       }
 
+      _v4
+        .set(
+          0,
+          k === 'WEAPON_BOMB_BAY' ? -0.65 : 0.55,
+          k === 'WEAPON_BOMB_BAY' ? 0 : 1.2,
+        )
+        .applyQuaternion(_q1);
       this.localVoxelToWorld(
-        mod.vx,
-        mod.vy + (k === 'WEAPON_BOMB_BAY' ? -0.65 : 0.55),
-        mod.vz + (k === 'WEAPON_BOMB_BAY' ? 0 : 1.2),
+        mod.vx + _v4.x,
+        mod.vy + _v4.y,
+        mod.vz + _v4.z,
         _v3,
       ).addScaledVector(_v2, k === 'WEAPON_BOMB_BAY' ? 0.2 : 0.65);
 
@@ -4705,9 +5234,12 @@ export class ModularVehicleRig {
   /**
    * Triggers Pyrotechnic Detachable Blocks [U] to cleave staging sections into independent physics fragments!
    */
-  triggerDetachableBlocks(): number {
-    const bolts = this.modules.filter((m) => m.kind === 'DETACHABLE_BLOCK');
+  triggerDetachableBlocks(onlyTriggeredBolts?: ActiveModule[]): number {
+    const bolts = (onlyTriggeredBolts ?? this.modules).filter(
+      (m) => m.kind === 'DETACHABLE_BLOCK',
+    );
     if (bolts.length === 0) return 0;
+    const boltSet = new Set(bolts);
     const hadSeatBefore = this.hasIntactSeat();
     let cleaved = 0;
     const boltCenterWorld = new THREE.Vector3();
@@ -4732,13 +5264,14 @@ export class ModularVehicleRig {
       cleaved++;
     }
     boltCenterWorld.divideScalar(Math.max(1, bolts.length));
-    this.modules = this.modules.filter((m) => m.kind !== 'DETACHABLE_BLOCK');
+    this.modules = this.modules.filter((m) => !boltSet.has(m));
 
     const cockpitMod =
       this.modules.find((m) => isSeatModuleKind(m.kind)) || null;
     const { detachedIslands } = findDisconnectedVoxelIslands(
       this.voxelMap,
       cockpitMod,
+      this.modules,
     );
     for (const island of detachedIslands) {
       let sumX = 0,
@@ -4824,17 +5357,26 @@ export class ModularVehicleRig {
   togglePistons(): boolean {
     const intactPistons = this.modules.filter(
       (m) => m.kind === 'PISTON' && (m.health ?? 1.0) > 0,
-    ).length;
-    if (this.pistonCount <= 0 || intactPistons <= 0) {
+    );
+    if (this.pistonCount <= 0 || intactPistons.length <= 0) {
       this.pistonExtended = false;
       this.pistonExtRatio = 0;
       return false;
     }
     this.pistonExtended = !this.pistonExtended;
+    for (const p of intactPistons) {
+      p.toggleLatch = this.pistonExtended ? 1 : 0;
+      p.heldSignal = this.pistonExtended ? 1 : 0;
+    }
+    if (this.pistonExtended) {
+      // Apply initial hydraulic extension reaction impulse along each piston's 3D axis
+      const upImpulse = Math.min(8.5, 4.8 + intactPistons.length * 1.1);
+      this.velocity.y = Math.max(this.velocity.y, upImpulse);
+      this.rigidBody.velocity.copy(this.velocity);
+    }
     SoundFX.hover();
-    if (this.pistonExtended && !this.inBuildMode) {
-      this.velocity.y += Math.min(8.5, 4.2 + intactPistons * 1.4);
-      this.rigidBody.velocity.y = this.velocity.y;
+    if (this.rigidBody.isSleeping) {
+      this.rigidBody.wake();
     }
     return this.pistonExtended;
   }
@@ -5408,6 +5950,327 @@ export class ModularVehicleRig {
   }
 
   /**
+   * 1px (0.0625m) micro-voxel DDA raycaster across combined `microHull`, coarse `voxelMap` (4×4×4 micro cells),
+   * and attached functional modules. Enables exact face-snapping at any Hull Scale (`1px..16px`)!
+   */
+  raycastVehicleMicro(
+    worldOrigin: THREE.Vector3,
+    worldDir: THREE.Vector3,
+    maxDist = 65.0,
+  ): {
+    target: 'vehicle';
+    vx: number;
+    vy: number;
+    vz: number;
+    mx: number;
+    my: number;
+    mz: number;
+    hitIsMicro: boolean;
+    mat: number;
+    moduleHit?: ActiveModule;
+    normal: Vec3;
+    distance: number;
+    worldPos: THREE.Vector3;
+  } | null {
+    if (this.voxelCount === 0 && this.microHull.size === 0 && this.modules.length === 0) {
+      return null;
+    }
+    const padCoarse = 3;
+    const mMinX = (this.minVX - padCoarse) * MICRO_VOXEL_SUBDIV;
+    const mMinY = (this.minVY - padCoarse) * MICRO_VOXEL_SUBDIV;
+    const mMinZ = (this.minVZ - padCoarse) * MICRO_VOXEL_SUBDIV;
+    const mDimX = Math.max(8, (this.maxVX + padCoarse + 1) * MICRO_VOXEL_SUBDIV - mMinX);
+    const mDimY = Math.max(8, (this.maxVY + padCoarse + 1) * MICRO_VOXEL_SUBDIV - mMinY);
+    const mDimZ = Math.max(8, (this.maxVZ + padCoarse + 1) * MICRO_VOXEL_SUBDIV - mMinZ);
+
+    _invRot.copy(this.quaternion).invert();
+    this.worldToLocalMetric(
+      worldOrigin.x,
+      worldOrigin.y,
+      worldOrigin.z,
+      _localOrigin,
+    );
+    _localOrigin.x -= mMinX * MICRO_VOXEL_SIZE;
+    _localOrigin.y -= mMinY * MICRO_VOXEL_SIZE;
+    _localOrigin.z -= mMinZ * MICRO_VOXEL_SIZE;
+    _localDir.copy(worldDir).applyQuaternion(_invRot).normalize();
+
+    const xrayActive = this.inBuildMode && this.xrayMode;
+    const xrayFloorLimitVY = this.minVY + 1;
+    const getMicroCell = (lx: number, ly: number, lz: number): number => {
+      const mx = mMinX + lx;
+      const my = mMinY + ly;
+      const mz = mMinZ + lz;
+      const vx = Math.floor(mx / MICRO_VOXEL_SUBDIV);
+      const vy = Math.floor(my / MICRO_VOXEL_SUBDIV);
+      const vz = Math.floor(mz / MICRO_VOXEL_SUBDIV);
+      // In X-Ray Build Mode, internal modules and the lower floor deck remain clickable while upper roof/side hull walls are passed through!
+      const modVal = this.moduleVoxelLookup.get(`${vx},${vy},${vz}`);
+      if (modVal !== undefined) {
+        const modIdx = modVal - 100;
+        if (modIdx >= 0 && modIdx < this.modules.length) {
+          return modVal;
+        }
+      }
+      if (xrayActive && vy > xrayFloorLimitVY) {
+        return 0;
+      }
+      const microMat = this.microHull.getMicro(mx, my, mz);
+      if (microMat !== MAT.AIR) return microMat | 512; // bit 512 marks a native 1px micro-hull hit
+      const coarseMat = this.getVoxel(vx, vy, vz);
+      if (coarseMat !== MAT.AIR) return coarseMat;
+      return 0;
+    };
+
+    const ddaHit = raycastVoxelGridDDA(
+      { x: _localOrigin.x, y: _localOrigin.y, z: _localOrigin.z },
+      { x: _localDir.x, y: _localDir.y, z: _localDir.z },
+      mDimX,
+      mDimY,
+      mDimZ,
+      MICRO_VOXEL_SIZE,
+      getMicroCell,
+      maxDist,
+    );
+    if (!ddaHit) return null;
+
+    const mx = mMinX + ddaHit.vx;
+    const my = mMinY + ddaHit.vy;
+    const mz = mMinZ + ddaHit.vz;
+    const vx = Math.floor(mx / MICRO_VOXEL_SUBDIV);
+    const vy = Math.floor(my / MICRO_VOXEL_SUBDIV);
+    const vz = Math.floor(mz / MICRO_VOXEL_SUBDIV);
+    const hitIsMicro = (ddaHit.val & 512) !== 0;
+    const rawVal = ddaHit.val & ~512;
+    const worldPos = this.localVoxelToWorld(
+      (mx + 0.5) / MICRO_VOXEL_SUBDIV - 0.5,
+      (my + 0.5) / MICRO_VOXEL_SUBDIV - 0.5,
+      (mz + 0.5) / MICRO_VOXEL_SUBDIV - 0.5,
+    );
+
+    if (!hitIsMicro && rawVal >= 100) {
+      const modIdx = rawVal - 100;
+      const mod = modIdx >= 0 && modIdx < this.modules.length ? this.modules[modIdx] : undefined;
+      if (mod) {
+        return {
+          target: 'vehicle',
+          vx,
+          vy,
+          vz,
+          mx,
+          my,
+          mz,
+          hitIsMicro: false,
+          mat: MAT.ALLOY_BLUE,
+          moduleHit: mod,
+          normal: ddaHit.normal,
+          distance: ddaHit.distance,
+          worldPos,
+        };
+      }
+    }
+
+    const safeMat = rawVal >= 100 || rawVal === MAT.AIR ? MAT.ALLOY_BLUE : rawVal;
+    return {
+      target: 'vehicle',
+      vx,
+      vy,
+      vz,
+      mx,
+      my,
+      mz,
+      hitIsMicro,
+      mat: safeMat,
+      normal: ddaHit.normal,
+      distance: ddaHit.distance,
+      worldPos,
+    };
+  }
+
+  getMicroOrCoarseMat(mx: number, my: number, mz: number): number {
+    const microMat = this.microHull.getMicro(mx, my, mz);
+    if (microMat !== MAT.AIR) return microMat;
+    const vx = Math.floor(mx / MICRO_VOXEL_SUBDIV);
+    const vy = Math.floor(my / MICRO_VOXEL_SUBDIV);
+    const vz = Math.floor(mz / MICRO_VOXEL_SUBDIV);
+    if (!this.inBounds(vx, vy, vz)) return MAT.AIR;
+    return this.getVoxel(vx, vy, vz);
+  }
+
+  /**
+   * Places a pure cube hull block of edge `sizePx` (1px Fine or 4px Block cluster) at micro-grid origin `(mx, my, mz)`.
+   * Coarse-aligned `4px/8px/12px/16px` cubes stamp into `voxelMap` for zero overhead (and split automatically if carved at 1px);
+   * `1px` placements stamp into the greedy-meshed `microHull` layer!
+   */
+  placeScaledHullBlock(
+    mx: number,
+    my: number,
+    mz: number,
+    sizePx: number,
+    mat: number,
+    _shape: HullMicroShape = 'CUBE',
+    _yawIdx = 0,
+    _pitchIdx = 0,
+    _rollIdx = 0,
+  ): number {
+    const s = clampHullScalePx(sizePx);
+    if (
+      s % MICRO_VOXEL_SUBDIV === 0 &&
+      mx % MICRO_VOXEL_SUBDIV === 0 &&
+      my % MICRO_VOXEL_SUBDIV === 0 &&
+      mz % MICRO_VOXEL_SUBDIV === 0
+    ) {
+      const coarseUnits = s / MICRO_VOXEL_SUBDIV;
+      const bx = mx / MICRO_VOXEL_SUBDIV;
+      const by = my / MICRO_VOXEL_SUBDIV;
+      const bz = mz / MICRO_VOXEL_SUBDIV;
+      let placed = 0;
+      for (let dz = 0; dz < coarseUnits; dz++) {
+        for (let dy = 0; dy < coarseUnits; dy++) {
+          for (let dx = 0; dx < coarseUnits; dx++) {
+            if (!this.inBounds(bx + dx, by + dy, bz + dz)) continue;
+            // Clear any overlapping 1px micro-voxels in this coarse cell before stamping solid coarse voxel
+            if (this.microHull.size > 0) {
+              this.microHull.stampMicroCube(
+                (bx + dx) * MICRO_VOXEL_SUBDIV,
+                (by + dy) * MICRO_VOXEL_SUBDIV,
+                (bz + dz) * MICRO_VOXEL_SUBDIV,
+                MICRO_VOXEL_SUBDIV,
+                MAT.AIR,
+              );
+            }
+            this.setVoxel(bx + dx, by + dy, bz + dz, mat);
+            this.markVoxelSpawnTime(bx + dx, by + dy, bz + dz);
+            placed++;
+          }
+        }
+      }
+      return placed;
+    }
+
+    const bx = Math.floor(mx / MICRO_VOXEL_SUBDIV);
+    const by = Math.floor(my / MICRO_VOXEL_SUBDIV);
+    const bz = Math.floor(mz / MICRO_VOXEL_SUBDIV);
+    if (!this.inBounds(bx, by, bz)) return 0;
+    const stamped = this.microHull.stampMicroCube(mx, my, mz, s, mat);
+    if (stamped > 0) {
+      this.lastGhostSignature = '';
+    }
+    return stamped;
+  }
+
+  /**
+   * Erases a scalable hull block of edge `sizePx` (1px..16px) at micro-grid origin `(mx, my, mz)`.
+   * When erasing `< 4px` on a standard 4px coarse block, splits that block into 1px micro-voxels first so
+   * players can carve crisp 1px/2px/3px notches into any hull block!
+   */
+  eraseScaledHullBlock(mx: number, my: number, mz: number, sizePx: number): number {
+    const s = clampHullScalePx(sizePx);
+    let erased = 0;
+
+    // Check overlapping coarse voxels first
+    const minVX = Math.floor(mx / MICRO_VOXEL_SUBDIV);
+    const maxVX = Math.floor((mx + s - 1) / MICRO_VOXEL_SUBDIV);
+    const minVY = Math.floor(my / MICRO_VOXEL_SUBDIV);
+    const maxVY = Math.floor((my + s - 1) / MICRO_VOXEL_SUBDIV);
+    const minVZ = Math.floor(mz / MICRO_VOXEL_SUBDIV);
+    const maxVZ = Math.floor((mz + s - 1) / MICRO_VOXEL_SUBDIV);
+
+    for (let vz = minVZ; vz <= maxVZ; vz++) {
+      for (let vy = minVY; vy <= maxVY; vy++) {
+        for (let vx = minVX; vx <= maxVX; vx++) {
+          const coarseMat = this.getVoxel(vx, vy, vz);
+          if (coarseMat === MAT.AIR) continue;
+          const cellX0 = vx * MICRO_VOXEL_SUBDIV;
+          const cellY0 = vy * MICRO_VOXEL_SUBDIV;
+          const cellZ0 = vz * MICRO_VOXEL_SUBDIV;
+          const fullyCovered =
+            mx <= cellX0 &&
+            mx + s >= cellX0 + MICRO_VOXEL_SUBDIV &&
+            my <= cellY0 &&
+            my + s >= cellY0 + MICRO_VOXEL_SUBDIV &&
+            mz <= cellZ0 &&
+            mz + s >= cellZ0 + MICRO_VOXEL_SUBDIV;
+          if (fullyCovered) {
+            this.removeVoxel(vx, vy, vz);
+            erased++;
+          } else {
+            // Split coarse voxel to 1px micro-voxels so only the exact `sizePx` sub-cube is carved away!
+            this.microHull.splitCoarseVoxelToMicro(vx, vy, vz, coarseMat);
+            this.removeVoxel(vx, vy, vz);
+            erased++;
+          }
+        }
+      }
+    }
+
+    erased += this.microHull.stampMicroCube(mx, my, mz, s, MAT.AIR);
+    if (erased > 0) {
+      this.lastGhostSignature = '';
+    }
+    return erased;
+  }
+
+  /**
+   * Paints an existing `sizePx` cube on `microHull` or `voxelMap` (splitting coarse blocks when painting `< 4px` fine stripes!).
+   */
+  paintScaledHullBlock(
+    mx: number,
+    my: number,
+    mz: number,
+    sizePx: number,
+    mat: number,
+  ): number {
+    const s = clampHullScalePx(sizePx);
+    let painted = 0;
+
+    const minVX = Math.floor(mx / MICRO_VOXEL_SUBDIV);
+    const maxVX = Math.floor((mx + s - 1) / MICRO_VOXEL_SUBDIV);
+    const minVY = Math.floor(my / MICRO_VOXEL_SUBDIV);
+    const maxVY = Math.floor((my + s - 1) / MICRO_VOXEL_SUBDIV);
+    const minVZ = Math.floor(mz / MICRO_VOXEL_SUBDIV);
+    const maxVZ = Math.floor((mz + s - 1) / MICRO_VOXEL_SUBDIV);
+
+    for (let vz = minVZ; vz <= maxVZ; vz++) {
+      for (let vy = minVY; vy <= maxVY; vy++) {
+        for (let vx = minVX; vx <= maxVX; vx++) {
+          const coarseMat = this.getVoxel(vx, vy, vz);
+          if (coarseMat === MAT.AIR) continue;
+          const cellX0 = vx * MICRO_VOXEL_SUBDIV;
+          const cellY0 = vy * MICRO_VOXEL_SUBDIV;
+          const cellZ0 = vz * MICRO_VOXEL_SUBDIV;
+          const fullyCovered =
+            mx <= cellX0 &&
+            mx + s >= cellX0 + MICRO_VOXEL_SUBDIV &&
+            my <= cellY0 &&
+            my + s >= cellY0 + MICRO_VOXEL_SUBDIV &&
+            mz <= cellZ0 &&
+            mz + s >= cellZ0 + MICRO_VOXEL_SUBDIV;
+          if (fullyCovered) {
+            this.setVoxel(vx, vy, vz, mat);
+            painted++;
+          } else {
+            this.microHull.splitCoarseVoxelToMicro(vx, vy, vz, coarseMat);
+            this.removeVoxel(vx, vy, vz);
+          }
+        }
+      }
+    }
+
+    for (let dz = 0; dz < s; dz++) {
+      for (let dy = 0; dy < s; dy++) {
+        for (let dx = 0; dx < s; dx++) {
+          if (this.microHull.getMicro(mx + dx, my + dy, mz + dz) !== MAT.AIR) {
+            this.microHull.setMicro(mx + dx, my + dy, mz + dz, mat);
+            painted++;
+          }
+        }
+      }
+    }
+    return painted;
+  }
+
+  /**
    * Raycasts the vehicle, or if dragging in BOX_FILL / LINE_DRAG mode and the cursor leaves the hull
    * into open air (up, down, left, right, anywhere!), projects onto a 3D drag plane through dragStartVoxel!
    */
@@ -5468,22 +6331,56 @@ export class ModularVehicleRig {
    * Cached, zero-GC Trailmakers-style 3D Ghost Preview supporting all 6 Placement Modes and 3-Axis Rotation!
    */
   updateBuildGhost(
-    hit: { vx: number; vy: number; vz: number; normal: Vec3 } | null,
+    hit: {
+      vx: number;
+      vy: number;
+      vz: number;
+      mx?: number;
+      my?: number;
+      mz?: number;
+      hitIsMicro?: boolean;
+      normal: Vec3;
+    } | null,
     slotItem: BuildSlotItem | undefined,
     placementMode: BuildPlacementMode,
     dragStartVoxel: { vx: number; vy: number; vz: number } | null = null,
+    hullScalePx = 1,
+    dragStartMicro: { mx: number; my: number; mz: number } | null = null,
+    _hullShape: HullMicroShape = 'CUBE',
+    boxDepthPx = 1,
   ): void {
     if (!this.inBuildMode || !hit || !slotItem) {
       if (this.ghostGroup.visible) {
         this.ghostGroup.visible = false;
         this.lastGhostSignature = '';
       }
+      this.lastGhostSummary = { dimsLabel: '', count: 0, massDeltaKg: 0 };
       return;
     }
 
-    const sig = `${hit.vx},${hit.vy},${hit.vz}:${hit.normal.x},${hit.normal.y},${hit.normal.z}:${slotItem.slot}:${placementMode}:${this.mirrorMode}:${this.partYawIndex}:${this.partPitchIndex}:${this.partRollIndex}:${
+    const activeScalePx = clampHullScalePx(hullScalePx);
+    const activeDepthPx = Math.max(1, Math.min(8, Math.round(boxDepthPx || 1)));
+    const isChiselMode = placementMode === 'CHISEL';
+    const useScaledHull =
+      isChiselMode ||
+      ((slotItem.type === 'voxel' ||
+        placementMode === 'PAINT_TOOL' ||
+        placementMode === 'FLOOD_PAINT' ||
+        placementMode === 'FACE_EXTRUDE') &&
+        (activeScalePx !== 4 ||
+          activeDepthPx > 1 ||
+          this.symmetryAxisMode === 'Z' ||
+          this.symmetryAxisMode === 'XZ' ||
+          Boolean(hit.hitIsMicro)));
+
+    const hitMX = hit.mx ?? hit.vx * MICRO_VOXEL_SUBDIV;
+    const hitMY = hit.my ?? hit.vy * MICRO_VOXEL_SUBDIV;
+    const hitMZ = hit.mz ?? hit.vz * MICRO_VOXEL_SUBDIV;
+    const symKey = this.mirrorMode ? this.symmetryAxisMode : 'OFF';
+
+    const sig = `${hit.vx},${hit.vy},${hit.vz}:${hitMX},${hitMY},${hitMZ}:${activeScalePx}:${activeDepthPx}:${hit.normal.x},${hit.normal.y},${hit.normal.z}:${slotItem.slot}:${placementMode}:${symKey}:${this.partYawIndex}:${this.partPitchIndex}:${this.partRollIndex}:${
       dragStartVoxel ? `${dragStartVoxel.vx},${dragStartVoxel.vy},${dragStartVoxel.vz}` : 'none'
-    }`;
+    }:${dragStartMicro ? `${dragStartMicro.mx},${dragStartMicro.my},${dragStartMicro.mz}` : 'none'}`;
 
     if (sig === this.lastGhostSignature && this.ghostGroup.visible) {
       return; // Zero-GC fast path: nothing changed since last frame!
@@ -5498,76 +6395,143 @@ export class ModularVehicleRig {
 
     const isPaintTool =
       placementMode === 'PAINT_TOOL' || placementMode === 'FLOOD_PAINT';
-    const nx = isPaintTool ? hit.vx : hit.vx + hit.normal.x;
-    const ny = isPaintTool ? hit.vy : hit.vy + hit.normal.y;
-    const nz = isPaintTool ? hit.vz : hit.vz + hit.normal.z;
+    const isTargetExisting = isPaintTool || isChiselMode;
+    const nx = isTargetExisting ? hit.vx : hit.vx + hit.normal.x;
+    const ny = isTargetExisting ? hit.vy : hit.vy + hit.normal.y;
+    const nz = isTargetExisting ? hit.vz : hit.vz + hit.normal.z;
     if (!this.inBounds(nx, ny, nz)) {
       this.ghostGroup.visible = false;
+      this.lastGhostSummary = { dimsLabel: '', count: 0, massDeltaKg: 0 };
       return;
     }
 
     this.ghostGroup.visible = true;
 
-    // Update ghost box material color to match selected slot's color
-    if (slotItem.mat && MAT_INFO[slotItem.mat]) {
+    // Update ghost box material color: Warning Red for CHISEL/Carve, or selected slot color
+    if (isChiselMode) {
+      _sharedGhostBoxMat.color.setHex(0xef4444);
+    } else if (slotItem.mat && MAT_INFO[slotItem.mat]) {
       _sharedGhostBoxMat.color.setHex(MAT_INFO[slotItem.mat].color);
     } else {
       _sharedGhostBoxMat.color.set(slotItem.color || '#38bdf8');
     }
 
     // Trailmakers yellow weld connection pin on the clicked face
-    const weldCenterX = (hit.vx + 0.5 + hit.normal.x * 0.5) * VOXEL_SIZE;
-    const weldCenterY = (hit.vy + 0.5 + hit.normal.y * 0.5) * VOXEL_SIZE;
-    const weldCenterZ = (hit.vz + 0.5 + hit.normal.z * 0.5) * VOXEL_SIZE;
+    const weldCenterX = useScaledHull
+      ? (hitMX + 0.5 + hit.normal.x * 0.5) * MICRO_VOXEL_SIZE
+      : (hit.vx + 0.5 + hit.normal.x * 0.5) * VOXEL_SIZE;
+    const weldCenterY = useScaledHull
+      ? (hitMY + 0.5 + hit.normal.y * 0.5) * MICRO_VOXEL_SIZE
+      : (hit.vy + 0.5 + hit.normal.y * 0.5) * VOXEL_SIZE;
+    const weldCenterZ = useScaledHull
+      ? (hitMZ + 0.5 + hit.normal.z * 0.5) * MICRO_VOXEL_SIZE
+      : (hit.vz + 0.5 + hit.normal.z * 0.5) * VOXEL_SIZE;
 
     const pin = new THREE.Mesh(_sharedPinGeo, _sharedWeldMat);
     pin.position.set(weldCenterX, weldCenterY, weldCenterZ);
+    if (activeScalePx < 4) {
+      const ps = Math.max(0.35, activeScalePx / 4);
+      pin.scale.set(ps, ps, ps);
+    }
     if (hit.normal.x !== 0) pin.rotation.z = Math.PI / 2;
     if (hit.normal.z !== 0) pin.rotation.x = Math.PI / 2;
     this.ghostGroup.add(pin);
 
-    if (slotItem.type === 'voxel' || isPaintTool) {
-      const coords =
-        placementMode === 'FLOOD_PAINT'
-          ? computeFloodFillPaintCoords(
-              hit.vx,
-              hit.vy,
-              hit.vz,
-              (vx, vy, vz) => this.getVoxel(vx, vy, vz),
-              this.mirrorMode,
-              250,
-            )
-          : placementMode === 'FACE_EXTRUDE'
-            ? computeFaceExtrudeCoords(
-                hit,
-                (vx, vy, vz) => this.getVoxel(vx, vy, vz),
-                this.mirrorMode,
-                160,
+    if (slotItem.type === 'voxel' || isTargetExisting) {
+      if (useScaledHull && placementMode !== 'FLOOD_PAINT') {
+        const microHitArg: MicroVoxelHit = {
+          mx: hitMX,
+          my: hitMY,
+          mz: hitMZ,
+          normal: hit.normal,
+        };
+        const scaledOrigins =
+          placementMode === 'FACE_EXTRUDE'
+            ? computeMicroFaceExtrudeCoords(
+                microHitArg,
+                (mx, my, mz) => this.getMicroOrCoarseMat(mx, my, mz),
+                symKey,
+                activeScalePx === 4 ? activeDepthPx * 4 : activeDepthPx,
+                256,
               )
-            : computePlacementVoxelCoords(
+            : computeScaledHullPlacementCoords(
                 placementMode,
-                hit,
-                dragStartVoxel,
-                this.mirrorMode,
-                false,
+                microHitArg,
+                dragStartMicro,
+                activeScalePx,
+                symKey,
+                isChiselMode,
                 this.partYawIndex,
                 this.partPitchIndex,
                 this.partRollIndex,
+                activeDepthPx,
               );
-      for (let i = 0; i < coords.length; i++) {
-        const pt = coords[i];
-        if (!this.inBounds(pt.vx, pt.vy, pt.vz)) continue;
-        if (isPaintTool && this.getVoxel(pt.vx, pt.vy, pt.vz) === MAT.AIR) continue;
-        const box = new THREE.Mesh(_sharedUnitBoxGeo, _sharedGhostBoxMat);
-        if (isPaintTool) {
-          box.scale.set(1.04, 1.04, 1.04);
-        }
-        box.position.set(
-          (pt.vx + 0.5) * VOXEL_SIZE,
-          (pt.vy + 0.5) * VOXEL_SIZE,
-          (pt.vz + 0.5) * VOXEL_SIZE,
+        this.lastGhostSummary = computeGhostDimensionsSummary(
+          scaledOrigins,
+          slotItem.massKg || 7,
+          isChiselMode,
         );
-        this.ghostGroup.add(box);
+        const maxPreviewBoxes = 220;
+        const limit = Math.min(scaledOrigins.length, maxPreviewBoxes);
+        for (let i = 0; i < limit; i++) {
+          const orig = scaledOrigins[i];
+          const cellSizePx = orig.sizePx || activeScalePx;
+          const scaleFactor = cellSizePx / MICRO_VOXEL_SUBDIV;
+          const c = microBlockCenterMeters(orig.mx, orig.my, orig.mz, cellSizePx);
+          const box = new THREE.Mesh(_sharedUnitBoxGeo, _sharedGhostBoxMat);
+          const sf = isTargetExisting ? scaleFactor * 1.04 : scaleFactor;
+          box.scale.set(sf, sf, sf);
+          box.position.set(c.x, c.y, c.z);
+          this.ghostGroup.add(box);
+        }
+      } else {
+        const coords =
+          placementMode === 'FLOOD_PAINT'
+            ? computeFloodFillPaintCoords(
+                hit.vx,
+                hit.vy,
+                hit.vz,
+                (vx, vy, vz) => this.getVoxel(vx, vy, vz),
+                this.mirrorMode,
+                250,
+              )
+            : placementMode === 'FACE_EXTRUDE'
+              ? computeFaceExtrudeCoords(
+                  hit,
+                  (vx, vy, vz) => this.getVoxel(vx, vy, vz),
+                  this.mirrorMode,
+                  160,
+                )
+              : computePlacementVoxelCoords(
+                  placementMode,
+                  hit,
+                  dragStartVoxel,
+                  this.mirrorMode,
+                  false,
+                  this.partYawIndex,
+                  this.partPitchIndex,
+                  this.partRollIndex,
+                );
+        this.lastGhostSummary = {
+          dimsLabel: `${coords.length} blk (4px)`,
+          count: coords.length,
+          massDeltaKg: Math.round(coords.length * (slotItem.massKg || 7)),
+        };
+        for (let i = 0; i < coords.length; i++) {
+          const pt = coords[i];
+          if (!this.inBounds(pt.vx, pt.vy, pt.vz)) continue;
+          if (isPaintTool && this.getVoxel(pt.vx, pt.vy, pt.vz) === MAT.AIR) continue;
+          const box = new THREE.Mesh(_sharedUnitBoxGeo, _sharedGhostBoxMat);
+          if (isTargetExisting) {
+            box.scale.set(1.04, 1.04, 1.04);
+          }
+          box.position.set(
+            (pt.vx + 0.5) * VOXEL_SIZE,
+            (pt.vy + 0.5) * VOXEL_SIZE,
+            (pt.vz + 0.5) * VOXEL_SIZE,
+          );
+          this.ghostGroup.add(box);
+        }
       }
     } else if (slotItem.type === 'module' && slotItem.kind) {
       const previewMod: ActiveModule = {
@@ -5601,21 +6565,44 @@ export class ModularVehicleRig {
         slotItem.kind === 'SEAT_DIVING' ||
         slotItem.kind === 'SEAT_SPACE' ||
         slotItem.kind === 'SEAT_SHIP_WHEEL';
+      let modCount = 1;
       if (this.mirrorMode && !isCenterSeat) {
-        const mx = SYMMETRY_CENTER_X * 2 - 1 - nx;
-        if (mx !== nx && this.inBounds(mx, ny, nz)) {
-          const mirrorMod: ActiveModule = {
-            ...previewMod,
-            vx: mx,
-          };
-          this.ghostGroup.add(this.createModuleMesh(mirrorMod, true));
+        const mirX = SYMMETRY_CENTER_X * 2 - 1 - nx;
+        const mirZ = SYMMETRY_CENTER_Z * 2 - 1 - nz;
+        const useX = this.symmetryAxisMode === 'X' || this.symmetryAxisMode === 'XZ';
+        const useZ = this.symmetryAxisMode === 'Z' || this.symmetryAxisMode === 'XZ';
+        if (useX && mirX !== nx && this.inBounds(mirX, ny, nz)) {
+          this.ghostGroup.add(
+            this.createModuleMesh({ ...previewMod, vx: mirX }, true),
+          );
+          modCount++;
+        }
+        if (useZ && mirZ !== nz && this.inBounds(nx, ny, mirZ)) {
+          this.ghostGroup.add(
+            this.createModuleMesh({ ...previewMod, vz: mirZ }, true),
+          );
+          modCount++;
+        }
+        if (useX && useZ && mirX !== nx && mirZ !== nz && this.inBounds(mirX, ny, mirZ)) {
+          this.ghostGroup.add(
+            this.createModuleMesh({ ...previewMod, vx: mirX, vz: mirZ }, true),
+          );
+          modCount++;
         }
       }
+      this.lastGhostSummary = {
+        dimsLabel: `${modCount}× ${slotItem.name}`,
+        count: modCount,
+        massDeltaKg: Math.round(modCount * (slotItem.massKg || 20)),
+      };
     }
   }
 
+  private _evalTickId = 0;
+
   /**
-   * Evaluates a placed module's custom bound Positive/Negative keys + Logic Bus Channel (1..8)
+   * Evaluates a placed module's custom bound Positive/Negative keys + Logic Bus Channel (1..8),
+   * including per-module `toggleMode` (edge-triggered latch) and `autoReset === false` (hold state).
    */
   private evalModSignal(
     mod: ActiveModule,
@@ -5623,19 +6610,66 @@ export class ModularVehicleRig {
     hasPilot: boolean,
     defaultPosKey?: string,
     defaultNegKey?: string,
+    defaultToggleMode = false,
   ): number {
-    let val = 0;
     const cfg = mod.config;
+    if (cfg?.disabled) return 0;
+
+    let busVal = 0;
     const ch = cfg?.channel ?? 0;
     if (ch >= 1 && ch <= 8 && this.logicChannelSignals[ch]) {
-      val += 1.0;
+      busVal = 1.0;
     }
-    if (!hasPilot) return Math.max(-1, Math.min(1, val));
 
     const pk = cfg?.posKey ?? defaultPosKey;
     const nk = cfg?.negKey ?? defaultNegKey;
-    if (pk && pk !== 'NONE' && keys[pk]) val += 1.0;
-    if (nk && nk !== 'NONE' && keys[nk]) val -= 1.0;
+    const posDown = Boolean(hasPilot && pk && pk !== 'NONE' && keys[pk]);
+    const negDown = Boolean(hasPilot && nk && nk !== 'NONE' && keys[nk]);
+    const isToggleMode = cfg?.toggleMode ?? defaultToggleMode;
+
+    const isNewFrameTick = mod.lastEvalTick !== this._evalTickId;
+    if (isNewFrameTick) {
+      const posEdge = posDown && !mod.prevPosKeyDown;
+      const negEdge = negDown && !mod.prevNegKeyDown;
+      mod.prevPosKeyDown = posDown;
+      mod.prevNegKeyDown = negDown;
+      mod.lastEvalTick = this._evalTickId;
+
+      if (isToggleMode) {
+        const curr = mod.toggleLatch ?? 0;
+        if (posEdge) {
+          mod.toggleLatch = curr > 0 ? 0 : 1;
+        } else if (negEdge) {
+          mod.toggleLatch = curr < 0 ? 0 : -1;
+        }
+      } else if (cfg?.autoReset === false) {
+        let held = mod.heldSignal ?? 0;
+        if (posDown && !negDown) {
+          held = 1;
+        } else if (negDown && !posDown) {
+          held = pk && nk ? -1 : 0;
+        }
+        mod.heldSignal = held;
+      }
+    }
+
+    if (isToggleMode) {
+      const latched = mod.toggleLatch ?? 0;
+      const combined = latched !== 0 ? latched : busVal;
+      return Math.max(-1, Math.min(1, combined));
+    }
+
+    if (cfg?.autoReset === false) {
+      const held = mod.heldSignal ?? 0;
+      const combined = held !== 0 ? held : busVal;
+      return Math.max(-1, Math.min(1, combined));
+    }
+
+    let val = busVal;
+    if (!hasPilot) return Math.max(-1, Math.min(1, val));
+
+    if (posDown) val += 1.0;
+    if (negDown) val -= 1.0;
 
     // Also apply proportional mobile/touch OR smart AI inputs when using standard drive/steer/pitch axes
     const isAiDriver = !this.isLocalPlayerOccupied && this.aiConfig.enabled;
@@ -5789,12 +6823,41 @@ export class ModularVehicleRig {
       }
     }
 
+    // Part 3: Damaged 1px micro-voxel engines & thrusters emit dark smoke + hot sputtering sparks below 68% integrity!
+    if (!this.isVoxelEntity && !this.inBuildMode && this.modules.length > 0) {
+      this.engineSparkTimer += dt;
+      const sparkInterval = this.usePotatoShader ? 0.24 : 0.11;
+      if (this.engineSparkTimer >= sparkInterval) {
+        this.engineSparkTimer = 0;
+        for (let mi = 0; mi < this.modules.length; mi++) {
+          const mod = this.modules[mi];
+          const integ = mod.microIntegrity ?? 1.0;
+          if (integ >= 0.68) continue;
+          if (
+            mod.kind === 'V8_ENGINE' ||
+            mod.kind === 'ENGINE_BULLDAWG' ||
+            mod.kind === 'ENGINE_DRAGON' ||
+            mod.kind === 'THRUSTER' ||
+            mod.kind === 'THRUSTER_ROCKET' ||
+            mod.kind === 'JET_RAW' ||
+            mod.kind === 'JET_GIMBAL'
+          ) {
+            const wp = this.localVoxelToWorld(mod.vx, mod.vy, mod.vz);
+            this.fx.spawnStructuralSmoke(wp.x, wp.y + 0.26, wp.z);
+            if (integ < 0.55 && Math.random() < 0.65) {
+              this.fx.spawnWeldSparks(wp.x, wp.y + 0.2, wp.z);
+            }
+          }
+        }
+      }
+    }
+
     if (this.inBuildMode) {
       this.hoverTime += dt * 2.4;
       this.position.x = this.hoverAnchorPos.x;
       this.position.z = this.hoverAnchorPos.z;
       this.position.y = this.hoverAnchorPos.y + Math.sin(this.hoverTime) * 0.05;
-      this.symmetryPlane.visible = this.mirrorMode;
+      this.syncSymmetryPlanesVisibility();
       this.statusLabel = 'HOVERING (BUILD)';
       this.speedKmh = 0;
       this.isBoostingNow = false;
@@ -5864,10 +6927,14 @@ export class ModularVehicleRig {
     // AI can pilot even damaged / seat-less / unconventional creations!
     const hasPilot = isSeatedDriver || (isAiPiloted && !this.isVoxelEntity);
 
+    // Advance per-frame signal evaluation tick so edge-triggered toggleMode latches once per updatePhysics frame
+    this._evalTickId = (this._evalTickId + 1) | 0;
+
     // --- PASS 1: EVALUATE SENSORS & LOGIC GATES INTO 8-CHANNEL SIGNAL BUS ---
     this.logicChannelSignals.fill(false);
     const rawChannelInputs: number[] = new Array(9).fill(0);
     for (const mod of this.modules) {
+      if (mod.config?.disabled || (mod.health ?? 1.0) <= 0) continue;
       const k = mod.kind;
       const ch = mod.config?.channel ?? 1;
       const thresh = mod.config?.threshold ?? 15;
@@ -5880,12 +6947,58 @@ export class ModularVehicleRig {
       } else if (k === 'SENSOR_POSITION') {
         if (Math.hypot(this.position.x, this.position.z) >= thresh) rawChannelInputs[ch]++;
       } else if (k === 'SENSOR_DISTANCE') {
-        const origin = this.localVoxelToWorld(mod.vx, mod.vy, mod.vz);
-        const gnd = this.world.probeGroundBelow(origin.x, origin.y, origin.z, thresh);
-        if (origin.y - gnd.y <= thresh) rawChannelInputs[ch]++;
+        const origin = this.localVoxelToWorld(mod.vx + 0.5, mod.vy + 0.5, mod.vz + 0.5, _v1);
+        _q1.setFromEuler(
+          _modEuler.set(
+            ((mod.pitchIdx || 0) & 3) * (Math.PI / 2),
+            ((mod.yawIdx || 0) & 3) * (Math.PI / 2),
+            ((mod.rollIdx || 0) & 3) * (Math.PI / 2),
+            'YXZ',
+          ),
+        );
+        _v2
+          .set(0, 0, 1)
+          .applyQuaternion(_q1)
+          .applyQuaternion(this.quaternion)
+          .normalize();
+        const maxRange = Math.max(0.5, thresh);
+        const wHit = this.world.raycastWorldVoxels(origin, _v2, maxRange);
+        let hitDist = wHit ? wHit.distance : Infinity;
+        if (this.fx?.rigs) {
+          for (const other of this.fx.rigs) {
+            if (other !== this && !other.inBuildMode) {
+              const rHit = other.raycastVehicle(origin, _v2, Math.min(maxRange, hitDist));
+              if (rHit && rHit.distance < hitDist) {
+                hitDist = rHit.distance;
+              }
+            }
+          }
+        }
+        if (hitDist <= maxRange) rawChannelInputs[ch]++;
       } else if (k === 'RADIO_TRX') {
         const pk = mod.config?.posKey ?? 'KeyF';
-        if (hasPilot && keys[pk]) rawChannelInputs[ch]++;
+        const localTx = Boolean(hasPilot && pk !== 'NONE' && keys[pk]);
+        let remoteTx = false;
+        if (!localTx && this.fx?.rigs) {
+          const maxRadioRangeSq = 500 * 500;
+          for (const other of this.fx.rigs) {
+            if (other === this || other.inBuildMode) continue;
+            if (this.position.distanceToSquared(other.position) > maxRadioRangeSq) continue;
+            if (
+              other.logicChannelSignals[ch] &&
+              other.modules.some(
+                (om) =>
+                  om.kind === 'RADIO_TRX' &&
+                  !om.config?.disabled &&
+                  (om.config?.channel ?? 1) === ch,
+              )
+            ) {
+              remoteTx = true;
+              break;
+            }
+          }
+        }
+        if (localTx || remoteTx) rawChannelInputs[ch]++;
       }
     }
     for (let ch = 1; ch <= 8; ch++) {
@@ -6114,8 +7227,15 @@ export class ModularVehicleRig {
       this.fireCannons();
     }
 
-    // Fire weapons or detachable bolts strictly when their configured module keybind or logic channel is active
+    // Fire weapons, detachable bolts, and toggleable/custom-bound actuators per-module
+    const triggeredWeapons: ActiveModule[] = [];
+    const triggeredBolts: ActiveModule[] = [];
+    let wantSmokeFlare = false;
+    let anyPistonExtSum = 0;
+    let activePistonCount = 0;
+
     for (const mod of this.modules) {
+      if (mod.config?.disabled || (mod.health ?? 1.0) <= 0) continue;
       if (
         mod.kind === 'PLASMA_CANNON' ||
         mod.kind === 'WEAPON_MINIGUN' ||
@@ -6123,20 +7243,92 @@ export class ModularVehicleRig {
         mod.kind === 'WEAPON_BOMB_BAY'
       ) {
         if (this.evalModSignal(mod, keys, hasPilot, 'KeyF') > 0) {
-          this.fireCannons();
-          break;
+          triggeredWeapons.push(mod);
         }
       } else if (mod.kind === 'DETACHABLE_BLOCK') {
         if (this.evalModSignal(mod, keys, hasPilot, 'KeyU') > 0) {
-          this.triggerDetachableBlocks();
-          break;
+          triggeredBolts.push(mod);
         }
       } else if (mod.kind === 'SMOKE_FLARE') {
         if (this.evalModSignal(mod, keys, hasPilot, 'KeyI') > 0) {
-          this.deploySmokeAndFlares();
-          break;
+          wantSmokeFlare = true;
         }
+      } else if (mod.kind === 'HEADLIGHT') {
+        const pk = mod.config?.posKey || 'KeyH';
+        const posDown = Boolean(hasPilot && pk !== 'NONE' && keys[pk]);
+        if (posDown && !mod.prevPosKeyDown) {
+          this.toggleHeadlights();
+        }
+        mod.prevPosKeyDown = posDown;
+        if (mod.config?.channel && this.logicChannelSignals[mod.config.channel]) {
+          this.setHeadlights(true);
+        }
+      } else if (mod.kind === 'GYRO') {
+        const pk = mod.config?.posKey || 'KeyY';
+        const posDown = Boolean(hasPilot && pk !== 'NONE' && keys[pk]);
+        if (posDown && !mod.prevPosKeyDown) {
+          this.toggleGyro();
+        }
+        mod.prevPosKeyDown = posDown;
+      } else if (mod.kind === 'PARACHUTE_AIRBRAKE') {
+        const pk = mod.config?.posKey || 'KeyU';
+        const posDown = Boolean(hasPilot && pk !== 'NONE' && keys[pk]);
+        if (posDown && !mod.prevPosKeyDown) {
+          this.toggleParachuteAirbrake();
+        }
+        mod.prevPosKeyDown = posDown;
+        if (mod.config?.channel && this.logicChannelSignals[mod.config.channel]) {
+          this.parachuteDeployed = true;
+        }
+      } else if (mod.kind === 'OUTRIGGER_JACK') {
+        const pk = mod.config?.posKey || 'KeyJ';
+        const posDown = Boolean(hasPilot && pk !== 'NONE' && keys[pk]);
+        if (posDown && !mod.prevPosKeyDown) {
+          this.toggleOutriggerJacks();
+        }
+        mod.prevPosKeyDown = posDown;
+        if (mod.config?.channel && this.logicChannelSignals[mod.config.channel]) {
+          this.outriggersExtended = true;
+        }
+      } else if (mod.kind === 'PISTON') {
+        activePistonCount++;
+        const prevLatch = mod.toggleLatch ?? 0;
+        const isToggle = mod.config?.toggleMode !== false;
+        const sig = this.evalModSignal(mod, keys, hasPilot, 'KeyX', 'KeyQ', true);
+        const currExt = mod.pistonExtension ?? 0;
+        let targetExt = currExt;
+        if (isToggle) {
+          // Toggle mode: pressing posKey once latches extended (1.0); pressing the SAME posKey again retracts to 0.0;
+          // pressing negKey also retracts to 0.0.
+          if ((mod.toggleLatch ?? 0) < 0) {
+            mod.toggleLatch = 0;
+          }
+          if ((mod.toggleLatch ?? 0) !== prevLatch) {
+            SoundFX.hover();
+            if (this.rigidBody.isSleeping) this.rigidBody.wake();
+          }
+          targetExt = sig > 0 ? 1.0 : 0.0;
+        } else if (mod.config?.autoReset === false) {
+          // Hold-position mode (toggleMode: false, autoReset: false): extend on +key, retract on -key
+          targetExt = Math.max(0, Math.min(1, currExt + sig * dt * 2.5));
+        } else {
+          // Momentary hold mode (toggleMode: false, autoReset: true): extend while held, auto-retract on release
+          targetExt = sig > 0 ? Math.min(1, sig) : 0.0;
+        }
+        const nextExt = currExt + (targetExt - currExt) * Math.min(1, dt * 9.0);
+        mod.pistonExtension = nextExt;
+        anyPistonExtSum += nextExt;
       }
+    }
+
+    if (triggeredWeapons.length > 0) {
+      this.fireCannons(triggeredWeapons);
+    }
+    if (triggeredBolts.length > 0) {
+      this.triggerDetachableBlocks(triggeredBolts);
+    }
+    if (wantSmokeFlare) {
+      this.deploySmokeAndFlares();
     }
 
     if (this.countermeasureCooldown > 0) {
@@ -6167,13 +7359,12 @@ export class ModularVehicleRig {
       this.vtolCollective = 0;
     }
 
-    if (this.pistonCount <= 0) {
+    if (activePistonCount <= 0) {
       this.pistonExtended = false;
       this.pistonExtRatio = 0;
     } else {
-      const targetPistonRatio = this.pistonExtended ? 1.0 : 0.0;
-      this.pistonExtRatio +=
-        (targetPistonRatio - this.pistonExtRatio) * Math.min(1, dt * 10.0);
+      this.pistonExtRatio = anyPistonExtSum / activePistonCount;
+      this.pistonExtended = this.pistonExtRatio > 0.25;
     }
 
     const fwdSpin = speed * dt * 2.1 * (throttle >= 0 ? 1 : -1);
@@ -6195,7 +7386,7 @@ export class ModularVehicleRig {
       ) {
         mod.spinMesh.rotation.y += dt * 14.0;
       } else if (mod.kind === 'PISTON' && mod.spinMesh) {
-        mod.spinMesh.position.y = -this.pistonExtRatio * 0.68;
+        mod.spinMesh.position.y = -(mod.pistonExtension ?? this.pistonExtRatio) * 0.68;
       } else if (mod.kind === 'OUTRIGGER_JACK' && mod.spinMesh) {
         mod.spinMesh.position.y = -this.outriggerExtRatio * 0.55;
       } else if (mod.kind === 'PARACHUTE_AIRBRAKE' && mod.spinMesh) {
@@ -6406,9 +7597,16 @@ export class ModularVehicleRig {
         mod.kind === 'ENGINE_DRAGON'
       ) {
         hasAnyEngine = true;
-        if (mod.kind === 'ENGINE_BULLDAWG') engineMultiplier += 1.25 * str;
-        else if (mod.kind === 'V8_ENGINE') engineMultiplier += 2.4 * str;
-        else if (mod.kind === 'ENGINE_DRAGON') engineMultiplier += 4.5 * str;
+        // Scale live horsepower proportionally with intact 1px micro-voxels on the engine block + sputter misfires below 58% integrity!
+        const rawInteg = mod.microIntegrity ?? 1.0;
+        const sputterFactor =
+          rawInteg < 0.58
+            ? 0.65 + 0.35 * Math.sin(this.hoverTime * 19 + mod.vx * 3.1 + performance.now() * 0.025)
+            : 1.0;
+        const integrityScale = Math.max(0.16, rawInteg) * sputterFactor;
+        if (mod.kind === 'ENGINE_BULLDAWG') engineMultiplier += 1.25 * str * integrityScale;
+        else if (mod.kind === 'V8_ENGINE') engineMultiplier += 2.4 * str * integrityScale;
+        else if (mod.kind === 'ENGINE_DRAGON') engineMultiplier += 4.5 * str * integrityScale;
 
         const engSig = this.evalModSignal(mod, keys, hasPilot, 'KeyW', 'KeyS');
         if (Math.abs(engSig) > Math.abs(engineThrottleSignal)) {
@@ -7277,11 +8475,25 @@ export class ModularVehicleRig {
         const sig = this.evalModSignal(mod, keys, hasPilot, 'KeyW', 'KeyS');
         const str = mod.config?.strength ?? 1.0;
 
+        _steerQ.setFromEuler(
+          _modEuler.set(
+            ((mod.pitchIdx || 0) & 3) * (Math.PI / 2),
+            ((mod.yawIdx || 0) & 3) * (Math.PI / 2),
+            ((mod.rollIdx || 0) & 3) * (Math.PI / 2),
+            'YXZ',
+          ),
+        );
+        _v2
+          .set(0, 0, 1)
+          .applyQuaternion(_steerQ)
+          .applyQuaternion(this.rigidBody.quaternion)
+          .normalize();
+
         const propWaveH = this.world.getWaveHeightAt(_wp.x, _wp.z);
         if (mod.kind === 'PROP_AERO') {
           if (_wp.y > WATER_LEVEL + propWaveH - 0.25 && sig !== 0) {
             _wheelForce
-              .copy(_forward)
+              .copy(_v2)
               .multiplyScalar(sig * effectivePowerMass * 11.5 * str);
             addForceAtLocal(_wheelForce, _localPos);
           }
@@ -7292,7 +8504,7 @@ export class ModularVehicleRig {
         ) {
           if (sig !== 0) {
             _wheelForce
-              .copy(_forward)
+              .copy(_v2)
               .multiplyScalar(sig * effectivePowerMass * 16.5 * str);
             addForceAtLocal(_wheelForce, _localPos);
           }
@@ -7519,18 +8731,22 @@ export class ModularVehicleRig {
             .applyQuaternion(this.rigidBody.quaternion)
             .add(this.rigidBody.position);
 
+          _steerQ.setFromEuler(
+            _modEuler.set(
+              ((mod.pitchIdx || 0) & 3) * (Math.PI / 2),
+              ((mod.yawIdx || 0) & 3) * (Math.PI / 2),
+              ((mod.rollIdx || 0) & 3) * (Math.PI / 2),
+              'YXZ',
+            ),
+          );
           if (k === 'JET_GIMBAL') {
-            _v2.set(0, 1, 0).applyQuaternion(this.rigidBody.quaternion).normalize();
+            _v2
+              .set(0, 1, 0)
+              .applyQuaternion(_steerQ)
+              .applyQuaternion(this.rigidBody.quaternion)
+              .normalize();
             stepJetModulePhysics(this.rigidBody, _wp, _v2, sig, jetPower);
           } else {
-            _steerQ.setFromEuler(
-              _modEuler.set(
-                ((mod.pitchIdx || 0) & 3) * (Math.PI / 2),
-                ((mod.yawIdx || 0) & 3) * (Math.PI / 2),
-                ((mod.rollIdx || 0) & 3) * (Math.PI / 2),
-                'YXZ',
-              ),
-            );
             _v2
               .set(0, 0, 1)
               .applyQuaternion(_steerQ)
@@ -7647,10 +8863,15 @@ export class ModularVehicleRig {
       // Apply accumulated rotational torques to CustomRigidBody
       this.rigidBody.applyTorque(_totalTorque);
 
-      // Hydraulic Piston Ground Push Force
-      if (this.pistonExtRatio > 0.05 && this.pistonCount > 0) {
+      // 3D-Oriented Hydraulic Piston Linear Actuator (Smooth Spring-Damper Push Against Terrain & Vehicles)
+      if (this.pistonCount > 0) {
         for (const mod of this.modules) {
-          if (mod.kind !== 'PISTON') continue;
+          if (mod.kind !== 'PISTON' || mod.config?.disabled || (mod.health ?? 1.0) <= 0) {
+            continue;
+          }
+          const ext = mod.pistonExtension ?? this.pistonExtRatio;
+          if (ext <= 0.02) continue;
+
           _localPos.set(
             (mod.vx + 0.5) * VOXEL_SIZE,
             (mod.vy + 0.5) * VOXEL_SIZE,
@@ -7661,13 +8882,78 @@ export class ModularVehicleRig {
             .sub(this.comLocal)
             .applyQuaternion(this.rigidBody.quaternion)
             .add(this.rigidBody.position);
-          const gnd = this.world.probeGroundBelow(_wp.x, _wp.y, _wp.z, 0.5);
-          const reach = 0.55 + this.pistonExtRatio * 0.95;
-          const distGnd = _wp.y - gnd.y;
-          if (distGnd < reach) {
-            const pushUp = (reach - distGnd) * this.rigidBody.mass * G * 2.4;
-            _wheelForce.set(0, pushUp, 0);
-            addForceAtLocal(_wheelForce, _localPos);
+
+          // At default orientation (0,0,0), piston rod extends along local -Y; 3D rotations orient it along any axis
+          _steerQ.setFromEuler(
+            _modEuler.set(
+              ((mod.pitchIdx || 0) & 3) * (Math.PI / 2),
+              ((mod.yawIdx || 0) & 3) * (Math.PI / 2),
+              ((mod.rollIdx || 0) & 3) * (Math.PI / 2),
+              'YXZ',
+            ),
+          );
+          _v2
+            .set(0, -1, 0)
+            .applyQuaternion(_steerQ)
+            .applyQuaternion(this.rigidBody.quaternion)
+            .normalize();
+
+          const reach = 0.45 + ext * 1.15;
+          let contactDist = Infinity;
+          let hitOtherRig: ModularVehicleRig | null = null;
+
+          if (_v2.y < -0.5) {
+            const gnd = this.world.probeGroundBelow(_wp.x, _wp.y + 0.2, _wp.z, reach + 0.25);
+            const verticalDist = (_wp.y - gnd.y) / Math.max(0.25, -_v2.y);
+            if (verticalDist >= -0.25 && verticalDist < contactDist) {
+              contactDist = Math.max(0, verticalDist);
+            }
+          }
+          const wHit = this.world.raycastWorldVoxels(_wp, _v2, reach);
+          if (wHit && wHit.distance < contactDist) {
+            contactDist = wHit.distance;
+          }
+          if (this.fx?.rigs) {
+            for (const other of this.fx.rigs) {
+              if (other === this || other.inBuildMode) continue;
+              const rHit = other.raycastVehicle(_wp, _v2, Math.min(reach, contactDist));
+              if (rHit && rHit.distance < contactDist) {
+                contactDist = rHit.distance;
+                hitOtherRig = other;
+              }
+            }
+          }
+
+          if (contactDist < reach) {
+            const compression = Math.min(1.15, reach - contactDist);
+            this.rigidBody.velocityAtPoint(_wp, _contactVel);
+            if (hitOtherRig) {
+              hitOtherRig.rigidBody.velocityAtPoint(_wp, _v4);
+              _contactVel.sub(_v4);
+            }
+            // Relative velocity along the reaction direction (-_v2)
+            const velAlongReaction = -_contactVel.dot(_v2);
+            const str = mod.config?.strength ?? 1.0;
+            const kPiston = this.rigidBody.mass * G * 3.2 * str;
+            const cPiston = this.rigidBody.mass * 4.8 * str;
+            const pushMag = Math.max(
+              0,
+              Math.min(
+                this.rigidBody.mass * G * 5.5 * str,
+                compression * kPiston - velAlongReaction * cPiston,
+              ),
+            );
+            if (pushMag > 0) {
+              _wheelForce.copy(_v2).multiplyScalar(-pushMag);
+              addForceAtLocal(_wheelForce, _localPos);
+              if (hitOtherRig) {
+                _wheelForce.copy(_v2).multiplyScalar(pushMag * 0.85);
+                hitOtherRig.rigidBody.applyForceAtPoint(_wheelForce, _wp);
+                if (hitOtherRig.rigidBody.isSleeping) {
+                  hitOtherRig.rigidBody.wake();
+                }
+              }
+            }
           }
         }
       }
@@ -8429,6 +9715,11 @@ export class ModularVehicleRig {
       this.chassisTransMesh.geometry.dispose();
       this.chassisTransMesh = null;
     }
+    if (this.microChassisMesh) {
+      this.rootGroup.remove(this.microChassisMesh);
+      this.microChassisMesh.geometry.dispose();
+      this.microChassisMesh = null;
+    }
     while (this.ghostGroup.children.length > 0) {
       const ch = this.ghostGroup.children[0];
       this.ghostGroup.remove(ch);
@@ -8452,6 +9743,7 @@ export class ModularVehicleRig {
     disposeObjectTree(this.cobMarker);
     disposeObjectTree(this.cotMarker);
     disposeObjectTree(this.symmetryPlane);
+    disposeObjectTree(this.symmetryPlaneZ);
     disposeObjectTree(this.hoverRingGroup);
     disposeObjectTree(this.winchLineMesh);
     disposeObjectTree(this.winchCableCylinderMesh);
@@ -8462,7 +9754,15 @@ export class ModularVehicleRig {
 
     this.scene.remove(this.rootGroup);
     this.scene.remove(this.hoverRingGroup);
-    this.scene.remove(this.contactShadowMesh);
+    if (this.blobShadowManager && this.blobShadowSlot >= 0) {
+      this.blobShadowManager.releaseSlot(this.blobShadowSlot);
+      this.blobShadowSlot = -1;
+      this.blobShadowManager = null;
+    }
+    if (this.contactShadowMesh) {
+      this.scene.remove(this.contactShadowMesh);
+      this.contactShadowMesh = null;
+    }
     this.scene.remove(this.winchLineMesh);
     this.scene.remove(this.winchCableCylinderMesh);
     this.scene.remove(this.winchHookMesh);

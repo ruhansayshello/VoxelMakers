@@ -23,3 +23,11 @@ export {
 } from './ChunkBatchRenderer';
 
 export { GPUChunkCuller } from './GPUChunkCuller';
+
+export {
+  buildVoxelChunkGeometry,
+  raycastVoxels,
+  type BuildVoxelChunkMeshOptions,
+  type VoxelMesherPaletteEntry,
+  type VoxelDDARaycastHit,
+} from './VoxelMesher';

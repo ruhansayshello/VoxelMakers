@@ -6,6 +6,12 @@ import {
 } from './constants.ts';
 import type { ActiveModule } from './vehicle.ts';
 import { LED_PATTERNS, type LedMatrixIcon } from './logicSystem.ts';
+import {
+  getMicroVoxelBlockTemplate,
+  getMicroVoxelBlockMaterial,
+  getMicroVoxelWheelRollGeometry,
+  type MicroVoxelBlockKind,
+} from './microVoxelBlocks.ts';
 
 // ============================================================================
 // 1. UNIFIED PALETTE & SPECIALIZED MATERIAL DEFINITIONS
@@ -246,6 +252,7 @@ export function getCachedBoxGeo(w: number, h: number, d: number): THREE.BoxGeome
     geo = new THREE.BoxGeometry(w, h, d);
     geo.computeBoundingSphere();
     geo.userData.isSharedPrimitive = true;
+    geo.userData.cacheKey = key;
     _sharedPrimitiveGeoCache.set(key, geo);
   }
   return geo;
@@ -268,6 +275,7 @@ export function getCachedCylGeo(
     else if (rotAxis === 'z') geo.rotateZ(Math.PI / 2);
     geo.computeBoundingSphere();
     geo.userData.isSharedPrimitive = true;
+    geo.userData.cacheKey = key;
     _sharedPrimitiveGeoCache.set(key, geo);
   }
   return geo;
@@ -287,6 +295,7 @@ export function getCachedConeGeo(
     else if (rotAxis === '-x') geo.rotateX(-Math.PI / 2);
     geo.computeBoundingSphere();
     geo.userData.isSharedPrimitive = true;
+    geo.userData.cacheKey = key;
     _sharedPrimitiveGeoCache.set(key, geo);
   }
   return geo;
@@ -303,6 +312,7 @@ export function getCachedSphereGeo(
     geo = new THREE.SphereGeometry(r, wSegs, hSegs);
     geo.computeBoundingSphere();
     geo.userData.isSharedPrimitive = true;
+    geo.userData.cacheKey = key;
     _sharedPrimitiveGeoCache.set(key, geo);
   }
   return geo;
@@ -321,31 +331,347 @@ export function getCachedTorusGeo(
     geo = new THREE.TorusGeometry(r, tube, rSegs, tSegs, arc);
     geo.computeBoundingSphere();
     geo.userData.isSharedPrimitive = true;
+    geo.userData.cacheKey = key;
     _sharedPrimitiveGeoCache.set(key, geo);
   }
   return geo;
 }
 
+const _sharedMergedGeoCache = new Map<string, THREE.BufferGeometry>();
+let _sharedMergedStaticMat: THREE.MeshStandardMaterial | null = null;
+
+function getSharedMergedStaticMat(): THREE.MeshStandardMaterial {
+  if (!_sharedMergedStaticMat) {
+    _sharedMergedStaticMat = new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      vertexColors: true,
+      roughness: 0.44,
+      metalness: 0.45,
+    });
+  }
+  return _sharedMergedStaticMat;
+}
+
 export function getSharedGeoCacheSize(): number {
-  return _sharedPrimitiveGeoCache.size;
+  return _sharedPrimitiveGeoCache.size + _sharedMergedGeoCache.size;
+}
+
+/**
+ * Disposes all shared procedural module geometries, merged geometries, materials,
+ * and cached palette textures on full scene teardown.
+ */
+export function disposeSharedModelCaches(): void {
+  if (_sharedPaletteTexture) {
+    _sharedPaletteTexture.dispose();
+    _sharedPaletteTexture = null;
+  }
+  for (const mat of _modelMatCache.values()) {
+    mat.dispose();
+  }
+  _modelMatCache.clear();
+  if (_sharedMergedStaticMat) {
+    _sharedMergedStaticMat.dispose();
+    _sharedMergedStaticMat = null;
+  }
+  for (const geo of _sharedPrimitiveGeoCache.values()) {
+    geo.dispose();
+  }
+  _sharedPrimitiveGeoCache.clear();
+  for (const geo of _sharedMergedGeoCache.values()) {
+    geo.dispose();
+  }
+  _sharedMergedGeoCache.clear();
+  _ledOffMat.dispose();
+  _ledRedMat.dispose();
+  _ledCyanMat.dispose();
+  _sharedLedDotGeo.dispose();
+}
+
+const _mergePos = new THREE.Vector3();
+const _mergeNrm = new THREE.Vector3();
+const _mergeNormalMat = new THREE.Matrix3();
+const _mergeRelMat = new THREE.Matrix4();
+
+function isMergeableOpaqueStaticMesh(
+  obj: THREE.Object3D,
+  skip?: Set<THREE.Object3D>,
+): obj is THREE.Mesh {
+  if (!(obj instanceof THREE.Mesh)) return false;
+  if (obj instanceof THREE.InstancedMesh) return false;
+  if (skip?.has(obj)) return false;
+  if (obj.children.length > 0) return false;
+  if (!obj.geometry) return false;
+  const posAttr = obj.geometry.getAttribute('position');
+  const nrmAttr = obj.geometry.getAttribute('normal');
+  if (!posAttr || !nrmAttr || posAttr.count === 0) return false;
+
+  const mat = obj.material as THREE.Material & {
+    transparent?: boolean;
+    wireframe?: boolean;
+    opacity?: number;
+    map?: THREE.Texture | null;
+    emissive?: THREE.Color;
+    emissiveIntensity?: number;
+  };
+  if (!mat || Array.isArray(mat)) return false;
+  if (mat.transparent || mat.wireframe) return false;
+  if (mat.opacity !== undefined && mat.opacity < 0.99) return false;
+  if (mat.map) return false;
+  if (
+    mat.emissive &&
+    (mat.emissiveIntensity ?? 1) > 0 &&
+    (mat.emissive.r > 0.001 || mat.emissive.g > 0.001 || mat.emissive.b > 0.001)
+  ) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Merges all static opaque child meshes under `group` (skipping animated/referenced sub-trees in `skip`)
+ * into a single vertex-colored Mesh with cached BufferGeometry, slashing draw calls 5x–13x per module.
+ */
+export function mergeStaticMeshesInGroup(
+  group: THREE.Object3D,
+  skip?: Set<THREE.Object3D>,
+): THREE.Mesh | null {
+  interface MergeCandidate {
+    mesh: THREE.Mesh;
+    relMatrix: THREE.Matrix4;
+    r: number;
+    g: number;
+    b: number;
+    sig: string;
+  }
+
+  const candidates: MergeCandidate[] = [];
+  const candidateAncestors = new Set<THREE.Object3D>();
+
+  const collect = (parent: THREE.Object3D, parentRelMat: THREE.Matrix4 | null) => {
+    for (let i = 0; i < parent.children.length; i++) {
+      const child = parent.children[i];
+      if (skip?.has(child)) continue;
+
+      child.updateMatrix();
+      const childRelMat = parentRelMat
+        ? new THREE.Matrix4().multiplyMatrices(parentRelMat, child.matrix)
+        : child.matrix.clone();
+
+      if (isMergeableOpaqueStaticMesh(child, skip)) {
+        const mat = child.material as THREE.Material & { color?: THREE.Color };
+        const r = mat.color ? mat.color.r : 1;
+        const g = mat.color ? mat.color.g : 1;
+        const b = mat.color ? mat.color.b : 1;
+
+        const geo = child.geometry as THREE.BufferGeometry & {
+          parameters?: Record<string, unknown>;
+        };
+        const geoSig = geo.userData?.cacheKey
+          ? String(geo.userData.cacheKey)
+          : geo.parameters
+            ? `${geo.type}:${JSON.stringify(geo.parameters)}`
+            : `${geo.type}:${geo.getAttribute('position')?.count ?? 0}:${geo.index?.count ?? 0}`;
+        const e = childRelMat.elements;
+        // Quantize matrix + color for deterministic deduplication across identical modules
+        const mSig =
+          `${Math.round(e[0] * 1000)},${Math.round(e[1] * 1000)},${Math.round(e[2] * 1000)},` +
+          `${Math.round(e[4] * 1000)},${Math.round(e[5] * 1000)},${Math.round(e[6] * 1000)},` +
+          `${Math.round(e[8] * 1000)},${Math.round(e[9] * 1000)},${Math.round(e[10] * 1000)},` +
+          `${Math.round(e[12] * 1000)},${Math.round(e[13] * 1000)},${Math.round(e[14] * 1000)}`;
+        const cSig = `${Math.round(r * 255)},${Math.round(g * 255)},${Math.round(b * 255)}`;
+
+        candidates.push({
+          mesh: child,
+          relMatrix: childRelMat,
+          r,
+          g,
+          b,
+          sig: `${geoSig}|${cSig}|${mSig}`,
+        });
+        if (parent !== group) {
+          candidateAncestors.add(parent);
+        }
+      } else if (child instanceof THREE.Group || child.type === 'Object3D') {
+        collect(child, childRelMat);
+      }
+    }
+  };
+
+  collect(group, null);
+  if (candidates.length < 2) return null;
+
+  const cacheKey = candidates.map((c) => c.sig).join(';');
+  let mergedGeo = _sharedMergedGeoCache.get(cacheKey);
+
+  if (!mergedGeo) {
+    let totalVerts = 0;
+    let totalIndices = 0;
+    for (let i = 0; i < candidates.length; i++) {
+      const geo = candidates[i].mesh.geometry;
+      const posAttr = geo.getAttribute('position')!;
+      totalVerts += posAttr.count;
+      totalIndices += geo.index ? geo.index.count : posAttr.count;
+    }
+
+    const positions = new Float32Array(totalVerts * 3);
+    const normals = new Float32Array(totalVerts * 3);
+    const colors = new Float32Array(totalVerts * 3);
+    const indices =
+      totalVerts <= 65535
+        ? new Uint16Array(totalIndices)
+        : new Uint32Array(totalIndices);
+
+    let vOffset = 0;
+    let iOffset = 0;
+
+    for (let i = 0; i < candidates.length; i++) {
+      const { mesh, relMatrix, r, g, b } = candidates[i];
+      const geo = mesh.geometry;
+      const posAttr = geo.getAttribute('position')!;
+      const nrmAttr = geo.getAttribute('normal')!;
+      const colAttr = geo.getAttribute('color');
+      const vCount = posAttr.count;
+
+      _mergeRelMat.copy(relMatrix);
+      _mergeNormalMat.getNormalMatrix(_mergeRelMat);
+
+      for (let v = 0; v < vCount; v++) {
+        _mergePos.set(posAttr.getX(v), posAttr.getY(v), posAttr.getZ(v)).applyMatrix4(_mergeRelMat);
+        const dst3 = (vOffset + v) * 3;
+        positions[dst3] = _mergePos.x;
+        positions[dst3 + 1] = _mergePos.y;
+        positions[dst3 + 2] = _mergePos.z;
+
+        _mergeNrm.set(nrmAttr.getX(v), nrmAttr.getY(v), nrmAttr.getZ(v)).applyMatrix3(_mergeNormalMat).normalize();
+        normals[dst3] = _mergeNrm.x;
+        normals[dst3 + 1] = _mergeNrm.y;
+        normals[dst3 + 2] = _mergeNrm.z;
+
+        if (colAttr) {
+          colors[dst3] = colAttr.getX(v) * r;
+          colors[dst3 + 1] = colAttr.getY(v) * g;
+          colors[dst3 + 2] = colAttr.getZ(v) * b;
+        } else {
+          colors[dst3] = r;
+          colors[dst3 + 1] = g;
+          colors[dst3 + 2] = b;
+        }
+      }
+
+      if (geo.index) {
+        const idxArr = geo.index.array;
+        for (let k = 0; k < geo.index.count; k++) {
+          indices[iOffset + k] = idxArr[k] + vOffset;
+        }
+        iOffset += geo.index.count;
+      } else {
+        for (let k = 0; k < vCount; k++) {
+          indices[iOffset + k] = vOffset + k;
+        }
+        iOffset += vCount;
+      }
+
+      vOffset += vCount;
+    }
+
+    mergedGeo = new THREE.BufferGeometry();
+    mergedGeo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    mergedGeo.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
+    mergedGeo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+    mergedGeo.setIndex(new THREE.BufferAttribute(indices, 1));
+    mergedGeo.computeBoundingSphere();
+    mergedGeo.userData.isSharedPrimitive = true;
+    mergedGeo.userData.isMergedStatic = true;
+    _sharedMergedGeoCache.set(cacheKey, mergedGeo);
+  }
+
+  // Remove original static meshes and dispose non-shared source geometries
+  for (let i = 0; i < candidates.length; i++) {
+    const mesh = candidates[i].mesh;
+    if (mesh.parent) {
+      mesh.parent.remove(mesh);
+    }
+    if (mesh.geometry && !mesh.geometry.userData?.isSharedPrimitive) {
+      mesh.geometry.dispose();
+    }
+  }
+
+  // Prune any intermediate static groups that are now empty
+  for (const anc of candidateAncestors) {
+    if (anc.children.length === 0 && anc.parent && !skip?.has(anc)) {
+      anc.parent.remove(anc);
+    }
+  }
+
+  const mergedMesh = new THREE.Mesh(mergedGeo, getSharedMergedStaticMat());
+  mergedMesh.name = `${group.name || 'StaticGroup'}_Merged`;
+  mergedMesh.frustumCulled = true;
+  mergedMesh.castShadow = false;
+  mergedMesh.receiveShadow = false;
+  mergedMesh.matrixAutoUpdate = false;
+  mergedMesh.updateMatrix();
+  group.add(mergedMesh);
+  return mergedMesh;
 }
 
 /**
  * Optimizes a generated module hierarchy:
+ * - Merges static opaque sub-meshes into vertex-colored BufferGeometries (5x-13x draw-call reduction)
  * - Marks all child geometries as shared primitives in `_sharedPrimitiveGeoCache` so they are never leaked or redundantly allocated
  * - Disables `castShadow` on small sub-parts (lug bolts, springs, screens, trim)
  * - Enables `frustumCulled = true` on every mesh and sub-assembly
  * - Sets `matrixAutoUpdate = false` (calling `updateMatrix()` once) on static sub-meshes
  */
-export function optimizeModuleMeshHierarchy(root: THREE.Group): THREE.Group {
+export function optimizeModuleMeshHierarchy(
+  root: THREE.Group,
+  mod?: ActiveModule,
+): THREE.Group {
   const dynamicNodes = new Set<THREE.Object3D>();
-  if (root.userData.steerPivot) dynamicNodes.add(root.userData.steerPivot);
-  if (root.userData.rollGroup) dynamicNodes.add(root.userData.rollGroup);
-  if (root.userData.propellerHub) dynamicNodes.add(root.userData.propellerHub);
-  if (root.userData.flameCore) dynamicNodes.add(root.userData.flameCore);
-  if (root.userData.turretPivot) dynamicNodes.add(root.userData.turretPivot);
-  if (root.userData.spinMesh) dynamicNodes.add(root.userData.spinMesh);
-  if (root.userData.hookMesh) dynamicNodes.add(root.userData.hookMesh);
+  const skipForMerge = new Set<THREE.Object3D>();
+
+  const registerDynamic = (node: unknown) => {
+    if (node instanceof THREE.Object3D) {
+      dynamicNodes.add(node);
+      skipForMerge.add(node);
+    }
+  };
+
+  registerDynamic(root.userData.steerPivot);
+  registerDynamic(root.userData.rollGroup);
+  registerDynamic(root.userData.propellerHub);
+  registerDynamic(root.userData.flameCore);
+  registerDynamic(root.userData.turretPivot);
+  registerDynamic(root.userData.spinMesh);
+  registerDynamic(root.userData.hookMesh);
+  registerDynamic(root.userData.winchHookClaw);
+  if (root.userData.nozzleBell instanceof THREE.Object3D) {
+    skipForMerge.add(root.userData.nozzleBell);
+  }
+  if (root.userData.microVoxelMesh instanceof THREE.Object3D) {
+    skipForMerge.add(root.userData.microVoxelMesh);
+  }
+  if (Array.isArray(root.userData.ledMatrixDots)) {
+    for (const dot of root.userData.ledMatrixDots) {
+      if (dot instanceof THREE.Object3D) skipForMerge.add(dot);
+    }
+  }
+  if (mod) {
+    registerDynamic(mod.wheelMesh);
+    registerDynamic(mod.spinMesh);
+    registerDynamic(mod.turretPivot);
+  }
+
+  // Merge static sub-meshes inside animated pivot sub-groups (while preserving nested pivots & propellerHub bladeGroups)
+  for (const dynNode of dynamicNodes) {
+    if (dynNode === root) continue;
+    if (dynNode === root.userData.propellerHub) continue;
+    if (dynNode instanceof THREE.Group) {
+      mergeStaticMeshesInGroup(dynNode, skipForMerge);
+    }
+  }
+
+  // Merge static sub-meshes on root (skipping animated/referenced sub-trees)
+  mergeStaticMeshesInGroup(root, skipForMerge);
 
   root.frustumCulled = true;
 
@@ -439,9 +765,6 @@ export function createDetailedWheelMesh(
   const metalMat = getMachinedMetalMat(0x64748b, 0.35, 0.7, isGhost, isCharred);
   const darkMetalMat = getMachinedMetalMat(0x1e293b, 0.45, 0.6, isGhost, isCharred);
   const springMat = getMachinedMetalMat(rimColor, 0.3, 0.5, isGhost, isCharred);
-  const rubberMat = getMatteRubberMat(isGhost, isCharred);
-  const rimMat = getMachinedMetalMat(rimColor, 0.25, 0.8, isGhost, isCharred);
-  const boltMat = getMachinedMetalMat(0xe2e8f0, 0.15, 0.9, isGhost, isCharred);
 
   // --- Fixed Chassis Mount & Suspension Links (Stay mounted to vehicle body) ---
   const upperMount = new THREE.Mesh(new THREE.BoxGeometry(0.28, 0.1, 0.28), darkMetalMat);
@@ -502,68 +825,21 @@ export function createDetailedWheelMesh(
   rollGroup.name = 'WheelRollGroup';
   rollGroup.position.set(0, 0, 0);
 
-  // 1. Tire Carcass (Tread base cylinder + beveled shoulder rings)
-  const tireGeo = getCachedCylGeo(rad, rad, width * 0.88, 20, 1, false, 'z');
-  const tire = new THREE.Mesh(tireGeo, rubberMat);
-
-  const shoulderGeo = getCachedCylGeo(rad * 0.88, rad * 0.88, width, 20, 1, false, 'z');
-  const shoulder = new THREE.Mesh(shoulderGeo, rubberMat);
-  rollGroup.add(tire, shoulder);
-
-  // 2. Outer-Perimeter Tread Lugs (Placed strictly along the outer tire perimeter ring so they never clip the rim)
-  const lugCount = isRacing || isDrag ? 10 : 12;
-  const lugRadialHeight = isSpiked ? rad * 0.18 : rad * 0.11;
-  const lugCircumWidth = isSpiked ? 0.055 : rad * 0.22;
-  const lugGeo = getCachedBoxGeo(width * 0.92, lugRadialHeight, lugCircumWidth);
-  const lugMat = isSpiked
-    ? getMachinedMetalMat(0x7dd3fc, 0.2, 0.8, isGhost, isCharred)
-    : rubberMat;
-
-  for (let i = 0; i < lugCount; i++) {
-    const angle = (i * 2 * Math.PI) / lugCount;
-    const lug = new THREE.Mesh(lugGeo, lugMat);
-    const lugRadius = rad - lugRadialHeight * 0.25;
-    lug.position.set(0, Math.sin(angle) * lugRadius, Math.cos(angle) * lugRadius);
-    lug.rotation.x = -angle;
-    rollGroup.add(lug);
-  }
-
-  // 3. Recessed Alloy Rim with Beveled Lip & 5 Spoke Webbing (staggered widths prevent Z-fighting)
-  const rimOuterGeo = getCachedCylGeo(rad * 0.62, rad * 0.62, width * 0.94, 16, 1, false, 'z');
-  const rimOuter = new THREE.Mesh(rimOuterGeo, rimMat);
-
-  const rimInnerGeo = getCachedCylGeo(rad * 0.52, rad * 0.52, width * 0.84, 16, 1, false, 'z');
-  const rimInner = new THREE.Mesh(rimInnerGeo, darkMetalMat);
-  rollGroup.add(rimOuter, rimInner);
-
-  // 5 Spoke Bars radiating from hub (width sits cleanly outside rimInner without Z-fighting)
-  const spokeGeo = getCachedBoxGeo(width * 0.98, rad * 0.46, rad * 0.14);
-  for (let s = 0; s < 5; s++) {
-    const sAngle = (s * 2 * Math.PI) / 5;
-    const spoke = new THREE.Mesh(spokeGeo, rimMat);
-    spoke.position.set(0, Math.sin(sAngle) * rad * 0.26, Math.cos(sAngle) * rad * 0.26);
-    spoke.rotation.x = -sAngle;
-    rollGroup.add(spoke);
-  }
-
-  // 4. Central Hubcap & Chrome Lug Bolts
-  const hubcapGeo = getCachedCylGeo(rad * 0.2, rad * 0.2, width + 0.04, 12, 1, false, 'z');
-  const hubcap = new THREE.Mesh(hubcapGeo, metalMat);
-  rollGroup.add(hubcap);
-
-  // Lug Bolts on outboard face
-  const boltFaceX = (width + 0.05) * 0.5 * sideSign;
-  const lugBoltGeo = getCachedCylGeo(0.022, 0.022, 0.04, 6, 1, false, 'z');
-  for (let b = 0; b < 5; b++) {
-    const bAngle = (b * (2 * Math.PI)) / 5;
-    const bolt = new THREE.Mesh(lugBoltGeo, boltMat);
-    bolt.position.set(
-      boltFaceX,
-      Math.sin(bAngle) * rad * 0.13,
-      Math.cos(bAngle) * rad * 0.13,
-    );
-    rollGroup.add(bolt);
-  }
+  // High-detail 1px (0.0625m) greedy-meshed micro-voxel wheel (tread lugs, sidewalls, recessed alloy rim, 5 spokes & chrome hubcap in 1 draw call!)
+  const wheelRollGeo = getMicroVoxelWheelRollGeometry(
+    k,
+    rad,
+    width,
+    rimColor,
+    isSpiked,
+  );
+  const wheelRollMesh = new THREE.Mesh(
+    wheelRollGeo,
+    getMicroVoxelBlockMaterial(isGhost, isCharred),
+  );
+  wheelRollMesh.name = `MicroVoxelWheel_${k}`;
+  wheelRollMesh.userData.isMicroVoxelBody = true;
+  rollGroup.add(wheelRollMesh);
 
   steerPivot.add(rollGroup);
   root.add(steerPivot);
@@ -576,7 +852,7 @@ export function createDetailedWheelMesh(
     mod.wheelMesh = steerPivot;
   }
 
-  return optimizeModuleMeshHierarchy(root);
+  return optimizeModuleMeshHierarchy(root, mod);
 }
 
 /**
@@ -594,93 +870,48 @@ export function createDetailedThrusterMesh(
   const root = new THREE.Group();
   root.name = `Thruster_${mod.kind}`;
 
-  const k = mod.kind;
+  const k = mod.kind as 'THRUSTER' | 'THRUSTER_MINI' | 'THRUSTER_ROCKET' | 'JET_RAW' | 'JET_GIMBAL';
   const isMini = k === 'THRUSTER_MINI';
   const isRaw = k === 'JET_RAW';
   const isRocket = k === 'THRUSTER_ROCKET';
   const isGimbal = k === 'JET_GIMBAL';
-
-  const scale = isMini ? 0.65 : isRaw ? 1.25 : isRocket ? 1.15 : 1.0;
-  const casingCol = isRaw ? 0xf97316 : isRocket ? 0xdc2626 : isGimbal ? 0x0d9488 : 0x0284c7;
-  const emissiveColor = 0xff6600; // Dedicated rocket glow emissive core
-
-  const metalMat = getMachinedMetalMat(casingCol, 0.35, 0.7, isGhost, isCharred);
-  const heatShieldMat = getMachinedMetalMat(0x1e293b, 0.45, 0.6, isGhost, isCharred);
-  const nozzleMat = getMachinedMetalMat(0x334155, 0.3, 0.8, isGhost, isCharred);
-  const glowMat = getEmissiveNeonMat(emissiveColor, 2.0, isGhost, isCharred);
-  const innerChamberMat = getEmissiveNeonMat(0xfacc15, 1.8, isGhost, isCharred);
+  const scale = isMini ? 0.68 : isRaw ? 1.2 : isRocket ? 1.12 : 1.0;
 
   const bodyGroup = new THREE.Group();
-
-  // 1. Multi-tiered Outer Heat-Shield Casing (Hexagonal/12-sided with reinforcement ribs)
-  const casing = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.26 * scale, 0.28 * scale, 0.66 * scale, 12),
-    metalMat,
+  const tpl = getMicroVoxelBlockTemplate(k);
+  const bodyGeo =
+    !isGhost && mod.microDamage?.damagedGeometry
+      ? mod.microDamage.damagedGeometry
+      : tpl.intactGeometry;
+  const microBody = new THREE.Mesh(
+    bodyGeo,
+    getMicroVoxelBlockMaterial(isGhost, isCharred),
   );
+  microBody.name = `MicroVoxel_${k}`;
+  microBody.userData.isMicroVoxelBody = true;
 
-  // Stepped cooling jacket collars & structural mount brackets
-  const ribF = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.3 * scale, 0.3 * scale, 0.08 * scale, 12),
-    heatShieldMat,
-  );
-  ribF.position.y = 0.22 * scale;
-  const ribR = ribF.clone();
-  ribR.position.y = -0.18 * scale;
-
-  // Supersonic intake compression cone (front)
-  const intakeCone = new THREE.Mesh(
-    new THREE.ConeGeometry(0.16 * scale, 0.26 * scale, 10),
-    heatShieldMat,
-  );
-  intakeCone.position.y = 0.38 * scale;
-
-  // 2. Stepped Exhaust Bell Nozzle (Multi-stage divergent rocket bell)
-  const nozzleBell = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.18 * scale, 0.29 * scale, 0.32 * scale, 12, 1, true),
-    nozzleMat,
-  );
-  nozzleBell.position.y = -0.44 * scale;
-
-  const nozzleRim = new THREE.Mesh(
-    new THREE.TorusGeometry(0.29 * scale, 0.025 * scale, 8, 14),
-    heatShieldMat,
-  );
-  nozzleRim.rotation.x = Math.PI / 2;
-  nozzleRim.position.y = -0.58 * scale;
-
-  // 3. Dedicated Emissive Rocket Core (emissive: 0xff6600, emissiveIntensity: 2.0)
-  const emitterCore = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.13 * scale, 0.17 * scale, 0.14 * scale, 10),
-    glowMat,
-  );
-  emitterCore.position.y = -0.42 * scale;
-
-  const deepChamber = new THREE.Mesh(
-    new THREE.SphereGeometry(0.11 * scale, 8, 8),
-    innerChamberMat,
-  );
-  deepChamber.position.y = -0.34 * scale;
-
-  // 4. Dynamic Thruster Flame Trail Mesh (Scales along thrust axis during Shift boost)
+  // Dynamic Thruster Flame Trail Mesh (Scales along thrust axis during Shift boost)
   const flameMesh = new THREE.Mesh(
-    new THREE.ConeGeometry(0.24 * scale, 0.72 * scale, 10),
+    getCachedConeGeo(0.22 * scale, 0.68 * scale, 10),
     getEmissiveNeonMat(0xff7700, 2.4, isGhost, isCharred),
   );
   flameMesh.rotation.x = Math.PI; // Point backwards out of nozzle
-  flameMesh.position.y = -0.84 * scale;
+  flameMesh.position.y = -0.82 * scale;
   flameMesh.scale.set(0.65, 0.55, 0.65); // Default idle plume
   flameMesh.name = 'FlameMesh';
 
-  bodyGroup.add(casing, ribF, ribR, intakeCone, nozzleBell, nozzleRim, emitterCore, deepChamber, flameMesh);
+  bodyGroup.add(microBody, flameMesh);
 
   if (!isGimbal) {
     bodyGroup.rotation.x = Math.PI / 2;
   }
   root.add(bodyGroup);
 
-  // Expose flameMesh on root userData for dynamic boost scaling
+  // Expose flameCore, nozzleBell, and microVoxelMesh for boost scaling & CoW chipping
   root.userData.flameCore = flameMesh;
-  root.userData.nozzleBell = nozzleBell;
+  root.userData.nozzleBell = microBody;
+  root.userData.microVoxelMesh = microBody;
+  root.userData.microVoxelKind = k;
   root.userData.baseScaleY = 0.55;
 
   return root;
@@ -701,43 +932,44 @@ export function createDetailedOutboardMesh(
   const root = new THREE.Group();
   root.name = `MarineOutboard_${mod.kind}`;
 
-  const k = mod.kind;
+  const k = mod.kind as 'BOAT_PROP' | 'BOAT_OUTBOARD' | 'PROP_AERO';
   const isAero = k === 'PROP_AERO';
-  const isOutboard = k === 'BOAT_OUTBOARD';
 
-  const housingCol = isAero ? 0x84cc16 : isOutboard ? 0x0284c7 : 0x06b6d4;
-  const metalMat = getMachinedMetalMat(housingCol, 0.35, 0.65, isGhost, isCharred);
   const darkMetalMat = getMachinedMetalMat(0x1e293b, 0.45, 0.6, isGhost, isCharred);
   const chromeMat = getMachinedMetalMat(0xe2e8f0, 0.15, 0.9, isGhost, isCharred);
   const bladeMat = getMachinedMetalMat(0xfacc15, 0.25, 0.75, isGhost, isCharred);
 
+  // 1px micro-voxel destructible nacelle / outboard motor powerhead & drive shaft
+  const tpl = getMicroVoxelBlockTemplate(k);
+  const bodyGeo =
+    !isGhost && mod.microDamage?.damagedGeometry
+      ? mod.microDamage.damagedGeometry
+      : tpl.intactGeometry;
+  const microBody = new THREE.Mesh(
+    bodyGeo,
+    getMicroVoxelBlockMaterial(isGhost, isCharred),
+  );
+  microBody.name = `MicroVoxel_${k}`;
+  microBody.userData.isMicroVoxelBody = true;
+  root.add(microBody);
+  root.userData.microVoxelMesh = microBody;
+  root.userData.microVoxelKind = k;
+
   if (isAero) {
-    // Aircraft Propeller Nacelle & 3-Blade Aero Rotor
-    const nacelle = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.22, 0.52, 12), metalMat);
-    nacelle.rotation.x = Math.PI / 2;
-    root.add(nacelle);
-
-    const shroud = new THREE.Mesh(
-      new THREE.CylinderGeometry(0.48, 0.48, 0.28, 16, 1, true),
-      metalMat,
-    );
-    shroud.rotation.x = Math.PI / 2;
-    root.add(shroud);
-
     const propHub = new THREE.Group();
     propHub.name = 'PropellerHub';
     propHub.position.z = 0.28;
 
-    const spinner = new THREE.Mesh(new THREE.ConeGeometry(0.12, 0.24, 10), chromeMat);
-    spinner.rotation.x = Math.PI / 2;
+    const spinner = new THREE.Mesh(getCachedConeGeo(0.12, 0.24, 10, 'x'), chromeMat);
     propHub.add(spinner);
 
     // 3 curved aero blades spaced at 120 degrees
+    const aeroBladeGeo = getCachedBoxGeo(0.1, 0.94, 0.035);
     for (let i = 0; i < 3; i++) {
       const angle = (i * 2 * Math.PI) / 3;
-      const blade = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.94, 0.035), bladeMat);
+      const blade = new THREE.Mesh(aeroBladeGeo, bladeMat);
       blade.rotation.z = angle;
-      blade.rotation.y = 0.22; // Pitch angle
+      blade.rotation.y = 0.22;
       propHub.add(blade);
     }
     root.add(propHub);
@@ -746,62 +978,27 @@ export function createDetailedOutboardMesh(
     return root;
   }
 
-  // --- Marine Outboard Motor Assembly ---
-  // 1. Upper Cowling / Powerhead
-  const cowling = new THREE.Mesh(new THREE.BoxGeometry(0.38, 0.34, 0.52), metalMat);
-  cowling.position.set(0, 0.24, -0.06);
-  const cowlCap = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.2, 0.48, 10), darkMetalMat);
-  cowlCap.rotation.x = Math.PI / 2;
-  cowlCap.position.set(0, 0.38, -0.06);
-  root.add(cowling, cowlCap);
-
-  // 2. Streamlined Vertical Drive Shaft Housing (Vertical pylon/leg)
-  const driveShaftHousing = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.48, 0.28), darkMetalMat);
-  driveShaftHousing.position.set(0, -0.12, -0.04);
-  root.add(driveShaftHousing);
-
-  // 3. Anti-Cavitation Plate (Horizontal planar foil above propeller)
-  const antiCavPlate = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.04, 0.38), metalMat);
-  antiCavPlate.position.set(0, -0.32, -0.02);
-  root.add(antiCavPlate);
-
-  // 4. Aerodynamic Torpedo Gear-Case Bulb (Bullet-shaped housing for prop shaft)
-  const torpedoBulb = new THREE.Mesh(new THREE.CylinderGeometry(0.11, 0.12, 0.48, 12), metalMat);
-  torpedoBulb.rotation.x = Math.PI / 2;
-  torpedoBulb.position.set(0, -0.42, -0.02);
-  const torpedoCone = new THREE.Mesh(new THREE.ConeGeometry(0.11, 0.18, 10), chromeMat);
-  torpedoCone.rotation.x = -Math.PI / 2;
-  torpedoCone.position.set(0, -0.42, 0.26);
-
-  // Skeg fin under torpedo for rudder stability & protection
-  const skeg = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.18, 0.24), darkMetalMat);
-  skeg.position.set(0, -0.52, -0.04);
-  root.add(torpedoBulb, torpedoCone, skeg);
-
-  // 5. Isolated Sub-Mesh: `propellerHub` with 3 Angled, Curved Blades
+  // Isolated Sub-Mesh: `propellerHub` with 3 Angled, Curved Blades
   const propellerHub = new THREE.Group();
   propellerHub.name = 'PropellerHub';
   propellerHub.position.set(0, -0.42, -0.28);
 
-  const propNose = new THREE.Mesh(new THREE.ConeGeometry(0.08, 0.14, 8), chromeMat);
-  propNose.rotation.x = Math.PI / 2;
+  const propNose = new THREE.Mesh(getCachedConeGeo(0.08, 0.14, 8, 'x'), chromeMat);
   propellerHub.add(propNose);
 
-  const propCenter = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.08, 0.1, 8), darkMetalMat);
-  propCenter.rotation.x = Math.PI / 2;
+  const propCenter = new THREE.Mesh(getCachedCylGeo(0.08, 0.08, 0.1, 8, 1, false, 'x'), darkMetalMat);
   propellerHub.add(propCenter);
 
-  // 3 Angled, Curved Blades spaced symmetrically at 120° (2*PI/3)
+  const hydroBladeGeo = getCachedBoxGeo(0.09, 0.28, 0.03);
   for (let b = 0; b < 3; b++) {
     const angle = (b * 2 * Math.PI) / 3;
     const bladeGroup = new THREE.Group();
     bladeGroup.rotation.z = angle;
 
-    // Curved hydro-foil blade
-    const blade = new THREE.Mesh(new THREE.BoxGeometry(0.09, 0.28, 0.03), bladeMat);
+    const blade = new THREE.Mesh(hydroBladeGeo, bladeMat);
     blade.position.y = 0.16;
-    blade.rotation.x = 0.38; // Hydro-pitch twist
-    blade.rotation.y = 0.12; // Cupped curve
+    blade.rotation.x = 0.38;
+    blade.rotation.y = 0.12;
     bladeGroup.add(blade);
 
     propellerHub.add(bladeGroup);
@@ -831,76 +1028,29 @@ export function createDetailedCockpitMesh(
   const root = new THREE.Group();
   root.name = `Cockpit_${mod.kind}`;
 
-  const k = mod.kind;
+  const k = mod.kind as MicroVoxelBlockKind;
   const isMoto = k === 'SEAT_MOTO';
-  const isArmored = k === 'SEAT_ARMORED';
   const w = isMoto ? 0.46 : 0.76;
 
-  const seatColor = isMoto ? 0xf97316 : isArmored ? 0x475569 : 0x0284c7;
-  const metalMat = getMachinedMetalMat(0x334155, 0.35, 0.7, isGhost, isCharred);
-  const darkMetalMat = getMachinedMetalMat(0x0f172a, 0.45, 0.6, isGhost, isCharred);
-  const seatMat = getMachinedMetalMat(seatColor, 0.75, 0.15, isGhost, isCharred);
-  const chromeMat = getMachinedMetalMat(0xe2e8f0, 0.15, 0.9, isGhost, isCharred);
-  const displayMat = getEmissiveNeonMat(0x38bdf8, 2.0, isGhost, isCharred);
-  const glassMat = getCockpitGlassMat(0x38bdf8, 0.6, isGhost);
+  // 1px micro-voxel sculpted bucket seat, bolsters, dashboard, steering & roll-cage
+  const tpl = getMicroVoxelBlockTemplate(k);
+  const bodyGeo =
+    !isGhost && mod.microDamage?.damagedGeometry
+      ? mod.microDamage.damagedGeometry
+      : tpl.intactGeometry;
+  const microBody = new THREE.Mesh(
+    bodyGeo,
+    getMicroVoxelBlockMaterial(isGhost, isCharred),
+  );
+  microBody.name = `MicroVoxel_${k}`;
+  microBody.userData.isMicroVoxelBody = true;
+  root.add(microBody);
 
-  // 1. Lower Floor Rails & Slider Mount
-  const floorRails = new THREE.Mesh(new THREE.BoxGeometry(w * 0.92, 0.08, 0.78), darkMetalMat);
-  floorRails.position.y = -0.12;
-  root.add(floorRails);
-
-  // 2. Ergonomic Racing Bucket Seat with Bolsters & Headrest
-  const seatCushion = new THREE.Mesh(new THREE.BoxGeometry(w * 0.88, 0.16, 0.68), seatMat);
-  seatCushion.position.set(0, -0.02, 0.02);
-
-  const seatBack = new THREE.Mesh(new THREE.BoxGeometry(w * 0.84, 0.62, 0.14), seatMat);
-  seatBack.position.set(0, 0.3, -0.28);
-  seatBack.rotation.x = -0.14;
-
-  const headrest = new THREE.Mesh(new THREE.BoxGeometry(w * 0.58, 0.2, 0.12), darkMetalMat);
-  headrest.position.set(0, 0.66, -0.34);
-
-  root.add(seatCushion, seatBack, headrest);
-
-  // 3. Side Bolsters & Tubular Roll-Cage Struts
-  const bolsterL = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.34, 0.64), darkMetalMat);
-  bolsterL.position.set(-w * 0.46, 0.14, 0.02);
-  const bolsterR = bolsterL.clone();
-  bolsterR.position.x = w * 0.46;
-  root.add(bolsterL, bolsterR);
-
-  // Tubular Roll-Cage Exo-Structure (A-pillars, B-pillars & Crossbar)
-  const cageGroup = new THREE.Group();
-  const tubeMat = getMachinedMetalMat(0x1e293b, 0.35, 0.8, isGhost, isCharred);
-
-  // Left & Right Front A-Pillars (Angled tubular struts)
-  for (const side of [-1, 1]) {
-    const aPillar = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.035, 0.72, 8), tubeMat);
-    aPillar.position.set(side * w * 0.48, 0.38, 0.22);
-    aPillar.rotation.x = -0.38;
-    cageGroup.add(aPillar);
-
-    const bPillar = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.035, 0.68, 8), tubeMat);
-    bPillar.position.set(side * w * 0.48, 0.42, -0.32);
-    cageGroup.add(bPillar);
-
-    const roofRail = new THREE.Mesh(new THREE.CylinderGeometry(0.032, 0.032, 0.58, 8), tubeMat);
-    roofRail.position.set(side * w * 0.48, 0.72, -0.05);
-    roofRail.rotation.x = Math.PI / 2;
-    cageGroup.add(roofRail);
-  }
-
-  // Roof Cross-Brace
-  const roofCross = new THREE.Mesh(new THREE.CylinderGeometry(0.032, 0.032, w * 0.96, 8), tubeMat);
-  roofCross.position.set(0, 0.72, -0.05);
-  roofCross.rotation.z = Math.PI / 2;
-  cageGroup.add(roofCross);
-  root.add(cageGroup);
-
-  // 4. Tinted Windshield Glass Element
+  // Translucent tinted windshield glass panel for enclosed cockpits/seats
   if (!isMoto) {
+    const glassMat = getCockpitGlassMat(0x38bdf8, 0.6, isGhost);
     const windshield = new THREE.Mesh(
-      new THREE.BoxGeometry(w * 0.96, 0.44, 0.04),
+      getCachedBoxGeo(w * 0.94, 0.42, 0.04),
       glassMat,
     );
     windshield.position.set(0, 0.48, 0.22);
@@ -909,30 +1059,8 @@ export function createDetailedCockpitMesh(
     root.add(windshield);
   }
 
-  // 5. Dashboard Console, Digital Telemetry Screen & Steering Wheel
-  const dashConsole = new THREE.Mesh(new THREE.BoxGeometry(w * 0.72, 0.18, 0.24), darkMetalMat);
-  dashConsole.position.set(0, 0.26, 0.28);
-  dashConsole.rotation.x = -0.35;
-
-  const mfdScreen = new THREE.Mesh(new THREE.BoxGeometry(w * 0.52, 0.12, 0.04), displayMat);
-  mfdScreen.position.set(0, 0.32, 0.29);
-  mfdScreen.rotation.x = -0.35;
-  root.add(dashConsole, mfdScreen);
-
-  if (isMoto) {
-    // Motocross Handlebars & Handgrips
-    const handlebar = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.03, 0.72, 8), chromeMat);
-    handlebar.rotation.z = Math.PI / 2;
-    handlebar.position.set(0, 0.42, 0.24);
-    root.add(handlebar);
-  } else {
-    // Sport Steering Wheel
-    const wheelRim = new THREE.Mesh(new THREE.TorusGeometry(0.12, 0.024, 8, 16), metalMat);
-    wheelRim.rotation.x = Math.PI / 2 - 0.45;
-    wheelRim.position.set(0, 0.36, 0.18);
-    root.add(wheelRim);
-  }
-
+  root.userData.microVoxelMesh = microBody;
+  root.userData.microVoxelKind = k;
   return root;
 }
 
@@ -972,12 +1100,12 @@ export function createDetailedModuleMesh(
     k === 'JET_RAW' ||
     k === 'JET_GIMBAL'
   ) {
-    return optimizeModuleMeshHierarchy(createDetailedThrusterMesh(mod, isGhost, isCharred));
+    return optimizeModuleMeshHierarchy(createDetailedThrusterMesh(mod, isGhost, isCharred), mod);
   }
 
   // 3. Outboard Marine Motors & Propellers
   if (k === 'BOAT_PROP' || k === 'BOAT_OUTBOARD' || k === 'PROP_AERO') {
-    return optimizeModuleMeshHierarchy(createDetailedOutboardMesh(mod, isGhost, isCharred));
+    return optimizeModuleMeshHierarchy(createDetailedOutboardMesh(mod, isGhost, isCharred), mod);
   }
 
   // 4. Cockpits, Seats & Roll-Cages
@@ -991,7 +1119,7 @@ export function createDetailedModuleMesh(
     k === 'SEAT_SPACE' ||
     k === 'SEAT_SHIP_WHEEL'
   ) {
-    return optimizeModuleMeshHierarchy(createDetailedCockpitMesh(mod, isGhost, isCharred));
+    return optimizeModuleMeshHierarchy(createDetailedCockpitMesh(mod, isGhost, isCharred), mod);
   }
 
   // For other specialized parts, build cleanly structured stylized low-poly components:
@@ -1007,215 +1135,200 @@ export function createDetailedModuleMesh(
     k === 'ENGINE_BULLDAWG' ||
     k === 'ENGINE_DRAGON'
   ) {
-    const col =
-      k === 'ENGINE_BULLDAWG'
-        ? 0xf97316
-        : k === 'ENGINE_DRAGON'
-          ? 0xef4444
-          : 0xe11d48;
-    const scale = k === 'ENGINE_DRAGON' ? 1.15 : k === 'ENGINE_BULLDAWG' ? 0.9 : 1.0;
-
-    const sump = new THREE.Mesh(new THREE.BoxGeometry(0.62 * scale, 0.18 * scale, 0.86 * scale), makeMat(0x1e293b));
-    sump.position.y = -0.22 * scale;
-
-    const block = new THREE.Mesh(new THREE.BoxGeometry(0.68 * scale, 0.44 * scale, 0.82 * scale), makeMat(col));
-
-    // Angled V-8 Cylinder Banks & Chrome Valve Covers
-    for (const s of [-1, 1]) {
-      const bank = new THREE.Mesh(new THREE.BoxGeometry(0.28 * scale, 0.32 * scale, 0.78 * scale), makeMat(0x334155));
-      bank.position.set(s * 0.24 * scale, 0.18 * scale, 0);
-      bank.rotation.z = -s * 0.42;
-
-      const cover = new THREE.Mesh(new THREE.BoxGeometry(0.18 * scale, 0.08 * scale, 0.74 * scale), makeMat(0xe2e8f0));
-      cover.position.set(s * 0.31 * scale, 0.31 * scale, 0);
-      cover.rotation.z = -s * 0.42;
-
-      const header = new THREE.Mesh(new THREE.CylinderGeometry(0.055 * scale, 0.055 * scale, 0.86 * scale, 8), makeMat(0x94a3b8));
-      header.rotation.x = Math.PI / 2;
-      header.position.set(s * 0.38 * scale, 0.08 * scale, -0.04 * scale);
-
-      root.add(bank, cover, header);
-    }
-
-    const blower = new THREE.Mesh(new THREE.BoxGeometry(0.38 * scale, 0.22 * scale, 0.56 * scale), makeMat(0xcbd5e1));
-    blower.position.y = 0.32 * scale;
-    const scoop = new THREE.Mesh(new THREE.BoxGeometry(0.32 * scale, 0.14 * scale, 0.38 * scale), makeMat(0xfacc15));
-    scoop.position.set(0, 0.46 * scale, 0.08 * scale);
-    const intakeMouth = new THREE.Mesh(
-      new THREE.BoxGeometry(0.26 * scale, 0.09 * scale, 0.06 * scale),
-      makeGlowMat(k === 'ENGINE_DRAGON' ? 0xff6600 : 0x38bdf8),
+    const tpl = getMicroVoxelBlockTemplate(k);
+    const bodyGeo =
+      !isGhost && mod.microDamage?.damagedGeometry
+        ? mod.microDamage.damagedGeometry
+        : tpl.intactGeometry;
+    const microBody = new THREE.Mesh(
+      bodyGeo,
+      getMicroVoxelBlockMaterial(isGhost, isCharred),
     );
-    intakeMouth.position.set(0, 0.46 * scale, 0.26 * scale);
-
-    const pulley = new THREE.Mesh(new THREE.CylinderGeometry(0.14 * scale, 0.14 * scale, 0.08 * scale, 10), makeMat(0xfacc15));
-    pulley.rotation.x = Math.PI / 2;
-    pulley.position.set(0, -0.02 * scale, 0.44 * scale);
-
-    root.add(sump, block, blower, scoop, intakeMouth, pulley);
+    microBody.name = `MicroVoxel_${k}`;
+    microBody.userData.isMicroVoxelBody = true;
+    root.add(microBody);
+    root.userData.microVoxelMesh = microBody;
+    root.userData.microVoxelKind = k;
   } else if (k === 'PLASMA_CANNON') {
     const turretBase = new THREE.Mesh(getCachedCylGeo(0.36, 0.4, 0.14, 14), makeMat(0x1e293b));
     turretBase.position.y = -0.18;
-    const bearingRing = new THREE.Mesh(getCachedTorusGeo(0.32, 0.03, 8, 16), makeMat(0x64748b));
-    bearingRing.rotation.x = Math.PI / 2;
-    bearingRing.position.y = -0.1;
-    root.add(turretBase, bearingRing);
+    root.add(turretBase);
 
     const turretPivot = new THREE.Group();
     turretPivot.name = 'TurretPivot';
     turretPivot.position.y = 0.04;
 
-    const mount = new THREE.Mesh(getCachedBoxGeo(0.58, 0.34, 0.68), makeMat(0xbe123c));
-    const shieldTop = new THREE.Mesh(getCachedBoxGeo(0.5, 0.08, 0.56), makeMat(0x1e293b));
-    shieldTop.position.y = 0.2;
-    turretPivot.add(mount, shieldTop);
+    const tpl = getMicroVoxelBlockTemplate('PLASMA_CANNON');
+    const bodyGeo =
+      !isGhost && mod.microDamage?.damagedGeometry
+        ? mod.microDamage.damagedGeometry
+        : tpl.intactGeometry;
+    const microBody = new THREE.Mesh(
+      bodyGeo,
+      getMicroVoxelBlockMaterial(isGhost, isCharred),
+    );
+    microBody.name = 'MicroVoxel_PLASMA_CANNON';
+    microBody.userData.isMicroVoxelBody = true;
+    turretPivot.add(microBody);
 
-    for (const s of [-1, 1]) {
-      const coil = new THREE.Mesh(getCachedBoxGeo(0.08, 0.18, 0.58), makeGlowMat(0x38bdf8, 2.4));
-      coil.position.set(s * 0.3, 0.02, 0.04);
-      turretPivot.add(coil);
-    }
-
-    const barrel = new THREE.Mesh(getCachedCylGeo(0.11, 0.14, 1.18, 12, 1, false, 'x'), makeMat(0x334155));
-    barrel.position.set(0, 0.02, 0.62);
-
-    const coolingShroud = new THREE.Mesh(getCachedCylGeo(0.155, 0.155, 0.52, 12, 1, false, 'x'), makeMat(0x1e293b));
-    coolingShroud.position.set(0, 0.02, 0.48);
-
-    const muzzleBrake = new THREE.Mesh(getCachedCylGeo(0.14, 0.12, 0.18, 12, 1, false, 'x'), makeMat(0x64748b));
-    muzzleBrake.position.set(0, 0.02, 1.14);
-
-    const muzzleCore = new THREE.Mesh(getCachedCylGeo(0.085, 0.085, 0.2, 10, 1, false, 'x'), makeGlowMat(0x38bdf8, 2.8));
-    muzzleCore.position.set(0, 0.02, 1.18);
-
-    turretPivot.add(barrel, coolingShroud, muzzleBrake, muzzleCore);
     root.add(turretPivot);
     root.userData.turretPivot = turretPivot;
+    root.userData.microVoxelMesh = microBody;
+    root.userData.microVoxelKind = 'PLASMA_CANNON';
     if (!isGhost) mod.spinMesh = turretPivot;
   } else if (k === 'HEADLIGHT') {
-    const bracket = new THREE.Mesh(new THREE.BoxGeometry(0.34, 0.1, 0.28), makeMat(0x1e293b));
-    bracket.position.y = -0.18;
-    const housing = new THREE.Mesh(new THREE.CylinderGeometry(0.24, 0.2, 0.28, 12), makeMat(0x334155));
-    housing.rotation.x = Math.PI / 2;
-    const rim = new THREE.Mesh(new THREE.CylinderGeometry(0.25, 0.25, 0.06, 12), makeMat(0xfacc15));
-    rim.rotation.x = Math.PI / 2;
-    rim.position.z = 0.12;
-    const lens = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.22, 0.04, 12), makeGlowMat(0xffedd5, 2.8));
-    lens.rotation.x = Math.PI / 2;
-    lens.position.z = 0.15;
-    root.add(bracket, housing, rim, lens);
+    const tpl = getMicroVoxelBlockTemplate('HEADLIGHT');
+    const bodyGeo =
+      !isGhost && mod.microDamage?.damagedGeometry
+        ? mod.microDamage.damagedGeometry
+        : tpl.intactGeometry;
+    const microBody = new THREE.Mesh(
+      bodyGeo,
+      getMicroVoxelBlockMaterial(isGhost, isCharred),
+    );
+    microBody.name = 'MicroVoxel_HEADLIGHT';
+    microBody.userData.isMicroVoxelBody = true;
+    root.add(microBody);
+    root.userData.microVoxelMesh = microBody;
+    root.userData.microVoxelKind = 'HEADLIGHT';
   } else if (
     k === 'AERO_WING' ||
     k === 'WING_STANDARD' ||
     k === 'SPOILER' ||
     k === 'TAILFIN' ||
     k === 'TAILFIN_POWERED' ||
-    k === 'AERO_BLADE'
+    k === 'AERO_BLADE' ||
+    k === 'SUSPENSION' ||
+    k === 'STEERING_HINGE' ||
+    k === 'SKI_SLIDER' ||
+    k === 'WEAPON_MELEE' ||
+    k === 'PONTOON_LARGE' ||
+    k === 'BCD_TANK' ||
+    k === 'WEIGHT_BLOCK' ||
+    k === 'HINGE_LARGE' ||
+    k === 'HINGE_TRAILER' ||
+    k === 'JOINT_MECH' ||
+    k === 'DETACHABLE_BLOCK' ||
+    k === 'SENSOR_DISTANCE' ||
+    k === 'SENSOR_SPEED' ||
+    k === 'SENSOR_ALTIMETER' ||
+    k === 'SENSOR_ANGLE' ||
+    k === 'SENSOR_POSITION' ||
+    k === 'SENSOR_IMU_TILT' ||
+    k === 'SENSOR_SPEEDO' ||
+    k === 'LOGIC_GATE' ||
+    k === 'RADIO_TRX'
   ) {
-    const isTail = k === 'TAILFIN' || k === 'TAILFIN_POWERED';
-    const isSpoiler = k === 'SPOILER';
-    const wingColor = isTail ? 0x0284c7 : isSpoiler ? 0x1e293b : 0x0284c7;
-
-    const baseMount = new THREE.Mesh(new THREE.BoxGeometry(0.24, 0.12, 0.82), makeMat(0x1e293b));
-    root.add(baseMount);
-
-    if (isSpoiler) {
-      for (const sx of [-0.44, 0.44]) {
-        const riser = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.36, 0.14), makeMat(0x94a3b8));
-        riser.position.set(sx, 0.2, 0);
-        root.add(riser);
-      }
-      const foil = new THREE.Mesh(new THREE.BoxGeometry(1.22, 0.06, 0.38), makeMat(0x0f172a));
-      foil.position.set(0, 0.38, 0);
-      foil.rotation.x = -0.12;
-      root.add(foil);
-    } else if (isTail) {
-      const fin = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.94, 0.82), makeMat(wingColor));
-      fin.position.set(0, 0.48, -0.1);
-      fin.rotation.x = -0.22;
-      root.add(fin);
-    } else {
-      // Main Airfoil Blade with swept wingtip winglet
-      const foil = new THREE.Mesh(new THREE.BoxGeometry(1.28, 0.08, 0.62), makeMat(wingColor));
-      foil.position.set(0, 0.06, 0);
-      const winglet = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.32, 0.38), makeMat(0xfacc15));
-      winglet.position.set(0.64, 0.18, -0.06);
-      root.add(foil, winglet);
-    }
+    // Part 3: Full 1px (0.0625m) greedy-meshed micro-voxel destructible module body
+    const tpl = getMicroVoxelBlockTemplate(k as MicroVoxelBlockKind);
+    const bodyGeo =
+      !isGhost && mod.microDamage?.damagedGeometry
+        ? mod.microDamage.damagedGeometry
+        : tpl.intactGeometry;
+    const microBody = new THREE.Mesh(
+      bodyGeo,
+      getMicroVoxelBlockMaterial(isGhost, isCharred),
+    );
+    microBody.name = `MicroVoxel_${k}`;
+    microBody.userData.isMicroVoxelBody = true;
+    root.add(microBody);
+    root.userData.microVoxelMesh = microBody;
+    root.userData.microVoxelKind = k;
   } else if (k === 'VTOL_ROTOR') {
-    const mast = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.1, 0.54, 10), makeMat(0x334155));
-    mast.position.y = 0.22;
+    const tpl = getMicroVoxelBlockTemplate('VTOL_ROTOR');
+    const bodyGeo =
+      !isGhost && mod.microDamage?.damagedGeometry
+        ? mod.microDamage.damagedGeometry
+        : tpl.intactGeometry;
+    const microBody = new THREE.Mesh(
+      bodyGeo,
+      getMicroVoxelBlockMaterial(isGhost, isCharred),
+    );
+    microBody.name = 'MicroVoxel_VTOL_ROTOR';
+    microBody.userData.isMicroVoxelBody = true;
+    root.add(microBody);
+    root.userData.microVoxelMesh = microBody;
+    root.userData.microVoxelKind = 'VTOL_ROTOR';
+
     const rotorHead = new THREE.Group();
     rotorHead.position.y = 0.48;
-
-    const hub = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.18, 0.1, 10), makeMat(0x0f172a));
+    const hub = new THREE.Mesh(getCachedCylGeo(0.18, 0.18, 0.1, 10), makeMat(0x0f172a));
     rotorHead.add(hub);
-
+    const bladeGeo = getCachedBoxGeo(1.64, 0.04, 0.14);
     for (let b = 0; b < 2; b++) {
-      const ang = (b * Math.PI);
-      const blade = new THREE.Mesh(new THREE.BoxGeometry(1.64, 0.04, 0.14), makeMat(0xfacc15));
-      blade.rotation.y = ang;
+      const blade = new THREE.Mesh(bladeGeo, makeMat(0xfacc15));
+      blade.rotation.y = b * Math.PI;
       rotorHead.add(blade);
     }
-    root.add(mast, rotorHead);
+    root.add(rotorHead);
     root.userData.propellerHub = rotorHead;
     if (!isGhost) mod.spinMesh = rotorHead;
   } else if (k === 'GYRO' || k === 'GYRO_REACTION') {
-    const gyroBase = new THREE.Mesh(new THREE.BoxGeometry(0.68, 0.18, 0.68), makeMat(0x1e293b));
-    gyroBase.position.y = -0.22;
-    const ring = new THREE.Mesh(new THREE.TorusGeometry(0.32, 0.04, 8, 16), makeMat(0x94a3b8));
-    const core = new THREE.Mesh(new THREE.SphereGeometry(0.18, 10, 10), makeGlowMat(0x38bdf8, 2.2));
-    root.add(gyroBase, ring, core);
+    const tpl = getMicroVoxelBlockTemplate(k);
+    const bodyGeo =
+      !isGhost && mod.microDamage?.damagedGeometry
+        ? mod.microDamage.damagedGeometry
+        : tpl.intactGeometry;
+    const microBody = new THREE.Mesh(
+      bodyGeo,
+      getMicroVoxelBlockMaterial(isGhost, isCharred),
+    );
+    microBody.name = `MicroVoxel_${k}`;
+    microBody.userData.isMicroVoxelBody = true;
+    root.add(microBody);
+    root.userData.microVoxelMesh = microBody;
+    root.userData.microVoxelKind = k;
+
+    const ring = new THREE.Mesh(getCachedTorusGeo(0.3, 0.036, 8, 14), makeMat(0x94a3b8));
+    const core = new THREE.Mesh(getCachedSphereGeo(0.14, 10, 10), makeGlowMat(0x38bdf8, 2.2));
+    root.add(ring, core);
     if (!isGhost) mod.spinMesh = ring;
-  } else if (k === 'SUSPENSION') {
-    const topMount = new THREE.Mesh(new THREE.BoxGeometry(0.32, 0.12, 0.32), makeMat(0x1e293b));
-    topMount.position.y = 0.28;
-    const damperShaft = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.06, 0.62, 8), makeMat(0xe2e8f0));
-    const springCoil = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.12, 0.44, 8), makeMat(0xf97316));
-    springCoil.position.y = 0.04;
-    root.add(topMount, damperShaft, springCoil);
-  } else if (k === 'STEERING_HINGE') {
-    const lowerPlate = new THREE.Mesh(new THREE.BoxGeometry(0.38, 0.1, 0.38), makeMat(0x1e293b));
-    lowerPlate.position.y = -0.22;
-    const pin = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.08, 0.48, 8), makeMat(0xe2e8f0));
-    const upperYoke = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.16, 0.42), makeMat(0x3b82f6));
-    upperYoke.position.y = 0.16;
-    root.add(lowerPlate, pin, upperYoke);
   } else if (k === 'PISTON') {
-    const outerTube = new THREE.Mesh(new THREE.CylinderGeometry(0.2, 0.22, 0.5, 10), makeMat(0xf97316));
-    const rod = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.1, 0.65, 8), makeMat(0xe2e8f0));
+    const tpl = getMicroVoxelBlockTemplate('PISTON');
+    const bodyGeo =
+      !isGhost && mod.microDamage?.damagedGeometry
+        ? mod.microDamage.damagedGeometry
+        : tpl.intactGeometry;
+    const microBody = new THREE.Mesh(
+      bodyGeo,
+      getMicroVoxelBlockMaterial(isGhost, isCharred),
+    );
+    microBody.name = 'MicroVoxel_PISTON';
+    microBody.userData.isMicroVoxelBody = true;
+    root.add(microBody);
+    root.userData.microVoxelMesh = microBody;
+    root.userData.microVoxelKind = 'PISTON';
+
+    const rod = new THREE.Mesh(getCachedCylGeo(0.09, 0.09, 0.62, 8), makeMat(0xe2e8f0));
     rod.position.y = -0.26;
-    const footPad = new THREE.Mesh(new THREE.BoxGeometry(0.44, 0.09, 0.44), makeMat(0x334155));
+    const footPad = new THREE.Mesh(getCachedBoxGeo(0.42, 0.09, 0.42), makeMat(0x334155));
     footPad.position.y = -0.58;
     const innerRam = new THREE.Group();
     innerRam.add(rod, footPad);
-    root.add(outerTube, innerRam);
+    root.add(innerRam);
     if (!isGhost) mod.spinMesh = innerRam;
   } else if (k === 'GRAPPLING_WINCH') {
-    const basePlate = new THREE.Mesh(getCachedBoxGeo(0.56, 0.1, 0.54), makeMat(0x0f172a));
-    basePlate.position.y = -0.2;
-    root.add(basePlate);
-
-    for (const sx of [-0.22, 0.22]) {
-      const cheekPlate = new THREE.Mesh(getCachedBoxGeo(0.07, 0.38, 0.48), makeMat(0x1e293b));
-      cheekPlate.position.set(sx, 0, 0);
-      root.add(cheekPlate);
-    }
-
-    // Fairlead rollers on front mouth
-    const rollerH = new THREE.Mesh(getCachedCylGeo(0.03, 0.03, 0.38, 8, 1, false, 'z'), makeMat(0xe2e8f0));
-    rollerH.position.set(0, 0.1, 0.24);
-    const rollerB = new THREE.Mesh(getCachedCylGeo(0.03, 0.03, 0.38, 8, 1, false, 'z'), makeMat(0xe2e8f0));
-    rollerB.position.set(0, -0.08, 0.24);
-    root.add(rollerH, rollerB);
+    const tpl = getMicroVoxelBlockTemplate('GRAPPLING_WINCH');
+    const bodyGeo =
+      !isGhost && mod.microDamage?.damagedGeometry
+        ? mod.microDamage.damagedGeometry
+        : tpl.intactGeometry;
+    const microBody = new THREE.Mesh(
+      bodyGeo,
+      getMicroVoxelBlockMaterial(isGhost, isCharred),
+    );
+    microBody.name = 'MicroVoxel_GRAPPLING_WINCH';
+    microBody.userData.isMicroVoxelBody = true;
+    root.add(microBody);
+    root.userData.microVoxelMesh = microBody;
+    root.userData.microVoxelKind = 'GRAPPLING_WINCH';
 
     // Rotating Cable Spool Drum
     const spoolGroup = new THREE.Group();
     spoolGroup.name = 'WinchSpool';
-    const drumCore = new THREE.Mesh(getCachedCylGeo(0.16, 0.16, 0.36, 12, 1, false, 'z'), makeMat(0xfacc15));
-    const cableWrap = new THREE.Mesh(getCachedCylGeo(0.18, 0.18, 0.28, 12, 1, false, 'z'), makeMat(0x64748b));
-    const gearFlange = new THREE.Mesh(getCachedCylGeo(0.2, 0.2, 0.04, 10, 1, false, 'z'), makeMat(0x94a3b8));
-    gearFlange.position.x = 0.16;
-    spoolGroup.add(drumCore, cableWrap, gearFlange);
+    const drumCore = new THREE.Mesh(getCachedCylGeo(0.15, 0.15, 0.34, 12, 1, false, 'z'), makeMat(0xfacc15));
+    const cableWrap = new THREE.Mesh(getCachedCylGeo(0.17, 0.17, 0.26, 12, 1, false, 'z'), makeMat(0x64748b));
+    spoolGroup.add(drumCore, cableWrap);
     root.add(spoolGroup);
 
     // 3-Prong Forged Grapple Hook
@@ -1236,377 +1349,129 @@ export function createDetailedModuleMesh(
     root.userData.winchHookClaw = hookGroup;
     root.userData.spinMesh = spoolGroup;
     if (!isGhost) mod.spinMesh = spoolGroup;
-  } else if (k === 'SKI_SLIDER') {
-    const mount = new THREE.Mesh(getCachedBoxGeo(0.26, 0.1, 0.26), makeMat(0x334155));
-    const strutF = new THREE.Mesh(getCachedBoxGeo(0.1, 0.44, 0.1), makeMat(0x94a3b8));
-    strutF.position.set(0, -0.22, 0.18);
-    strutF.rotation.x = 0.2;
-    const strutR = strutF.clone();
-    strutR.position.z = -0.18;
-    strutR.rotation.x = -0.2;
-    const runner = new THREE.Mesh(getCachedBoxGeo(0.32, 0.07, 1.42), makeMat(0x38bdf8));
-    runner.position.y = -0.45;
-    const keel = new THREE.Mesh(getCachedBoxGeo(0.12, 0.08, 1.24), makeMat(0x0284c7));
-    keel.position.y = -0.41;
-    const tip = new THREE.Mesh(getCachedBoxGeo(0.32, 0.14, 0.34), makeMat(0xfacc15));
-    tip.position.set(0, -0.37, 0.78);
-    tip.rotation.x = -0.48;
-    root.add(mount, strutF, strutR, runner, keel, tip);
   } else if (k === 'WEAPON_MINIGUN') {
-    const baseRing = new THREE.Mesh(getCachedCylGeo(0.32, 0.36, 0.12, 12), makeMat(0x1e293b));
-    baseRing.position.y = -0.2;
-    root.add(baseRing);
-
     const turretPivot = new THREE.Group();
     turretPivot.name = 'TurretPivot';
-    const receiver = new THREE.Mesh(getCachedBoxGeo(0.52, 0.38, 0.58), makeMat(0x334155));
-    const ammoDrum = new THREE.Mesh(getCachedCylGeo(0.19, 0.19, 0.38, 12, 1, false, 'z'), makeMat(0xeab308));
-    ammoDrum.position.set(0, -0.08, -0.1);
+
+    const tpl = getMicroVoxelBlockTemplate('WEAPON_MINIGUN');
+    const bodyGeo =
+      !isGhost && mod.microDamage?.damagedGeometry
+        ? mod.microDamage.damagedGeometry
+        : tpl.intactGeometry;
+    const microBody = new THREE.Mesh(
+      bodyGeo,
+      getMicroVoxelBlockMaterial(isGhost, isCharred),
+    );
+    microBody.name = 'MicroVoxel_WEAPON_MINIGUN';
+    microBody.userData.isMicroVoxelBody = true;
+    turretPivot.add(microBody);
 
     const cluster = new THREE.Group();
     cluster.name = 'GatlingCluster';
-    const clampF = new THREE.Mesh(getCachedCylGeo(0.165, 0.165, 0.1, 12, 1, false, 'x'), makeMat(0x94a3b8));
+    const clampF = new THREE.Mesh(getCachedCylGeo(0.155, 0.155, 0.08, 10, 1, false, 'x'), makeMat(0x94a3b8));
     clampF.position.z = 0.88;
-    const clampM = new THREE.Mesh(getCachedCylGeo(0.165, 0.165, 0.08, 12, 1, false, 'x'), makeMat(0x64748b));
-    clampM.position.z = 0.52;
+    const clampM = new THREE.Mesh(getCachedCylGeo(0.155, 0.155, 0.07, 10, 1, false, 'x'), makeMat(0x64748b));
+    clampM.position.z = 0.54;
     cluster.add(clampF, clampM);
-
-    const barrelGeo = getCachedCylGeo(0.032, 0.032, 1.08, 8, 1, false, 'x');
+    const barrelGeo = getCachedCylGeo(0.028, 0.028, 0.96, 8, 1, false, 'x');
     for (let b = 0; b < 6; b++) {
       const ang = (b * Math.PI * 2) / 6;
       const bMesh = new THREE.Mesh(barrelGeo, makeMat(0xe2e8f0));
-      bMesh.position.set(Math.cos(ang) * 0.095, Math.sin(ang) * 0.095, 0.56);
+      bMesh.position.set(Math.cos(ang) * 0.088, Math.sin(ang) * 0.088, 0.58);
       cluster.add(bMesh);
     }
     cluster.position.y = 0.06;
-    turretPivot.add(receiver, ammoDrum, cluster);
+    turretPivot.add(cluster);
     root.add(turretPivot);
     root.userData.turretPivot = turretPivot;
     root.userData.spinMesh = cluster;
+    root.userData.microVoxelMesh = microBody;
+    root.userData.microVoxelKind = 'WEAPON_MINIGUN';
     if (!isGhost) mod.spinMesh = cluster;
-  } else if (k === 'WEAPON_ROCKET') {
-    const basePedestal = new THREE.Mesh(getCachedCylGeo(0.3, 0.34, 0.12, 12), makeMat(0x1e293b));
-    basePedestal.position.y = -0.2;
-    root.add(basePedestal);
-
+  } else if (k === 'WEAPON_ROCKET' || k === 'WEAPON_BOMB_BAY') {
     const turretPivot = new THREE.Group();
     turretPivot.name = 'TurretPivot';
-    const pod = new THREE.Mesh(getCachedBoxGeo(0.68, 0.48, 0.86), makeMat(0x991b1b));
-    pod.position.y = 0.06;
-    const faceplate = new THREE.Mesh(getCachedBoxGeo(0.64, 0.42, 0.06), makeMat(0x0f172a));
-    faceplate.position.set(0, 0.06, 0.42);
-    const rearVents = new THREE.Mesh(getCachedBoxGeo(0.62, 0.38, 0.06), makeMat(0x334155));
-    rearVents.position.set(0, 0.06, -0.42);
-    turretPivot.add(pod, faceplate, rearVents);
 
-    const tubeGeo = getCachedCylGeo(0.11, 0.11, 0.88, 10, 1, false, 'x');
-    const warheadGeo = getCachedConeGeo(0.095, 0.24, 10, 'x');
-    for (const ox of [-0.16, 0.16]) {
-      for (const oy of [-0.05, 0.17]) {
-        const tube = new THREE.Mesh(tubeGeo, makeMat(0x1e293b));
-        tube.position.set(ox, oy, 0.02);
-        const warhead = new THREE.Mesh(warheadGeo, makeMat(0xfacc15));
-        warhead.position.set(ox, oy, 0.52);
-        turretPivot.add(tube, warhead);
-      }
-    }
+    const tpl = getMicroVoxelBlockTemplate(k);
+    const bodyGeo =
+      !isGhost && mod.microDamage?.damagedGeometry
+        ? mod.microDamage.damagedGeometry
+        : tpl.intactGeometry;
+    const microBody = new THREE.Mesh(
+      bodyGeo,
+      getMicroVoxelBlockMaterial(isGhost, isCharred),
+    );
+    microBody.name = `MicroVoxel_${k}`;
+    microBody.userData.isMicroVoxelBody = true;
+    turretPivot.add(microBody);
+
     root.add(turretPivot);
     root.userData.turretPivot = turretPivot;
-    if (!isGhost) mod.spinMesh = turretPivot;
-  } else if (k === 'WEAPON_BOMB_BAY') {
-    const bay = new THREE.Mesh(getCachedBoxGeo(0.72, 0.24, 0.84), makeMat(0x334155));
-    bay.position.y = 0.1;
-    const stripe = new THREE.Mesh(getCachedBoxGeo(0.74, 0.07, 0.86), makeMat(0xf97316));
-    stripe.position.y = 0.16;
-    const turretPivot = new THREE.Group();
-    turretPivot.name = 'TurretPivot';
-    const bomb = new THREE.Mesh(getCachedCylGeo(0.16, 0.16, 0.62, 12, 1, false, 'x'), makeMat(0x1e293b));
-    bomb.position.y = -0.16;
-    const nose = new THREE.Mesh(getCachedConeGeo(0.16, 0.22, 12, 'x'), makeMat(0xfacc15));
-    nose.position.set(0, -0.16, 0.41);
-    const tailFins = new THREE.Mesh(getCachedBoxGeo(0.38, 0.38, 0.14), makeMat(0xef4444));
-    tailFins.position.set(0, -0.16, -0.28);
-    turretPivot.add(bomb, nose, tailFins);
-    root.add(bay, stripe, turretPivot);
-    root.userData.turretPivot = turretPivot;
-  } else if (k === 'WEAPON_MELEE') {
-    const hilt = new THREE.Mesh(new THREE.BoxGeometry(0.38, 0.34, 0.48), makeMat(0x334155));
-    const bladeBody = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.24, 1.58), makeMat(0x94a3b8));
-    bladeBody.position.z = 0.92;
-    const plasmaEdge = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.3, 1.66), makeGlowMat(0xe879f9, 2.5));
-    plasmaEdge.position.z = 0.95;
-    root.add(hilt, bladeBody, plasmaEdge);
-  } else if (
-    k === 'PONTOON_LARGE' ||
-    (k as string) === 'FLOAT_PONTOON' ||
-    (k as string) === 'HEAVY_PONTOON'
-  ) {
-    // Tapered high-visibility yellow/slate hydrodynamic pontoon hull with top mounting rails
-    const hullMat = makeMat(0xfacc15);
-    const slateMat = makeMat(0x334155);
-    const darkMat = makeMat(0x1e293b);
-
-    // Main central pontoon hull body
-    const hullBody = new THREE.Mesh(new THREE.CylinderGeometry(0.28, 0.28, 0.78, 12), hullMat);
-    hullBody.rotation.x = Math.PI / 2;
-
-    // Tapered hydrodynamic bow cone (front) & stern cone (rear)
-    const bowCone = new THREE.Mesh(new THREE.ConeGeometry(0.28, 0.36, 12), hullMat);
-    bowCone.rotation.x = Math.PI / 2;
-    bowCone.position.z = 0.57;
-
-    const sternCone = new THREE.Mesh(new THREE.CylinderGeometry(0.14, 0.28, 0.24, 12), slateMat);
-    sternCone.rotation.x = Math.PI / 2;
-    sternCone.position.z = -0.51;
-
-    // Keel skeg & side rub-strakes
-    const keel = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.09, 1.02), darkMat);
-    keel.position.y = -0.26;
-    const strakeL = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.06, 0.84), slateMat);
-    strakeL.position.set(-0.27, 0, 0.02);
-    const strakeR = strakeL.clone();
-    strakeR.position.x = 0.27;
-
-    // Top structural mounting rail & cross-cleats
-    const topRail = new THREE.Mesh(new THREE.BoxGeometry(0.32, 0.09, 0.76), slateMat);
-    topRail.position.y = 0.27;
-    for (const cz of [-0.24, 0.24]) {
-      const collar = new THREE.Mesh(new THREE.CylinderGeometry(0.295, 0.295, 0.07, 12), darkMat);
-      collar.rotation.x = Math.PI / 2;
-      collar.position.z = cz;
-      root.add(collar);
-    }
-
-    root.add(hullBody, bowCone, sternCone, keel, strakeL, strakeR, topRail);
-  } else if (k === 'BCD_TANK' || (k as string) === 'BALLAST_TANK') {
-    // Bolted dark-iron submarine ballast tank with pressure valves & water-level gauge
-    const ironMat = makeMat(0x1e293b);
-    const tankMat = makeMat(0x0891b2);
-    const brassMat = makeMat(0xf59e0b);
-    const chromeMat = makeMat(0xe2e8f0);
-
-    // Lower & upper bolted cradle frame
-    const cradleB = new THREE.Mesh(new THREE.BoxGeometry(0.72, 0.1, 0.78), ironMat);
-    cradleB.position.y = -0.24;
-    const cradleT = new THREE.Mesh(new THREE.BoxGeometry(0.68, 0.08, 0.72), ironMat);
-    cradleT.position.y = 0.22;
-
-    // Twin cylindrical high-pressure flood chambers
-    for (const sx of [-0.18, 0.18]) {
-      const chamber = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.16, 0.76, 12), tankMat);
-      chamber.rotation.x = Math.PI / 2;
-      chamber.position.set(sx, 0, 0);
-
-      const capF = new THREE.Mesh(new THREE.SphereGeometry(0.16, 10, 10), ironMat);
-      capF.scale.set(1, 1, 0.55);
-      capF.position.set(sx, 0, 0.38);
-      const capR = capF.clone();
-      capR.position.z = -0.38;
-      root.add(chamber, capF, capR);
-    }
-
-    // Top pressure purge valve wheel & manifold pipe
-    const valveStem = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.04, 0.16, 8), chromeMat);
-    valveStem.position.y = 0.29;
-    const valveWheel = new THREE.Mesh(new THREE.TorusGeometry(0.13, 0.025, 8, 12), brassMat);
-    valveWheel.rotation.x = Math.PI / 2;
-    valveWheel.position.y = 0.36;
-
-    // Illuminated water-level sight gauge strip
-    const gaugeStrip = new THREE.Mesh(
-      new THREE.BoxGeometry(0.14, 0.28, 0.04),
-      makeGlowMat(0x22d3ee, 2.2),
-    );
-    gaugeStrip.position.set(0, 0, 0.41);
-
-    root.add(cradleB, cradleT, valveStem, valveWheel, gaugeStrip);
-  } else if (k === 'WEIGHT_BLOCK' || (k as string) === 'LEAD_WEIGHT') {
-    // Heavy bolted dark-iron lead ballast anvil block with hazard trim & lifting eye
-    const leadMat = makeMat(0x334155);
-    const darkIronMat = makeMat(0x0f172a);
-    const hazardMat = makeMat(0xfacc15);
-    const chromeMat = makeMat(0xe2e8f0);
-
-    const coreBlock = new THREE.Mesh(new THREE.BoxGeometry(0.74, 0.52, 0.74), leadMat);
-    const topPlate = new THREE.Mesh(new THREE.BoxGeometry(0.66, 0.08, 0.66), darkIronMat);
-    topPlate.position.y = 0.28;
-    const botPlate = new THREE.Mesh(new THREE.BoxGeometry(0.78, 0.1, 0.78), darkIronMat);
-    botPlate.position.y = -0.28;
-
-    // Yellow industrial weight hazard bands
-    const bandF = new THREE.Mesh(new THREE.BoxGeometry(0.76, 0.1, 0.04), hazardMat);
-    bandF.position.set(0, -0.1, 0.37);
-    const bandR = bandF.clone();
-    bandR.position.z = -0.37;
-
-    // Corner reinforcement rivets
-    for (const bx of [-0.26, 0.26]) {
-      for (const bz of [-0.26, 0.26]) {
-        const bolt = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.035, 0.62, 6), chromeMat);
-        bolt.position.set(bx, 0, bz);
-        root.add(bolt);
-      }
-    }
-
-    // Top hoist lifting eye-ring
-    const hoistRing = new THREE.Mesh(new THREE.TorusGeometry(0.1, 0.028, 8, 12), chromeMat);
-    hoistRing.position.y = 0.38;
-
-    root.add(coreBlock, topPlate, botPlate, bandF, bandR, hoistRing);
-  } else if (k === 'HINGE_LARGE' || k === 'HINGE_TRAILER' || k === 'JOINT_MECH') {
-    // Articulated mechanical hinge / trailer ball hitch / robotic limb joint
-    const baseMat = makeMat(0x1e293b);
-    const accentColor =
-      k === 'HINGE_LARGE' ? 0xf97316 : k === 'JOINT_MECH' ? 0xa855f7 : 0x94a3b8;
-    const armMat = makeMat(accentColor);
-    const pinMat = makeMat(0xe2e8f0);
-
-    const baseBracket = new THREE.Mesh(new THREE.BoxGeometry(0.54, 0.16, 0.54), baseMat);
-    baseBracket.position.y = -0.24;
-
-    if (k === 'HINGE_TRAILER') {
-      // Tow tongue + polished chrome trailer hitch ball + socket coupler
-      const neck = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.12, 0.24, 10), baseMat);
-      neck.position.y = -0.08;
-      const towBall = new THREE.Mesh(new THREE.SphereGeometry(0.16, 12, 12), pinMat);
-      towBall.position.y = 0.08;
-      const socketHood = new THREE.Mesh(new THREE.CylinderGeometry(0.19, 0.19, 0.18, 12), armMat);
-      socketHood.position.set(0, 0.2, -0.06);
-      root.add(baseBracket, neck, towBall, socketHood);
-    } else {
-      // Twin clevis ears + transverse chrome pivot axle + upper actuator yoke
-      for (const sx of [-0.18, 0.18]) {
-        const ear = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.34, 0.32), baseMat);
-        ear.position.set(sx, -0.05, 0);
-        root.add(ear);
-      }
-      const axlePin = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.09, 0.52, 10), pinMat);
-      axlePin.rotation.z = Math.PI / 2;
-      axlePin.position.y = 0.02;
-
-      const upperArm = new THREE.Mesh(new THREE.BoxGeometry(0.24, 0.32, 0.28), armMat);
-      upperArm.position.y = 0.16;
-      const topFlange = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.1, 0.5), armMat);
-      topFlange.position.y = 0.32;
-      root.add(baseBracket, axlePin, upperArm, topFlange);
-    }
+    root.userData.microVoxelMesh = microBody;
+    root.userData.microVoxelKind = k;
+    if (!isGhost && k === 'WEAPON_ROCKET') mod.spinMesh = turretPivot;
   } else if (k === 'SERVO_SPIN' || k === 'SERVO_SMALL') {
-    // Electric rotary servo motor with ribbed stator housing & splined output turntable
     const isSmall = k === 'SERVO_SMALL';
     const sc = isSmall ? 0.78 : 1.0;
-    const statorMat = makeMat(0x1e293b);
-    const rotorMat = makeMat(isSmall ? 0x34d399 : 0x10b981);
-    const chromeMat = makeMat(0xe2e8f0);
 
-    const baseFlange = new THREE.Mesh(
-      new THREE.BoxGeometry(0.62 * sc, 0.1 * sc, 0.62 * sc),
-      statorMat,
+    const tpl = getMicroVoxelBlockTemplate(k);
+    const bodyGeo =
+      !isGhost && mod.microDamage?.damagedGeometry
+        ? mod.microDamage.damagedGeometry
+        : tpl.intactGeometry;
+    const microBody = new THREE.Mesh(
+      bodyGeo,
+      getMicroVoxelBlockMaterial(isGhost, isCharred),
     );
-    baseFlange.position.y = -0.24 * sc;
-
-    const motorCan = new THREE.Mesh(
-      new THREE.CylinderGeometry(0.26 * sc, 0.26 * sc, 0.36 * sc, 14),
-      statorMat,
-    );
-    motorCan.position.y = -0.04 * sc;
-
-    // Cooling ring ribs
-    for (const ry of [-0.1 * sc, 0.04 * sc]) {
-      const rib = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.285 * sc, 0.285 * sc, 0.045 * sc, 14),
-        makeMat(0x475569),
-      );
-      rib.position.y = ry;
-      root.add(rib);
-    }
+    microBody.name = `MicroVoxel_${k}`;
+    microBody.userData.isMicroVoxelBody = true;
+    root.add(microBody);
+    root.userData.microVoxelMesh = microBody;
+    root.userData.microVoxelKind = k;
 
     const rotorGroup = new THREE.Group();
     rotorGroup.position.y = 0.2 * sc;
     const turntable = new THREE.Mesh(
-      new THREE.CylinderGeometry(0.28 * sc, 0.24 * sc, 0.1 * sc, 14),
-      rotorMat,
+      getCachedCylGeo(0.26 * sc, 0.22 * sc, 0.08 * sc, 12),
+      makeMat(isSmall ? 0x34d399 : 0x10b981),
     );
     const crossKey = new THREE.Mesh(
-      new THREE.BoxGeometry(0.42 * sc, 0.06 * sc, 0.12 * sc),
-      chromeMat,
+      getCachedBoxGeo(0.38 * sc, 0.05 * sc, 0.1 * sc),
+      makeMat(0xe2e8f0),
     );
     crossKey.position.y = 0.05 * sc;
-    const crossKey2 = crossKey.clone();
-    crossKey2.rotation.y = Math.PI / 2;
-    rotorGroup.add(turntable, crossKey, crossKey2);
-
-    const statusLed = new THREE.Mesh(
-      new THREE.BoxGeometry(0.12 * sc, 0.06 * sc, 0.04 * sc),
-      makeGlowMat(0x4ade80, 2.2),
-    );
-    statusLed.position.set(0, -0.04 * sc, 0.27 * sc);
-
-    root.add(baseFlange, motorCan, rotorGroup, statusLed);
+    rotorGroup.add(turntable, crossKey);
+    root.add(rotorGroup);
     if (!isGhost) mod.spinMesh = rotorGroup;
-  } else if (k === 'DETACHABLE_BLOCK') {
-    // Pyrotechnic explosive bolt stage-separation coupler
-    const clampMat = makeMat(0x1e293b);
-    const chargeMat = makeMat(0xdc2626);
-    const hazardMat = makeMat(0xfacc15);
-
-    const lowerJaw = new THREE.Mesh(new THREE.BoxGeometry(0.56, 0.16, 0.56), clampMat);
-    lowerJaw.position.y = -0.2;
-    const upperJaw = new THREE.Mesh(new THREE.BoxGeometry(0.56, 0.16, 0.56), clampMat);
-    upperJaw.position.y = 0.2;
-
-    const pyroCore = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.22, 0.26, 12), chargeMat);
-    const hazardRing = new THREE.Mesh(new THREE.CylinderGeometry(0.24, 0.24, 0.07, 12), hazardMat);
-    const armedLed = new THREE.Mesh(
-      new THREE.SphereGeometry(0.055, 8, 8),
-      makeGlowMat(0xef4444, 2.5),
-    );
-    armedLed.position.set(0, 0, 0.24);
-
-    root.add(lowerJaw, upperJaw, pyroCore, hazardRing, armedLed);
   } else if (k === 'MICROBIT_ECU') {
-    // Official stylized Micro:bit V2 / V3 Controller Block
-    // Matte dark circuit board, gold edge-connector pins, tactile buttons A & B, and active 5x5 LED matrix
+    // Official stylized Micro:bit V2 / V3 Controller Block with active 5x5 LED matrix
     const pcbMat = makeMat(0x0f172a);
     const goldMat = makeMat(0xf59e0b);
     const btnMat = makeMat(0x18181b);
     const bezelMat = makeMat(0x64748b);
 
-    // Main PCB Chassis
-    const pcbBoard = new THREE.Mesh(new THREE.BoxGeometry(0.64, 0.12, 0.64), pcbMat);
+    const pcbBoard = new THREE.Mesh(getCachedBoxGeo(0.64, 0.12, 0.64), pcbMat);
     pcbBoard.position.y = -0.06;
     root.add(pcbBoard);
 
-    // Gold edge-connector bus at the front edge
-    const goldBus = new THREE.Mesh(new THREE.BoxGeometry(0.60, 0.025, 0.12), goldMat);
+    const goldBus = new THREE.Mesh(getCachedBoxGeo(0.60, 0.025, 0.12), goldMat);
     goldBus.position.set(0, 0.01, 0.25);
     root.add(goldBus);
 
-    // Gold contact pads divider slots
     for (const gx of [-0.22, -0.11, 0, 0.11, 0.22]) {
-      const pinNotch = new THREE.Mesh(new THREE.BoxGeometry(0.015, 0.03, 0.13), pcbMat);
+      const pinNotch = new THREE.Mesh(getCachedBoxGeo(0.015, 0.03, 0.13), pcbMat);
       pinNotch.position.set(gx, 0.015, 0.25);
       root.add(pinNotch);
     }
 
-    // Tactile Button A (Left) with metal bezel ring
-    const btnRingA = new THREE.Mesh(new THREE.CylinderGeometry(0.065, 0.065, 0.035, 10), bezelMat);
-    btnRingA.position.set(-0.21, 0.015, 0.02);
-    const btnCapA = new THREE.Mesh(new THREE.CylinderGeometry(0.045, 0.045, 0.045, 10), btnMat);
-    btnCapA.position.set(-0.21, 0.02, 0.02);
-    const labelA = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.015, 0.04), makeMat(0xe2e8f0));
-    labelA.position.set(-0.21, 0.01, -0.07);
-    root.add(btnRingA, btnCapA, labelA);
+    for (const sx of [-0.21, 0.21]) {
+      const btnRing = new THREE.Mesh(getCachedCylGeo(0.065, 0.065, 0.035, 10), bezelMat);
+      btnRing.position.set(sx, 0.015, 0.02);
+      const btnCap = new THREE.Mesh(getCachedCylGeo(0.045, 0.045, 0.045, 10), btnMat);
+      btnCap.position.set(sx, 0.02, 0.02);
+      root.add(btnRing, btnCap);
+    }
 
-    // Tactile Button B (Right) with metal bezel ring
-    const btnRingB = new THREE.Mesh(new THREE.CylinderGeometry(0.065, 0.065, 0.035, 10), bezelMat);
-    btnRingB.position.set(0.21, 0.015, 0.02);
-    const btnCapB = new THREE.Mesh(new THREE.CylinderGeometry(0.045, 0.045, 0.045, 10), btnMat);
-    btnCapB.position.set(0.21, 0.02, 0.02);
-    const labelB = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.015, 0.04), makeMat(0xe2e8f0));
-    labelB.position.set(0.21, 0.01, -0.07);
-    root.add(btnRingB, btnCapB, labelB);
-
-    // Dynamic 5x5 LED Matrix Array centered on the top face
     const ledDots: THREE.Mesh[] = [];
     const ledSpacing = 0.052;
     for (let row = -2; row <= 2; row++) {
@@ -1620,186 +1485,54 @@ export function createDetailedModuleMesh(
     root.userData.ledMatrixDots = ledDots;
     root.userData.currentLedIcon = 'OFF';
 
-    // Status / BLE antenna trace at rear
-    const antTrace = new THREE.Mesh(new THREE.BoxGeometry(0.36, 0.015, 0.04), goldMat);
+    const antTrace = new THREE.Mesh(getCachedBoxGeo(0.36, 0.015, 0.04), goldMat);
     antTrace.position.set(0, 0.01, -0.24);
     root.add(antTrace);
   } else if (k === 'SENSOR_TARGET_RADAR') {
-    // 360-degree Rotating Target Radar & Tracking Gimbal
-    const basePedestal = new THREE.Mesh(new THREE.CylinderGeometry(0.24, 0.28, 0.16, 12), makeMat(0x1e293b));
+    const basePedestal = new THREE.Mesh(getCachedCylGeo(0.24, 0.28, 0.16, 12), makeMat(0x1e293b));
     basePedestal.position.y = -0.16;
-    const neckCollar = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.16, 0.08, 12), makeMat(0x64748b));
+    const neckCollar = new THREE.Mesh(getCachedCylGeo(0.16, 0.16, 0.08, 12), makeMat(0x64748b));
     neckCollar.position.y = -0.04;
     root.add(basePedestal, neckCollar);
 
     const dishGroup = new THREE.Group();
     dishGroup.position.y = 0.06;
-
-    // Parabolic tracking dish
-    const dish = new THREE.Mesh(new THREE.CylinderGeometry(0.32, 0.12, 0.14, 14), makeMat(0xe2e8f0));
+    const dish = new THREE.Mesh(getCachedCylGeo(0.32, 0.12, 0.14, 14), makeMat(0xe2e8f0));
     dish.rotation.x = Math.PI * 0.35;
-    const dishCore = new THREE.Mesh(new THREE.SphereGeometry(0.08, 8, 8), makeGlowMat(0xa855f7, 2.5));
+    const dishCore = new THREE.Mesh(getCachedSphereGeo(0.08, 8, 8), makeGlowMat(0xa855f7, 2.5));
     dishCore.position.z = 0.08;
-    const feedHorn = new THREE.Mesh(new THREE.CylinderGeometry(0.02, 0.02, 0.18, 6), makeMat(0xf59e0b));
+    const feedHorn = new THREE.Mesh(getCachedCylGeo(0.02, 0.02, 0.18, 6), makeMat(0xf59e0b));
     feedHorn.rotation.x = Math.PI * 0.35;
     feedHorn.position.z = 0.12;
-
     dishGroup.add(dish, dishCore, feedHorn);
     root.add(dishGroup);
     if (!isGhost) mod.spinMesh = dishGroup;
-  } else if (k === 'SENSOR_IMU_TILT') {
-    // 3-Axis Gyro & Inclinometer block with etched coordinate arrows
-    const bodyMat = makeMat(0xfacc15); // High-viz yellow
-    const slateMat = makeMat(0x1e293b);
-    const chassis = new THREE.Mesh(new THREE.BoxGeometry(0.60, 0.28, 0.60), slateMat);
-    chassis.position.y = -0.10;
-    const yellowCap = new THREE.Mesh(new THREE.BoxGeometry(0.56, 0.06, 0.56), bodyMat);
-    yellowCap.position.y = 0.07;
-    root.add(chassis, yellowCap);
-
-    // Cross axis markings (Pitch & Roll lines)
-    const axisX = new THREE.Mesh(new THREE.BoxGeometry(0.46, 0.02, 0.05), slateMat);
-    axisX.position.y = 0.11;
-    const axisZ = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.02, 0.46), slateMat);
-    axisZ.position.y = 0.11;
-    const centerGyro = new THREE.Mesh(new THREE.SphereGeometry(0.065, 8, 8), makeGlowMat(0x38bdf8, 2.2));
-    centerGyro.position.y = 0.12;
-    root.add(axisX, axisZ, centerGyro);
-  } else if (k === 'SENSOR_SPEEDO') {
-    // Pitot Tube Aerodynamic Probe + Telemetry Housing
-    const casing = new THREE.Mesh(new THREE.BoxGeometry(0.58, 0.28, 0.58), makeMat(0x1e293b));
-    casing.position.y = -0.10;
-    root.add(casing);
-
-    // Long forward needle probe
-    const probeMast = new THREE.Mesh(new THREE.CylinderGeometry(0.025, 0.035, 0.46, 8), makeMat(0xe2e8f0));
-    probeMast.rotation.x = Math.PI / 2;
-    probeMast.position.set(0, 0.02, 0.46);
-    const probeTip = new THREE.Mesh(new THREE.ConeGeometry(0.035, 0.10, 8), makeMat(0xf59e0b));
-    probeTip.rotation.x = Math.PI / 2;
-    probeTip.position.set(0, 0.02, 0.70);
-    const speedLed = new THREE.Mesh(new THREE.BoxGeometry(0.38, 0.08, 0.04), makeGlowMat(0x10b981, 2.4));
-    speedLed.position.set(0, 0.06, 0.29);
-    root.add(probeMast, probeTip, speedLed);
   } else if (
-    k === 'SENSOR_DISTANCE' ||
-    k === 'SENSOR_SPEED' ||
-    k === 'SENSOR_ALTIMETER' ||
-    k === 'SENSOR_ANGLE' ||
-    k === 'SENSOR_POSITION' ||
-    k === 'RADIO_TRX' ||
-    k === 'LOGIC_GATE'
+    (k as string) === 'FLOAT_PONTOON' ||
+    (k as string) === 'HEAVY_PONTOON' ||
+    (k as string) === 'BALLAST_TANK' ||
+    (k as string) === 'LEAD_WEIGHT'
   ) {
-    // Structured electronics box with machined cooling fins, LED status strips, and specialized sensor/logic optics
-    const caseMat = makeMat(0x1e293b);
-    const finMat = makeMat(0x64748b);
-    const chromeMat = makeMat(0xe2e8f0);
-    const accentHex =
-      k === 'SENSOR_DISTANCE'
-        ? 0xef4444 // Red laser diode for laser rangefinder!
-        : k === 'SENSOR_SPEED'
-          ? 0x22c55e
-          : k === 'SENSOR_ALTIMETER'
-            ? 0x38bdf8
-            : k === 'SENSOR_ANGLE'
-              ? 0xfacc15
-              : k === 'SENSOR_POSITION'
-                ? 0xa3e635
-                : k === 'RADIO_TRX'
-                  ? 0x2dd4bf
-                  : 0x10b981;
-    const ledMat = makeGlowMat(accentHex, 2.4);
-
-    // Main ruggedized avionics enclosure
-    const chassisBox = new THREE.Mesh(new THREE.BoxGeometry(0.62, 0.36, 0.62), caseMat);
-    chassisBox.position.y = -0.06;
-    root.add(chassisBox);
-
-    // Side aluminum cooling heatsink fins
-    for (let f = -1; f <= 1; f++) {
-      const fin = new THREE.Mesh(new THREE.BoxGeometry(0.68, 0.045, 0.48), finMat);
-      fin.position.set(0, -0.06 + f * 0.1, 0);
-      root.add(fin);
-    }
-
-    // Front glowing LED telemetry status bar
-    const statusStrip = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.055, 0.04), ledMat);
-    statusStrip.position.set(0, -0.16, 0.31);
-    root.add(statusStrip);
-
-    if (k === 'SENSOR_DISTANCE') {
-      // Twin laser rangefinder optical barrels with glowing red laser emitter on front face
-      for (const sx of [-0.14, 0.14]) {
-        const bezel = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.1, 0.14, 12), chromeMat);
-        bezel.rotation.x = Math.PI / 2;
-        bezel.position.set(sx, 0.02, 0.34);
-        const laserLens = new THREE.Mesh(new THREE.CylinderGeometry(0.075, 0.075, 0.16, 12), ledMat);
-        laserLens.rotation.x = Math.PI / 2;
-        laserLens.position.set(sx, 0.02, 0.345);
-        root.add(bezel, laserLens);
-      }
-      // Center laser targeting dot
-      const centerDot = new THREE.Mesh(new THREE.SphereGeometry(0.035, 8, 8), makeGlowMat(0xef4444, 3.0));
-      centerDot.position.set(0, 0.02, 0.36);
-      root.add(centerDot);
-    } else if (k === 'SENSOR_SPEED') {
-      // Forward pitot tube probe + top anemometer cup rotor
-      const pitotTube = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.045, 0.42, 8), chromeMat);
-      pitotTube.rotation.x = Math.PI / 2;
-      pitotTube.position.set(0, 0.02, 0.46);
-      const rotorMast = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.03, 0.22, 8), chromeMat);
-      rotorMast.position.y = 0.22;
-      const vane = new THREE.Mesh(new THREE.BoxGeometry(0.38, 0.04, 0.08), ledMat);
-      vane.position.y = 0.32;
-      root.add(pitotTube, rotorMast, vane);
-    } else if (k === 'SENSOR_ALTIMETER') {
-      // Barometric static pressure dome & vertical altitude scale bar
-      const dome = new THREE.Mesh(new THREE.SphereGeometry(0.18, 12, 12), ledMat);
-      dome.scale.set(1, 0.65, 1);
-      dome.position.y = 0.14;
-      const guardRing = new THREE.Mesh(new THREE.TorusGeometry(0.2, 0.025, 8, 14), chromeMat);
-      guardRing.rotation.x = Math.PI / 2;
-      guardRing.position.y = 0.15;
-      root.add(dome, guardRing);
-    } else if (k === 'SENSOR_ANGLE') {
-      // Horizon inclinometer gimbal ring & pendulum plumb core
-      const dialRing = new THREE.Mesh(new THREE.TorusGeometry(0.18, 0.03, 8, 16), chromeMat);
-      dialRing.position.y = 0.22;
-      const horizonBar = new THREE.Mesh(new THREE.BoxGeometry(0.32, 0.045, 0.045), ledMat);
-      horizonBar.position.y = 0.22;
-      root.add(dialRing, horizonBar);
-    } else if (k === 'SENSOR_POSITION') {
-      // Ceramic GPS radome patch antenna + corner beacon
-      const radome = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.25, 0.12, 12), chromeMat);
-      radome.position.y = 0.18;
-      const patchCore = new THREE.Mesh(new THREE.CylinderGeometry(0.14, 0.14, 0.14, 12), ledMat);
-      patchCore.position.y = 0.185;
-      root.add(radome, patchCore);
-    } else if (k === 'RADIO_TRX') {
-      // Dual whip antennas + glowing channel transceiver matrix
-      for (const sx of [-0.18, 0.18]) {
-        const baseCoil = new THREE.Mesh(new THREE.CylinderGeometry(0.045, 0.055, 0.12, 8), makeMat(0xfacc15));
-        baseCoil.position.set(sx, 0.18, -0.14);
-        const whip = new THREE.Mesh(new THREE.CylinderGeometry(0.015, 0.025, 0.48, 6), chromeMat);
-        whip.position.set(sx, 0.42, -0.14);
-        root.add(baseCoil, whip);
-      }
-      const screen = new THREE.Mesh(new THREE.BoxGeometry(0.36, 0.14, 0.04), ledMat);
-      screen.position.set(0, 0.0, 0.31);
-      root.add(screen);
-    } else {
-      // LOGIC_GATE microprocessor die, gold connector pins & glowing boolean gate matrix
-      const cpuDie = new THREE.Mesh(new THREE.BoxGeometry(0.38, 0.08, 0.38), makeMat(0x0f172a));
-      cpuDie.position.y = 0.16;
-      const gateMatrix = new THREE.Mesh(new THREE.BoxGeometry(0.26, 0.09, 0.26), ledMat);
-      gateMatrix.position.y = 0.165;
-      for (const px of [-0.22, 0, 0.22]) {
-        const pinBus = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.05, 0.72), makeMat(0xfacc15));
-        pinBus.position.set(px, 0.13, 0);
-        root.add(pinBus);
-      }
-      root.add(cpuDie, gateMatrix);
-    }
+    const mappedKind: MicroVoxelBlockKind =
+      (k as string) === 'BALLAST_TANK'
+        ? 'BCD_TANK'
+        : (k as string) === 'LEAD_WEIGHT'
+          ? 'WEIGHT_BLOCK'
+          : 'PONTOON_LARGE';
+    const tpl = getMicroVoxelBlockTemplate(mappedKind);
+    const bodyGeo =
+      !isGhost && mod.microDamage?.damagedGeometry
+        ? mod.microDamage.damagedGeometry
+        : tpl.intactGeometry;
+    const microBody = new THREE.Mesh(
+      bodyGeo,
+      getMicroVoxelBlockMaterial(isGhost, isCharred),
+    );
+    microBody.name = `MicroVoxel_${mappedKind}`;
+    microBody.userData.isMicroVoxelBody = true;
+    root.add(microBody);
+    root.userData.microVoxelMesh = microBody;
+    root.userData.microVoxelKind = mappedKind;
   } else if (k === 'COSMETIC_RACING_FIN') {
     const scoop = new THREE.Mesh(new THREE.BoxGeometry(0.34, 0.16, 0.62), makeMat(0x1e293b));
     scoop.position.y = -0.16;
@@ -1878,161 +1611,168 @@ export function createDetailedModuleMesh(
     finial.position.y = 0.46;
     root.add(base, mast, flag, finial);
   } else if (k === 'TURRET_RING') {
-    // 101. Motorized 360° Turret Azimuth Ring with geared raceway & rotating top mount
-    const basePlate = new THREE.Mesh(new THREE.BoxGeometry(0.86, 0.12, 0.86), makeMat(0x1e293b));
-    basePlate.position.y = -0.18;
-    const outerRace = new THREE.Mesh(new THREE.CylinderGeometry(0.42, 0.44, 0.16, 16), makeMat(0x334155));
-    outerRace.position.y = -0.06;
-    const gearRing = new THREE.Mesh(new THREE.TorusGeometry(0.36, 0.045, 8, 16), makeMat(0xf59e0b));
-    gearRing.rotation.x = Math.PI / 2;
-    gearRing.position.y = 0.02;
+    const tpl = getMicroVoxelBlockTemplate('TURRET_RING');
+    const bodyGeo =
+      !isGhost && mod.microDamage?.damagedGeometry
+        ? mod.microDamage.damagedGeometry
+        : tpl.intactGeometry;
+    const microBody = new THREE.Mesh(
+      bodyGeo,
+      getMicroVoxelBlockMaterial(isGhost, isCharred),
+    );
+    microBody.name = 'MicroVoxel_TURRET_RING';
+    microBody.userData.isMicroVoxelBody = true;
+    root.add(microBody);
+    root.userData.microVoxelMesh = microBody;
+    root.userData.microVoxelKind = 'TURRET_RING';
+
     const turretDeck = new THREE.Group();
     turretDeck.position.y = 0.08;
-    const topDisk = new THREE.Mesh(new THREE.CylinderGeometry(0.38, 0.38, 0.1, 16), makeMat(0x475569));
-    const aimArrow = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.06, 0.42), makeGlowMat(0xfacc15, 2.0));
+    const topDisk = new THREE.Mesh(getCachedCylGeo(0.36, 0.36, 0.08, 12), makeMat(0x475569));
+    const aimArrow = new THREE.Mesh(getCachedBoxGeo(0.14, 0.06, 0.42), makeGlowMat(0xfacc15, 2.0));
     aimArrow.position.set(0, 0.06, 0.14);
-    for (let i = 0; i < 4; i++) {
-      const a = (i * Math.PI) / 2 + Math.PI / 4;
-      const clamp = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.12, 0.12), makeMat(0x94a3b8));
-      clamp.position.set(Math.cos(a) * 0.28, 0.04, Math.sin(a) * 0.28);
-      turretDeck.add(clamp);
-    }
     turretDeck.add(topDisk, aimArrow);
-    root.add(basePlate, outerRace, gearRing, turretDeck);
+    root.add(turretDeck);
     if (!isGhost) {
       mod.turretPivot = turretDeck;
       mod.spinMesh = turretDeck;
     }
   } else if (k === 'MAGNET_COUPLER') {
-    // 102. Tractor-Beam & Electromagnet Coupler with copper field coils & twin glowing emitter poles
-    const chassisMount = new THREE.Mesh(new THREE.BoxGeometry(0.76, 0.28, 0.56), makeMat(0x1e293b));
-    chassisMount.position.z = -0.12;
-    const coreCyl = new THREE.Mesh(new THREE.CylinderGeometry(0.26, 0.28, 0.36, 14), makeMat(0xb45309));
-    coreCyl.rotation.x = Math.PI / 2;
-    coreCyl.position.z = 0.08;
+    const tpl = getMicroVoxelBlockTemplate('MAGNET_COUPLER');
+    const bodyGeo =
+      !isGhost && mod.microDamage?.damagedGeometry
+        ? mod.microDamage.damagedGeometry
+        : tpl.intactGeometry;
+    const microBody = new THREE.Mesh(
+      bodyGeo,
+      getMicroVoxelBlockMaterial(isGhost, isCharred),
+    );
+    microBody.name = 'MicroVoxel_MAGNET_COUPLER';
+    microBody.userData.isMicroVoxelBody = true;
+    root.add(microBody);
+    root.userData.microVoxelMesh = microBody;
+    root.userData.microVoxelKind = 'MAGNET_COUPLER';
+
     const emitterGroup = new THREE.Group();
     emitterGroup.position.z = 0.28;
-    const fieldRing = new THREE.Mesh(new THREE.TorusGeometry(0.28, 0.045, 8, 16), makeGlowMat(0x38bdf8, 2.6));
-    const innerLens = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.12, 0.08, 12), makeGlowMat(0x00f5ff, 3.0));
-    innerLens.rotation.x = Math.PI / 2;
-    for (const sx of [-0.24, 0.24]) {
-      const pole = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.34, 0.18), makeMat(0xef4444));
-      pole.position.set(sx, 0, -0.04);
-      const poleTip = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.34, 0.06), makeMat(0xe2e8f0));
-      poleTip.position.set(sx, 0, 0.07);
-      emitterGroup.add(pole, poleTip);
-    }
-    emitterGroup.add(fieldRing, innerLens);
-    root.add(chassisMount, coreCyl, emitterGroup);
+    const fieldRing = new THREE.Mesh(getCachedTorusGeo(0.24, 0.04, 8, 14), makeGlowMat(0x38bdf8, 2.6));
+    emitterGroup.add(fieldRing);
+    root.add(emitterGroup);
     if (!isGhost) mod.spinMesh = emitterGroup;
   } else if (k === 'TANK_TREAD') {
-    // 103. Heavy Armored Tank Tread Bogie with drive sprockets, road wheels & continuous rubber-steel belt
-    const strut = new THREE.Mesh(new THREE.BoxGeometry(0.32, 0.42, 0.48), makeMat(0x334155));
-    strut.position.y = 0.16;
-    const armorSkirt = new THREE.Mesh(new THREE.BoxGeometry(0.46, 0.24, 1.32), makeMat(0x4d7c0f));
-    armorSkirt.position.y = 0.08;
-    const beltOuter = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.56, 1.28), makeMat(0x111827));
-    beltOuter.position.y = -0.14;
+    const tpl = getMicroVoxelBlockTemplate('TANK_TREAD');
+    const bodyGeo =
+      !isGhost && mod.microDamage?.damagedGeometry
+        ? mod.microDamage.damagedGeometry
+        : tpl.intactGeometry;
+    const microBody = new THREE.Mesh(
+      bodyGeo,
+      getMicroVoxelBlockMaterial(isGhost, isCharred),
+    );
+    microBody.name = 'MicroVoxel_TANK_TREAD';
+    microBody.userData.isMicroVoxelBody = true;
+    root.add(microBody);
+    root.userData.microVoxelMesh = microBody;
+    root.userData.microVoxelKind = 'TANK_TREAD';
+
     const wheelsGroup = new THREE.Group();
     wheelsGroup.position.y = -0.14;
-    for (const wz of [-0.44, 0, 0.44]) {
-      const bogie = new THREE.Mesh(new THREE.CylinderGeometry(0.24, 0.24, 0.45, 12), makeMat(0x64748b));
-      bogie.rotation.z = Math.PI / 2;
-      bogie.position.set(0, 0, wz);
-      const hub = new THREE.Mesh(new THREE.CylinderGeometry(0.11, 0.11, 0.47, 8), makeMat(0xfacc15));
-      hub.rotation.z = Math.PI / 2;
+    const hubGeo = getCachedCylGeo(0.1, 0.1, 0.46, 8, 1, false, 'z');
+    for (const wz of [-0.42, 0, 0.42]) {
+      const hub = new THREE.Mesh(hubGeo, makeMat(0xfacc15));
       hub.position.set(0, 0, wz);
-      wheelsGroup.add(bogie, hub);
+      wheelsGroup.add(hub);
     }
-    for (let t = -3; t <= 3; t++) {
-      const cleat = new THREE.Mesh(new THREE.BoxGeometry(0.45, 0.05, 0.08), makeMat(0x374151));
-      cleat.position.set(0, -0.43, t * 0.17);
-      root.add(cleat);
-    }
-    root.add(strut, armorSkirt, beltOuter, wheelsGroup);
+    root.add(wheelsGroup);
     if (!isGhost) mod.spinMesh = wheelsGroup;
   } else if (k === 'PARACHUTE_AIRBRAKE') {
-    // 104. Deployable Parachute Canister & Twin Aerodynamic Airbrake Flaps
-    const packBox = new THREE.Mesh(new THREE.BoxGeometry(0.64, 0.34, 0.52), makeMat(0x334155));
-    packBox.position.y = -0.12;
-    const packCap = new THREE.Mesh(new THREE.BoxGeometry(0.58, 0.12, 0.46), makeMat(0xf97316));
-    packCap.position.y = 0.08;
+    const tpl = getMicroVoxelBlockTemplate('PARACHUTE_AIRBRAKE');
+    const bodyGeo =
+      !isGhost && mod.microDamage?.damagedGeometry
+        ? mod.microDamage.damagedGeometry
+        : tpl.intactGeometry;
+    const microBody = new THREE.Mesh(
+      bodyGeo,
+      getMicroVoxelBlockMaterial(isGhost, isCharred),
+    );
+    microBody.name = 'MicroVoxel_PARACHUTE_AIRBRAKE';
+    microBody.userData.isMicroVoxelBody = true;
+    root.add(microBody);
+    root.userData.microVoxelMesh = microBody;
+    root.userData.microVoxelKind = 'PARACHUTE_AIRBRAKE';
+
     const canopyGroup = new THREE.Group();
     canopyGroup.position.y = 0.14;
-    // Airbrake side flaps + overhead dome canopy (scales up when deployed in physics)
     const dome = new THREE.Mesh(
-      new THREE.SphereGeometry(0.42, 12, 8, 0, Math.PI * 2, 0, Math.PI * 0.55),
+      new THREE.SphereGeometry(0.42, 10, 6, 0, Math.PI * 2, 0, Math.PI * 0.55),
       makeMat(0xf97316),
     );
     dome.position.y = 0.36;
-    const domeStripe = new THREE.Mesh(
-      new THREE.BoxGeometry(0.86, 0.12, 0.22),
-      makeMat(0xf8fafc),
-    );
+    const domeStripe = new THREE.Mesh(getCachedBoxGeo(0.86, 0.12, 0.22), makeMat(0xf8fafc));
     domeStripe.position.y = 0.56;
-    for (const sx of [-0.28, 0.28]) {
-      for (const sz of [-0.22, 0.22]) {
-        const cord = new THREE.Mesh(new THREE.CylinderGeometry(0.012, 0.012, 0.46, 6), makeMat(0xe2e8f0));
-        cord.position.set(sx * 0.65, 0.2, sz * 0.65);
-        canopyGroup.add(cord);
-      }
-    }
     canopyGroup.add(dome, domeStripe);
     canopyGroup.scale.set(0.28, 0.18, 0.28);
-    root.add(packBox, packCap, canopyGroup);
+    root.add(canopyGroup);
     if (!isGhost) mod.spinMesh = canopyGroup;
   } else if (k === 'OUTRIGGER_JACK') {
-    // 105. Hydraulic Outrigger Stabilizer Jack with extendable vertical ram & heavy hazard footpad
-    const housing = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.2, 0.62, 12), makeMat(0x1e293b));
-    housing.position.y = 0.08;
-    const collar = new THREE.Mesh(new THREE.CylinderGeometry(0.21, 0.21, 0.1, 12), makeMat(0xfacc15));
-    collar.position.y = -0.18;
+    const tpl = getMicroVoxelBlockTemplate('OUTRIGGER_JACK');
+    const bodyGeo =
+      !isGhost && mod.microDamage?.damagedGeometry
+        ? mod.microDamage.damagedGeometry
+        : tpl.intactGeometry;
+    const microBody = new THREE.Mesh(
+      bodyGeo,
+      getMicroVoxelBlockMaterial(isGhost, isCharred),
+    );
+    microBody.name = 'MicroVoxel_OUTRIGGER_JACK';
+    microBody.userData.isMicroVoxelBody = true;
+    root.add(microBody);
+    root.userData.microVoxelMesh = microBody;
+    root.userData.microVoxelKind = 'OUTRIGGER_JACK';
+
     const ramGroup = new THREE.Group();
-    const chromeRod = new THREE.Mesh(new THREE.CylinderGeometry(0.11, 0.11, 0.58, 10), makeMat(0xe2e8f0));
+    const chromeRod = new THREE.Mesh(getCachedCylGeo(0.1, 0.1, 0.56, 8), makeMat(0xe2e8f0));
     chromeRod.position.y = -0.22;
-    const footPad = new THREE.Mesh(new THREE.CylinderGeometry(0.32, 0.36, 0.1, 12), makeMat(0xf59e0b));
+    const footPad = new THREE.Mesh(getCachedCylGeo(0.3, 0.34, 0.1, 10), makeMat(0xf59e0b));
     footPad.position.y = -0.5;
-    const gripBase = new THREE.Mesh(new THREE.CylinderGeometry(0.35, 0.35, 0.04, 12), makeMat(0x0f172a));
-    gripBase.position.y = -0.56;
-    ramGroup.add(chromeRod, footPad, gripBase);
-    root.add(housing, collar, ramGroup);
+    ramGroup.add(chromeRod, footPad);
+    root.add(ramGroup);
     if (!isGhost) mod.spinMesh = ramGroup;
   } else if (k === 'IMPULSE_BUMPER') {
-    // 106. Kinetic Spring-Impulse Ramming Bumper Plate
-    const backMount = new THREE.Mesh(new THREE.BoxGeometry(0.84, 0.36, 0.18), makeMat(0x1e293b));
-    backMount.position.z = -0.22;
+    const tpl = getMicroVoxelBlockTemplate('IMPULSE_BUMPER');
+    const bodyGeo =
+      !isGhost && mod.microDamage?.damagedGeometry
+        ? mod.microDamage.damagedGeometry
+        : tpl.intactGeometry;
+    const microBody = new THREE.Mesh(
+      bodyGeo,
+      getMicroVoxelBlockMaterial(isGhost, isCharred),
+    );
+    microBody.name = 'MicroVoxel_IMPULSE_BUMPER';
+    microBody.userData.isMicroVoxelBody = true;
     const plateGroup = new THREE.Group();
-    for (const sx of [-0.24, 0.24]) {
-      const springCoil = new THREE.Mesh(new THREE.CylinderGeometry(0.11, 0.11, 0.36, 10), makeMat(0xa855f7));
-      springCoil.rotation.x = Math.PI / 2;
-      springCoil.position.set(sx, 0, -0.02);
-      plateGroup.add(springCoil);
-    }
-    const ramShield = new THREE.Mesh(new THREE.BoxGeometry(0.96, 0.48, 0.16), makeMat(0x334155));
-    ramShield.position.z = 0.2;
-    const hazardBar = new THREE.Mesh(new THREE.BoxGeometry(0.98, 0.16, 0.18), makeGlowMat(0xfacc15, 1.8));
-    hazardBar.position.z = 0.21;
-    plateGroup.add(ramShield, hazardBar);
-    root.add(backMount, plateGroup);
+    plateGroup.add(microBody);
+    root.add(plateGroup);
+    root.userData.microVoxelMesh = microBody;
+    root.userData.microVoxelKind = 'IMPULSE_BUMPER';
     if (!isGhost) mod.spinMesh = plateGroup;
   } else if (k === 'SMOKE_FLARE') {
-    // 107. Multi-Tube Smoke & Thermal Flare Countermeasure Dispenser Rack
-    const rackBase = new THREE.Mesh(new THREE.BoxGeometry(0.68, 0.16, 0.54), makeMat(0x1e293b));
-    rackBase.position.y = -0.2;
+    const tpl = getMicroVoxelBlockTemplate('SMOKE_FLARE');
+    const bodyGeo =
+      !isGhost && mod.microDamage?.damagedGeometry
+        ? mod.microDamage.damagedGeometry
+        : tpl.intactGeometry;
+    const microBody = new THREE.Mesh(
+      bodyGeo,
+      getMicroVoxelBlockMaterial(isGhost, isCharred),
+    );
+    microBody.name = 'MicroVoxel_SMOKE_FLARE';
+    microBody.userData.isMicroVoxelBody = true;
     const launcherPod = new THREE.Group();
-    launcherPod.rotation.x = -0.35;
-    const podBody = new THREE.Mesh(new THREE.BoxGeometry(0.62, 0.28, 0.44), makeMat(0x475569));
-    launcherPod.add(podBody);
-    for (const sx of [-0.18, 0, 0.18]) {
-      for (const sz of [-0.1, 0.1]) {
-        const tube = new THREE.Mesh(new THREE.CylinderGeometry(0.065, 0.065, 0.32, 8), makeMat(0x0f172a));
-        tube.position.set(sx, 0.04, sz);
-        const flareCap = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, 0.04, 8), makeGlowMat(0xf43f5e, 2.4));
-        flareCap.position.set(sx, 0.2, sz);
-        launcherPod.add(tube, flareCap);
-      }
-    }
-    root.add(rackBase, launcherPod);
+    launcherPod.add(microBody);
+    root.add(launcherPod);
+    root.userData.microVoxelMesh = microBody;
+    root.userData.microVoxelKind = 'SMOKE_FLARE';
     if (!isGhost) mod.spinMesh = launcherPod;
   } else {
     // Structured Battery / Fuel Cell Power Module (with cooling fins, cylindrical cells & LED indicator)
@@ -2052,6 +1792,6 @@ export function createDetailedModuleMesh(
     root.add(tray, topCap, ledStrip);
   }
 
-  return optimizeModuleMeshHierarchy(root);
+  return optimizeModuleMeshHierarchy(root, mod);
 }
 

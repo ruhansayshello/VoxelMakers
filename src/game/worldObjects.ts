@@ -1074,6 +1074,8 @@ export function generateProceduralHeightmapPreset(
 export function findDisconnectedVoxelIslands(
   voxelMap: Map<any, number>,
   cockpitVoxel: { vx: number; vy: number; vz: number } | null,
+  bridgeModules?: ReadonlyArray<{ vx: number; vy: number; vz: number; health?: number }>,
+  microBridgeCoords?: ReadonlyArray<[number, number, number]>,
 ): {
   detachedIslands: Array<Array<[number, number, number, number]>>;
 } {
@@ -1093,6 +1095,132 @@ export function findDisconnectedVoxelIslands(
     [0, 0, 1],
     [0, 0, -1],
   ];
+
+  // Precompute module-bridged and microHull-bridged adjacency between voxel keys
+  const moduleBridgeNeighbors = new Map<number | string, Array<number | string>>();
+  const hasBridgeModules = Boolean(bridgeModules && bridgeModules.length > 0);
+  const hasMicroBridges = Boolean(microBridgeCoords && microBridgeCoords.length > 0);
+  if (hasBridgeModules || hasMicroBridges) {
+    let sampleKey: number | string | undefined;
+    for (const [k, mat] of voxelMap.entries()) {
+      if (mat !== MAT.AIR) {
+        sampleKey = k;
+        break;
+      }
+    }
+    if (sampleKey !== undefined) {
+      const isInt = typeof sampleKey === 'number';
+      const toKey = (nx: number, ny: number, nz: number): number | string =>
+        isInt
+          ? (((nx + 512) & 0x3ff) << 20) |
+            (((ny + 512) & 0x3ff) << 10) |
+            ((nz + 512) & 0x3ff)
+          : `${nx},${ny},${nz}`;
+
+      const linkKeys = (groupKeys: Array<number | string>) => {
+        if (groupKeys.length <= 1) return;
+        const anchor = groupKeys[0];
+        let anchorList = moduleBridgeNeighbors.get(anchor);
+        if (!anchorList) {
+          anchorList = [];
+          moduleBridgeNeighbors.set(anchor, anchorList);
+        }
+        for (let i = 1; i < groupKeys.length; i++) {
+          const other = groupKeys[i];
+          if (other === anchor) continue;
+          anchorList.push(other);
+          let otherList = moduleBridgeNeighbors.get(other);
+          if (!otherList) {
+            otherList = [];
+            moduleBridgeNeighbors.set(other, otherList);
+          }
+          otherList.push(anchor);
+        }
+      };
+
+      if (hasBridgeModules && bridgeModules) {
+        const intactMods: Array<{ vx: number; vy: number; vz: number; keys: Array<number | string> }> = [];
+        for (let i = 0; i < bridgeModules.length; i++) {
+          const m = bridgeModules[i];
+          if ((m.health ?? 1.0) <= 0) continue;
+          const keys: Array<number | string> = [];
+          for (let dz = -2; dz <= 2; dz++) {
+            for (let dy = -2; dy <= 2; dy++) {
+              for (let dx = -2; dx <= 2; dx++) {
+                const k = toKey(m.vx + dx, m.vy + dy, m.vz + dz);
+                const mat = voxelMap.get(k);
+                if (mat !== undefined && mat !== MAT.AIR) {
+                  keys.push(k);
+                }
+              }
+            }
+          }
+          intactMods.push({ vx: m.vx, vy: m.vy, vz: m.vz, keys });
+        }
+
+        const visitedMod = new Uint8Array(intactMods.length);
+        for (let i = 0; i < intactMods.length; i++) {
+          if (visitedMod[i]) continue;
+          visitedMod[i] = 1;
+          const queueMod = [i];
+          const mergedKeys: Array<number | string> = [];
+          let headMod = 0;
+          while (headMod < queueMod.length) {
+            const cur = intactMods[queueMod[headMod++]];
+            for (const k of cur.keys) mergedKeys.push(k);
+            for (let j = 0; j < intactMods.length; j++) {
+              if (visitedMod[j]) continue;
+              const nxt = intactMods[j];
+              if (
+                Math.abs(cur.vx - nxt.vx) <= 3 &&
+                Math.abs(cur.vy - nxt.vy) <= 3 &&
+                Math.abs(cur.vz - nxt.vz) <= 3
+              ) {
+                visitedMod[j] = 1;
+                queueMod.push(j);
+              }
+            }
+          }
+          linkKeys(mergedKeys);
+        }
+      }
+
+      if (hasMicroBridges && microBridgeCoords) {
+        const microMap = new Map<number | string, [number, number, number]>();
+        for (let i = 0; i < microBridgeCoords.length; i++) {
+          const [mx, my, mz] = microBridgeCoords[i];
+          microMap.set(toKey(mx, my, mz), [mx, my, mz]);
+        }
+        const visitedMicro = new Set<number | string>();
+        for (const [startKey, startCoord] of microMap.entries()) {
+          if (visitedMicro.has(startKey)) continue;
+          visitedMicro.add(startKey);
+          const q: Array<[number, number, number]> = [startCoord];
+          const adjKeys: Array<number | string> = [];
+          let h = 0;
+          while (h < q.length) {
+            const [cx, cy, cz] = q[h++];
+            const selfK = toKey(cx, cy, cz);
+            const selfMat = voxelMap.get(selfK);
+            if (selfMat !== undefined && selfMat !== MAT.AIR) adjKeys.push(selfK);
+            for (let d = 0; d < 6; d++) {
+              const nx = cx + dirs[d][0];
+              const ny = cy + dirs[d][1];
+              const nz = cz + dirs[d][2];
+              const nk = toKey(nx, ny, nz);
+              const nMat = voxelMap.get(nk);
+              if (nMat !== undefined && nMat !== MAT.AIR) adjKeys.push(nk);
+              if (!visitedMicro.has(nk) && microMap.has(nk)) {
+                visitedMicro.add(nk);
+                q.push([nx, ny, nz]);
+              }
+            }
+          }
+          linkKeys(adjKeys);
+        }
+      }
+    }
+  }
 
   voxelMap.forEach((startMat, startKey) => {
     if (startMat === MAT.AIR || visited.has(startKey)) return;
@@ -1134,6 +1262,17 @@ export function findDisconnectedVoxelIslands(
           queue.push(nKey);
         }
       }
+
+      const bridged = moduleBridgeNeighbors.get(key);
+      if (bridged) {
+        for (let b = 0; b < bridged.length; b++) {
+          const bKey = bridged[b];
+          if (!visited.has(bKey) && voxelMap.has(bKey)) {
+            visited.add(bKey);
+            queue.push(bKey);
+          }
+        }
+      }
     }
 
     if (compVoxels.length > 0) {
@@ -1165,3 +1304,36 @@ export function findDisconnectedVoxelIslands(
 
   return { detachedIslands };
 }
+
+/**
+ * Determines whether world coordinate (wx, wz) lies within a designated ocean, pond, or river basin
+ * so that subterranean caves and inland valleys below sea level remain dry.
+ * Pure worker-safe helper shared between main thread and chunk generation workers.
+ */
+export function isWaterBasinArea(
+  wx: number,
+  wz: number,
+  mode: WorldGenMode,
+): boolean {
+  if (mode === 'FLAT_BASEPLATE') return false;
+  if (
+    mode === 'BIOME_ARCHIPELAGO' ||
+    mode === 'CUSTOM_GLB_MAP' ||
+    mode === 'CUSTOM_HEIGHTMAP' ||
+    mode === 'BIOME_ARCTIC'
+  ) {
+    return true;
+  }
+  if (mode === 'DEFAULT_PARK') {
+    return (
+      (wx <= -22 && wz <= 36) ||
+      Math.hypot(wx - 65, wz - -85) < 22 ||
+      Math.max(Math.abs(wx), Math.abs(wz)) > 128
+    );
+  }
+  if (mode === 'BIOME_CANYON') {
+    return Math.abs(wx - Math.sin(wz * 0.04) * 22) < 18;
+  }
+  return false;
+}
+

@@ -8,6 +8,15 @@
  * 4. Cohesive Render Distance, LOD ring, Camera Far Plane, and Fog Density tuning math.
  */
 
+import {
+  CHUNK_SIZE_METERS_BIGINT,
+  computeDynamicLodPlan,
+  DEFAULT_LOD_SPACING,
+  MAX_RENDER_DISTANCE_CHUNKS,
+  sanitizeLodSpacing,
+  sanitizePositiveRenderDistanceBigInt,
+} from './distantHorizonMath.ts';
+
 export type TouchModeOverride = 'AUTO' | 'ON' | 'OFF';
 export type MobileDriveControlScheme = 'PEDALS_STEER' | 'JOYSTICK';
 
@@ -255,64 +264,150 @@ export function computeTouchOrbitCameraState(
 }
 
 /**
- * Computes cohesive Render Distance parameters (chunk radius, meters, LOD0/LOD1/LOD2 thresholds,
- * camera far plane, and exponential fog density) from a chunk radius setting [2..16].
+ * Computes cohesive Render Distance parameters (chunk radius, meters, dynamic LOD rings,
+ * camera near/far planes, skyDomeScale, and exponential fog density) from a chunk radius setting [2..512].
  */
 export function computeRenderDistanceTuning(
-  chunks: number,
+  chunks: number | bigint | string,
   uncappedChunkLod = false,
+  lodSpacing = DEFAULT_LOD_SPACING,
 ): {
   clampedChunks: number;
+  clampedChunksBig: bigint;
+  lodSpacing: number;
   radiusMeters: number;
+  radiusMetersBig: bigint;
   diameterMeters: number;
   lod0MaxCheb: number;
   lod0MaxMeters: number;
   lod1MaxCheb: number;
   lod1MaxMeters: number;
+  lod2MaxCheb: number;
+  lod2MaxMeters: number;
+  totalLodLayers: number;
+  activeScaleBands: number;
+  cameraNear: number;
   cameraFar: number;
   baseFogDensity: number;
   skyDomeScale: number;
   uncappedChunkLod: boolean;
 } {
-  const clampedChunks = Math.max(2, Math.min(16, Math.round(chunks)));
+  const clampedChunksBig = sanitizePositiveRenderDistanceBigInt(chunks, 6n);
+  const clampedChunks =
+    clampedChunksBig > BigInt(MAX_RENDER_DISTANCE_CHUNKS)
+      ? MAX_RENDER_DISTANCE_CHUNKS
+      : Number(clampedChunksBig);
+  const clampedSpacing = sanitizeLodSpacing(lodSpacing, DEFAULT_LOD_SPACING);
   const chunkSizeMeters = 16; // 64 voxels * 0.25m = 16m per chunk
   const radiusMeters = clampedChunks * chunkSizeMeters;
+  const radiusMetersBig = clampedChunksBig * CHUNK_SIZE_METERS_BIGINT;
   const diameterMeters = radiusMeters * 2;
+
+  const plan = computeDynamicLodPlan({
+    renderDistanceChunks: clampedChunksBig,
+    lodSpacing: clampedSpacing,
+    uncappedChunkLod,
+    supportsHorizonTiles: true,
+  });
 
   const lod0MaxCheb = uncappedChunkLod
     ? clampedChunks + 2
-    : Math.max(2, Math.round(clampedChunks * 0.55));
+    : Math.max(
+        2,
+        Math.min(
+          clampedChunks - 1,
+          Math.max(plan.realChunkRadiusChunks, Math.round(Math.min(clampedChunks, 16) * 0.65)),
+        ),
+      );
   const lod0MaxMeters = uncappedChunkLod
     ? radiusMeters * 2.0 + 64
-    : Math.max(36, (lod0MaxCheb + 0.5) * chunkSizeMeters);
+    : Math.max(44, (lod0MaxCheb + 0.75) * chunkSizeMeters);
 
   const lod1MaxCheb = uncappedChunkLod
     ? clampedChunks + 4
-    : Math.max(lod0MaxCheb + 1, Math.round(clampedChunks * 0.82));
+    : Math.max(lod0MaxCheb + 1, plan.rings[0]?.outerRadiusChunks ?? Math.round(clampedChunks * 0.8));
   const lod1MaxMeters = uncappedChunkLod
     ? radiusMeters * 2.5 + 96
-    : Math.max(64, (lod1MaxCheb + 0.5) * chunkSizeMeters);
+    : Math.max(lod0MaxMeters + 16, (lod1MaxCheb + 0.75) * chunkSizeMeters);
 
-  // Scale camera far plane and sky dome so high render distances never clip at the horizon
-  const cameraFar = Math.max(360, radiusMeters * 3.2 + 160);
-  const skyDomeScale = Math.max(1.0, (radiusMeters * 2.4) / 360);
-
-  // Scale exponential fog density inversely with render distance so distant islands stay crisp at high settings
-  const baseFogDensity = Number((0.0115 / Math.max(2.5, clampedChunks)).toFixed(5));
+  const lod2MaxCheb = uncappedChunkLod
+    ? clampedChunks + 6
+    : Math.max(lod1MaxCheb + 1, plan.rings[1]?.outerRadiusChunks ?? Math.round(clampedChunks * 0.94));
+  const lod2MaxMeters = uncappedChunkLod
+    ? radiusMeters * 3.0 + 128
+    : Math.max(lod1MaxMeters + 24, (lod2MaxCheb + 0.75) * chunkSizeMeters);
 
   return {
     clampedChunks,
+    clampedChunksBig,
+    lodSpacing: clampedSpacing,
     radiusMeters,
+    radiusMetersBig,
     diameterMeters,
     lod0MaxCheb,
     lod0MaxMeters,
     lod1MaxCheb,
     lod1MaxMeters,
-    cameraFar,
-    baseFogDensity,
-    skyDomeScale,
+    lod2MaxCheb,
+    lod2MaxMeters,
+    totalLodLayers: plan.totalLodLayers,
+    activeScaleBands: plan.activeScaleBands,
+    cameraNear: plan.cameraNear,
+    cameraFar: plan.cameraFar,
+    baseFogDensity: plan.baseFogDensity,
+    skyDomeScale: plan.skyDomeScale,
     uncappedChunkLod,
   };
+}
+
+export type ChunkLodLevel = 0 | 1 | 2 | 3;
+
+export interface ChunkLodSelectionInput {
+  chebDist: number;
+  distMeters: number;
+  prevLod: -1 | ChunkLodLevel;
+  tuning: ReturnType<typeof computeRenderDistanceTuning>;
+  isLowEndMode: boolean;
+  isMapFastLoad: boolean;
+  hysteresisMeters?: number;
+}
+
+/**
+ * Resolves the target chunk LOD tier (0 = 0.25m, 1 = 0.50m, 2 = 1.00m, 3 = 2.00m) using
+ * smooth Euclidean circular rings with +/- hysteresis so chunks never pop or flicker at
+ * boundaries, and guarantees the immediate 3x3 ring around the player stays crisp LOD0
+ * even in Low-End / Pentium mode.
+ */
+export function resolveChunkTargetLod(input: ChunkLodSelectionInput): ChunkLodLevel {
+  const {
+    chebDist,
+    distMeters,
+    prevLod,
+    tuning,
+    isLowEndMode,
+    isMapFastLoad,
+    hysteresisMeters = 3.0,
+  } = input;
+
+  if (isMapFastLoad || chebDist <= 1 || tuning.uncappedChunkLod) {
+    return 0;
+  }
+
+  const h = Math.max(0, hysteresisMeters);
+  const d0 = isLowEndMode ? 30 : tuning.lod0MaxMeters;
+  const d1 = isLowEndMode ? 50 : tuning.lod1MaxMeters;
+  const d2 = isLowEndMode ? 76 : tuning.lod2MaxMeters;
+
+  const t01 = prevLod === 0 ? d0 + h : prevLod >= 1 ? d0 - h : d0;
+  if (distMeters <= t01) return 0;
+
+  const t12 = prevLod >= 0 && prevLod <= 1 ? d1 + h : prevLod >= 2 ? d1 - h : d1;
+  if (distMeters <= t12) return 1;
+
+  const t23 = prevLod >= 0 && prevLod <= 2 ? d2 + h : prevLod === 3 ? d2 - h : d2;
+  if (distMeters <= t23) return 2;
+
+  return 3;
 }
 
 /**

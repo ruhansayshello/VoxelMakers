@@ -148,7 +148,6 @@ export class PerfProfiler {
       if (now - this._lastWarnBody > 1000) {
         this._lastWarnBody = now;
         const msg = `Body ${bodyId} slow: ${elapsedMs.toFixed(3)} ms`;
-        console.warn('Body', bodyId, 'slow:', Number(elapsedMs.toFixed(3)), 'ms');
         this._pushWarning(msg);
       }
     }
@@ -184,7 +183,6 @@ export class PerfProfiler {
       if (now - this._lastWarnMeshing > 1000) {
         this._lastWarnMeshing = now;
         const msg = `Meshing slow: ${elapsedMs.toFixed(2)} ms`;
-        console.warn('Meshing slow:', Number(elapsedMs.toFixed(2)), 'ms');
         this._pushWarning(msg);
       }
     }
@@ -296,25 +294,19 @@ export class PerfProfiler {
     this.sceneDrawCalls = this._frameSceneDrawCalls;
     this.sceneTriangles = this._frameSceneTriangles;
 
-    // Console slow-path warnings (throttled to <= 1/sec per category)
+    // Record slow-path warnings into profiler ring buffer without spamming console (console.warn stalls iframe DevTools!)
     const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
     if (params.physicsTotalMs > 4 && now - this._lastWarnPhysics > 1000) {
       this._lastWarnPhysics = now;
-      const msg = `Physics slow: ${params.physicsTotalMs.toFixed(2)} ms`;
-      console.warn('Physics slow:', Number(params.physicsTotalMs.toFixed(2)), 'ms');
-      this._pushWarning(msg);
+      this._pushWarning(`Physics slow: ${params.physicsTotalMs.toFixed(2)} ms`);
     }
     if (params.renderMs > 8 && now - this._lastWarnRender > 1000) {
       this._lastWarnRender = now;
-      const msg = `Render slow: ${params.renderMs.toFixed(2)} ms`;
-      console.warn('Render slow:', Number(params.renderMs.toFixed(2)), 'ms');
-      this._pushWarning(msg);
+      this._pushWarning(`Render slow: ${params.renderMs.toFixed(2)} ms`);
     }
     if (this._frameMeshingMs > 2 && now - this._lastWarnMeshing > 1000) {
       this._lastWarnMeshing = now;
-      const msg = `Meshing slow: ${this._frameMeshingMs.toFixed(2)} ms`;
-      console.warn('Meshing slow:', Number(this._frameMeshingMs.toFixed(2)), 'ms');
-      this._pushWarning(msg);
+      this._pushWarning(`Meshing slow: ${this._frameMeshingMs.toFixed(2)} ms`);
     }
   }
 

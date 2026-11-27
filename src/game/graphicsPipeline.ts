@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { WATER_LEVEL } from './constants.ts';
 import {
+  GRAPHICS_PRESETS,
   type GraphicsSettings,
   hasActivePostProcessing,
   computeHaltonJitter,
@@ -18,23 +19,18 @@ const FULLSCREEN_VERTEX_SHADER = /* glsl */ `
   }
 `;
 
+// Note: The custom WebGL2 engine always applies linearToOutputTexel() (sRGB encoding)
+// when rendering built-in and custom materials into offscreen WebGLRenderTargets.
+// Therefore tColor is already in sRGB display space — zero redundant pow(1/2.2) conversions!
 const BLOOM_EXTRACT_FRAGMENT_SHADER = /* glsl */ `
   precision highp float;
   precision highp int;
   varying vec2 vUv;
   uniform sampler2D tColor;
-  uniform sampler2D tDepth;
   uniform float uThreshold;
-  uniform int uSceneIsAlreadySrgb;
-
-  vec3 toSrgbIfLit(vec3 rawCol, float rawDepth) {
-    if (rawDepth > 0.9992 || uSceneIsAlreadySrgb == 1) return rawCol;
-    return pow(max(rawCol, vec3(0.0)), vec3(1.0 / 2.2));
-  }
 
   void main() {
-    float d = texture2D(tDepth, vUv).x;
-    vec3 col = toSrgbIfLit(texture2D(tColor, vUv).rgb, d);
+    vec3 col = texture2D(tColor, vUv).rgb;
     float lum = dot(col, vec3(0.2126, 0.7152, 0.0722));
     float maxCh = max(col.r, max(col.g, col.b));
     float brightness = max(lum, maxCh * 0.9);
@@ -42,7 +38,7 @@ const BLOOM_EXTRACT_FRAGMENT_SHADER = /* glsl */ `
     float soft = clamp(brightness - uThreshold + knee, 0.0, 2.0 * knee);
     soft = (soft * soft) / (4.0 * knee);
     float contrib = max(soft, brightness - uThreshold) / max(brightness, 0.0001);
-    gl_FragColor = vec4(col * clamp(contrib, 0.0, 3.5), 1.0);
+    gl_FragColor = vec4(col * clamp(contrib, 0.0, 3.2), 1.0);
   }
 `;
 
@@ -64,6 +60,106 @@ const BLOOM_BLUR_FRAGMENT_SHADER = /* glsl */ `
   }
 `;
 
+/**
+ * Computes the compile-time #define map and deterministic program cache key
+ * for the specialized post-processing composite shader.
+ * Only active features are compiled into each WebGL2 program, slashing VGPR
+ * register pressure and fragment shader instruction count across low-end,
+ * mobile, and desktop GPUs.
+ */
+export function computeCompositeFeatureKey(
+  settings: GraphicsSettings,
+  useTaaPass: boolean,
+): { key: string; defines: Record<string, number> } {
+  const tier = resolveVisualQualityTier(settings);
+  const defines: Record<string, number> = {
+    VISUAL_TIER: tier,
+  };
+
+  let mask = tier & 3;
+  if (Math.abs(settings.lensDistortion) > 0.005) {
+    defines.USE_LENS_DISTORTION = 1;
+    mask |= 1 << 2;
+  }
+  if (settings.chromaticAberrationEnabled) {
+    defines.USE_CHROMA = 1;
+    mask |= 1 << 3;
+  }
+  if (settings.dofEnabled) {
+    defines.USE_DOF = 1;
+    mask |= 1 << 4;
+  }
+  if (settings.motionBlurEnabled) {
+    defines.USE_MOTION_BLUR = 1;
+    mask |= 1 << 5;
+  }
+  if (settings.ssaoEnabled) {
+    defines.USE_SSAO = 1;
+    mask |= 1 << 6;
+  }
+  if (settings.contactShadowsEnabled) {
+    defines.USE_CONTACT_SHADOWS = 1;
+    mask |= 1 << 7;
+  }
+  if (tier >= 2) {
+    defines.USE_MICRO_BEVEL = 1;
+    mask |= 1 << 8;
+  }
+  if (settings.ssrEnabled) {
+    defines.USE_SSR = 1;
+    mask |= 1 << 9;
+  }
+  if (settings.volumetricSmokeEnabled) {
+    defines.USE_VOLUMETRIC_SMOKE = 1;
+    mask |= 1 << 10;
+  }
+  if (settings.godRaysEnabled) {
+    defines.USE_GODRAYS = 1;
+    mask |= 1 << 11;
+  }
+  if (settings.bloomEnabled) {
+    if (settings.cheapBloom) {
+      defines.USE_CHEAP_BLOOM = 1;
+      mask |= 1 << 12;
+    } else {
+      defines.USE_BLOOM = 1;
+      mask |= 1 << 13;
+    }
+  }
+  if (useTaaPass) {
+    defines.USE_TAA = 1;
+    mask |= 1 << 14;
+  }
+
+  const needsWorldPos = Boolean(
+    defines.USE_MOTION_BLUR ||
+      (defines.USE_SSAO && tier >= 2) ||
+      defines.USE_CONTACT_SHADOWS ||
+      defines.USE_SSR ||
+      defines.USE_VOLUMETRIC_SMOKE ||
+      defines.USE_TAA,
+  );
+  if (needsWorldPos) {
+    defines.NEEDS_WORLD_POS = 1;
+  }
+
+  const needsDepth = Boolean(
+    needsWorldPos ||
+      defines.USE_DOF ||
+      defines.USE_SSAO ||
+      defines.USE_MICRO_BEVEL ||
+      defines.USE_GODRAYS,
+  );
+  if (needsDepth) {
+    defines.NEEDS_DEPTH = 1;
+  }
+
+  return {
+    key: `composite_v2_${mask.toString(16)}`,
+    defines,
+  };
+}
+
 const COMPOSITE_POST_FRAGMENT_SHADER = /* glsl */ `
   precision highp float;
   precision highp int;
@@ -71,392 +167,458 @@ const COMPOSITE_POST_FRAGMENT_SHADER = /* glsl */ `
   varying vec2 vUv;
 
   uniform sampler2D tColor;
-  uniform sampler2D tDepth;
-  uniform sampler2D tBloom;
-  uniform sampler2D tHistory;
+  #ifdef NEEDS_DEPTH
+    uniform sampler2D tDepth;
+    uniform float uNear;
+    uniform float uFar;
+    uniform float uUseLogDepth;
+  #endif
+  #ifdef USE_BLOOM
+    uniform sampler2D tBloom;
+  #endif
+  #ifdef USE_TAA
+    uniform sampler2D tHistory;
+  #endif
 
   uniform vec2 uResolution;
   uniform vec2 uTexelSize;
-  uniform float uNear;
-  uniform float uFar;
   uniform float uTime;
 
-  // 2. SSAO
-  uniform int uSsaoEnabled;
-  uniform float uSsaoIntensity;
-  uniform float uSsaoRadius;
+  #ifdef USE_SSAO
+    uniform float uSsaoIntensity;
+    uniform float uSsaoRadius;
+  #endif
 
-  // 3. SSR
-  uniform int uSsrEnabled;
-  uniform float uSsrIntensity;
+  #ifdef USE_SSR
+    uniform float uSsrIntensity;
+    uniform int uWorldGenMode;
+  #endif
 
-  // 4. HDR Bloom (Standard Multi-Pass & Single-Pass Cheap Bloom for PENTIUM)
-  uniform int uBloomEnabled;
-  uniform int uCheapBloomEnabled;
-  uniform float uBloomStrength;
-  uniform float uBloomThreshold;
+  #if defined(USE_BLOOM) || defined(USE_CHEAP_BLOOM)
+    uniform float uBloomStrength;
+    uniform float uBloomThreshold;
+  #endif
 
-  // 6. Volumetric God Rays
-  uniform int uGodRaysEnabled;
-  uniform float uGodRaysIntensity;
-  uniform vec2 uSunScreenPos;
-  uniform float uSunVisible;
+  #ifdef USE_GODRAYS
+    uniform float uGodRaysIntensity;
+    uniform vec2 uSunScreenPos;
+    uniform float uSunVisible;
+  #endif
 
-  // 7. Motion Blur
-  uniform int uMotionBlurEnabled;
-  uniform float uMotionBlurStrength;
-  uniform mat4 uInvViewProjMatrix;
-  uniform mat4 uPrevViewProjMatrix;
+  #ifdef NEEDS_WORLD_POS
+    uniform mat4 uInvViewProjMatrix;
+  #endif
 
-  // 8. Bokeh Depth of Field
-  uniform int uDofEnabled;
-  uniform float uDofFocusDistance;
-  uniform float uDofAperture;
+  #if defined(USE_MOTION_BLUR) || defined(USE_TAA)
+    uniform mat4 uPrevViewProjMatrix;
+  #endif
 
-  // 9. Volumetric Smoke & Dust Raymarching
-  uniform int uVolumetricSmokeEnabled;
-  uniform float uVolumetricSmokeDensity;
-  uniform vec3 uCameraPos;
-  uniform vec3 uSmokeFocusPos;
-  uniform float uExplosionTrauma;
+  #ifdef USE_MOTION_BLUR
+    uniform float uMotionBlurStrength;
+  #endif
 
-  // 10. Screen-Space Contact Shadows
-  uniform int uContactShadowsEnabled;
-  uniform float uContactShadowsIntensity;
-  uniform vec2 uSunScreenDir;
+  #ifdef USE_DOF
+    uniform float uDofFocusDistance;
+    uniform float uDofAperture;
+  #endif
 
-  // 11. Temporal Anti-Aliasing (TAA)
-  uniform int uTaaEnabled;
-  uniform int uTaaHistoryValid;
-  uniform float uTaaBlendFactor;
-  uniform vec2 uJitterOffset;
+  #if defined(USE_VOLUMETRIC_SMOKE) || defined(USE_SSR)
+    uniform vec3 uCameraPos;
+  #endif
 
-  // 12. Chromatic Aberration & Lens Distortion
-  uniform int uChromaticEnabled;
-  uniform float uChromaticIntensity;
-  uniform float uLensDistortion;
+  #ifdef USE_VOLUMETRIC_SMOKE
+    uniform float uVolumetricSmokeDensity;
+    uniform vec3 uSmokeFocusPos;
+    uniform float uExplosionTrauma;
+  #endif
 
-  // 13. Tiered Visual Quality Grade (0 = LOW/PENTIUM/CARTOON, 1 = MEDIUM, 2 = HIGH, 3 = ULTRA)
-  uniform int uVisualTier;
-  uniform int uSceneIsAlreadySrgb;
-  uniform int uWorldGenMode;
+  #ifdef USE_CONTACT_SHADOWS
+    uniform float uContactShadowsIntensity;
+    uniform vec2 uSunScreenDir;
+  #endif
 
-  // Cancellation-free depth linearization (avoids subtracting uFar - uFar at mid/far distances)
-  float readLinearDepthFromRaw(float z) {
-    float oneMinusZ = max(0.000001, 1.0 - z);
-    return (uNear * uFar) / max(0.00001, uNear + oneMinusZ * (uFar - uNear));
+  #ifdef USE_TAA
+    uniform int uTaaHistoryValid;
+    uniform float uTaaBlendFactor;
+  #endif
+
+  #ifdef USE_CHROMA
+    uniform float uChromaticIntensity;
+  #endif
+  #ifdef USE_LENS_DISTORTION
+    uniform float uLensDistortion;
+  #endif
+
+  // Custom WebGL2 engine already renders sRGB directly into tColor; zero pow() conversion!
+  vec3 sampleScene(vec2 uv) {
+    return texture2D(tColor, clamp(uv, 0.001, 0.999)).rgb;
   }
 
-  float readLinearDepth(vec2 uv) {
-    float z = texture2D(tDepth, clamp(uv, 0.001, 0.999)).x;
-    return readLinearDepthFromRaw(z);
-  }
-
-  // Three.js disables #include <colorspace_fragment> (LinearTosRGB) when rendering into an offscreen
-  // WebGLRenderTarget. Convert linear-lit 3D geometry (rawDepth <= 0.9992) to sRGB,
-  // while skipping conversion when scene shaders already output sRGB (Potato / Cartoon presets).
-  vec3 sampleSceneSrgb(vec2 uv) {
-    vec2 cUv = clamp(uv, 0.001, 0.999);
-    vec3 raw = texture2D(tColor, cUv).rgb;
-    float d = texture2D(tDepth, cUv).x;
-    if (d > 0.9992 || uSceneIsAlreadySrgb == 1) {
-      return raw;
+  #ifdef NEEDS_DEPTH
+    float readLinearDepthFromRaw(float z) {
+      if (uUseLogDepth > 0.5) {
+        return max(uNear, pow(2.0, z * log2(uFar + 1.0)) - 1.0);
+      }
+      float oneMinusZ = max(0.000001, 1.0 - z);
+      return (uNear * uFar) / max(0.00001, uNear + oneMinusZ * (uFar - uNear));
     }
-    vec3 srgb = pow(max(raw, vec3(0.0)), vec3(1.0 / 2.2));
-    return srgb * 1.08;
-  }
 
-  bool isWaterSurfaceWorld(vec3 wp, vec3 srgbCol) {
-    if (wp.y < 13.4 || wp.y > 15.65) return false;
-    // Reject neutral/dark asphalt roads, yellow sand beaches, and green grass land
-    bool isWaterTint = (srgbCol.b > 0.16) && (srgbCol.b > srgbCol.r * 1.12) && (srgbCol.b >= srgbCol.g * 0.90);
-    if (!isWaterTint) return false;
-    if (uWorldGenMode == 0) {
-      return (wp.x < -22.5 && wp.z < 35.5) || length(wp.xz - vec2(65.0, -85.0)) < 18.0;
+    float readLinearDepth(vec2 uv) {
+      float z = texture2D(tDepth, clamp(uv, 0.001, 0.999)).x;
+      return readLinearDepthFromRaw(z);
     }
-    if (uWorldGenMode == 1) {
-      return abs(wp.x - sin(wp.z * 0.04) * 22.0) < 18.0;
-    }
-    if (uWorldGenMode == 4) {
-      return wp.y <= 15.25;
-    }
-    return false;
-  }
+  #endif
 
-  vec3 reconstructWorldPos(vec2 uv, float rawDepth) {
-    vec4 ndc = vec4(uv * 2.0 - 1.0, rawDepth * 2.0 - 1.0, 1.0);
-    vec4 world = uInvViewProjMatrix * ndc;
-    return world.xyz / max(0.0001, world.w);
-  }
+  #ifdef NEEDS_WORLD_POS
+    vec3 reconstructWorldPos(vec2 uv, float rawDepth) {
+      float ndcZ;
+      if (uUseLogDepth > 0.5) {
+        float d = readLinearDepthFromRaw(rawDepth);
+        ndcZ = (uFar + uNear - (2.0 * uNear * uFar) / max(uNear, d)) / max(0.0001, uFar - uNear);
+      } else {
+        ndcZ = rawDepth * 2.0 - 1.0;
+      }
+      vec4 ndc = vec4(uv * 2.0 - 1.0, ndcZ, 1.0);
+      vec4 world = uInvViewProjMatrix * ndc;
+      return world.xyz / max(0.0001, world.w);
+    }
+  #endif
 
-  float noise3D(vec3 p) {
-    vec3 i = floor(p);
-    vec3 f = fract(p);
-    f = f * f * (3.0 - 2.0 * f);
-    float n = i.x + i.y * 57.0 + 113.0 * i.z;
-    return mix(
-      mix(
-        mix(fract(sin(n + 0.0) * 43758.5453), fract(sin(n + 1.0) * 43758.5453), f.x),
-        mix(fract(sin(n + 57.0) * 43758.5453), fract(sin(n + 58.0) * 43758.5453), f.x),
-        f.y
-      ),
-      mix(
-        mix(fract(sin(n + 113.0) * 43758.5453), fract(sin(n + 114.0) * 43758.5453), f.x),
-        mix(fract(sin(n + 170.0) * 43758.5453), fract(sin(n + 171.0) * 43758.5453), f.x),
-        f.y
-      ),
-      f.z
-    );
-  }
+  #ifdef USE_SSR
+    bool isWaterSurfaceWorld(vec3 wp, vec3 srgbCol) {
+      if (wp.y < 13.4 || wp.y > 15.65) return false;
+      bool isWaterTint = (srgbCol.b > 0.16) && (srgbCol.b > srgbCol.r * 1.12) && (srgbCol.b >= srgbCol.g * 0.90);
+      if (!isWaterTint) return false;
+      if (uWorldGenMode == 0) {
+        return (wp.x < -22.5 && wp.z < 35.5) || length(wp.xz - vec2(65.0, -85.0)) < 18.0;
+      }
+      if (uWorldGenMode == 1) {
+        return abs(wp.x - sin(wp.z * 0.04) * 22.0) < 18.0;
+      }
+      if (uWorldGenMode == 4) {
+        return wp.y <= 15.25;
+      }
+      return false;
+    }
+  #endif
+
+  #ifdef USE_VOLUMETRIC_SMOKE
+    float noise3D(vec3 p) {
+      vec3 i = floor(p);
+      vec3 f = fract(p);
+      f = f * f * (3.0 - 2.0 * f);
+      float n = i.x + i.y * 57.0 + 113.0 * i.z;
+      return mix(
+        mix(
+          mix(fract(sin(n + 0.0) * 43758.5453), fract(sin(n + 1.0) * 43758.5453), f.x),
+          mix(fract(sin(n + 57.0) * 43758.5453), fract(sin(n + 58.0) * 43758.5453), f.x),
+          f.y
+        ),
+        mix(
+          mix(fract(sin(n + 113.0) * 43758.5453), fract(sin(n + 114.0) * 43758.5453), f.x),
+          mix(fract(sin(n + 170.0) * 43758.5453), fract(sin(n + 171.0) * 43758.5453), f.x),
+          f.y
+        ),
+        f.z
+      );
+    }
+  #endif
 
   void main() {
-    // 12A. Lens Distortion (Barrel / Pincushion)
-    vec2 centeredUv = vUv - 0.5;
-    float r2 = dot(centeredUv, centeredUv);
     vec2 baseUv = vUv;
-    if (abs(uLensDistortion) > 0.001) {
+
+    #if defined(USE_LENS_DISTORTION) || defined(USE_CHROMA)
+      vec2 centeredUv = vUv - 0.5;
+      float r2 = dot(centeredUv, centeredUv);
+    #endif
+
+    #ifdef USE_LENS_DISTORTION
       baseUv = 0.5 + centeredUv * (1.0 + uLensDistortion * r2 + uLensDistortion * 0.5 * r2 * r2);
       baseUv = clamp(baseUv, 0.001, 0.999);
-    }
+    #endif
 
-    float rawDepth = texture2D(tDepth, baseUv).x;
-    float linearDepth = readLinearDepthFromRaw(rawDepth);
-    bool isSky = rawDepth > 0.9992;
-    vec3 worldPos = isSky
-      ? reconstructWorldPos(baseUv, 0.995)
-      : reconstructWorldPos(baseUv, rawDepth);
+    #ifdef NEEDS_DEPTH
+      float rawDepth = texture2D(tDepth, baseUv).x;
+      float linearDepth = readLinearDepthFromRaw(rawDepth);
+      bool isSky = rawDepth > 0.9992;
+    #endif
 
-    // 12B. Chromatic Aberration & Base Color Fetch (in sRGB display space)
-    vec3 color;
-    if (uChromaticEnabled == 1 && uChromaticIntensity > 0.001) {
-      vec2 caOffset = centeredUv * (0.0035 * uChromaticIntensity * (0.3 + r2 * 1.8));
-      float r = sampleSceneSrgb(baseUv + caOffset).r;
-      float g = sampleSceneSrgb(baseUv).g;
-      float b = sampleSceneSrgb(baseUv - caOffset).b;
-      color = vec3(r, g, b);
-    } else {
-      color = sampleSceneSrgb(baseUv);
-    }
+    #ifdef NEEDS_WORLD_POS
+      vec3 worldPos = isSky
+        ? reconstructWorldPos(baseUv, 0.995)
+        : reconstructWorldPos(baseUv, rawDepth);
+    #endif
+
+    // Base Color Fetch (+ optional Chromatic Aberration)
+    #ifdef USE_CHROMA
+      vec3 color;
+      if (uChromaticIntensity > 0.001) {
+        vec2 caOffset = centeredUv * (0.0032 * uChromaticIntensity * (0.3 + r2 * 1.8));
+        color = vec3(
+          sampleScene(baseUv + caOffset).r,
+          sampleScene(baseUv).g,
+          sampleScene(baseUv - caOffset).b
+        );
+      } else {
+        color = sampleScene(baseUv);
+      }
+    #else
+      vec3 color = sampleScene(baseUv);
+    #endif
 
     // 8. Depth of Field (Bokeh DOF) — Far-Field Only with Depth-Discontinuity Rejection
-    // Never blurs sky pixels or gameplay foreground (< 38m), and weights samples by depth similarity
-    // so airborne debris cubes never bleed square halos onto the sky!
-    if (uDofEnabled == 1 && !isSky) {
-      float focusStart = max(uDofFocusDistance, 38.0);
-      float coc = clamp((linearDepth - focusStart) * uDofAperture * 0.014, 0.0, 0.75);
-      if (coc > 0.05) {
-        vec3 bokehAcc = color;
-        float totalW = 1.0;
-        vec2 blurRad = uTexelSize * coc * 4.5;
-        for (int i = 0; i < 8; i++) {
+    #ifdef USE_DOF
+      if (!isSky) {
+        float focusStart = max(uDofFocusDistance, 38.0);
+        float coc = clamp((linearDepth - focusStart) * uDofAperture * 0.014, 0.0, 0.75);
+        if (coc > 0.05) {
+          vec3 bokehAcc = color;
+          float totalW = 1.0;
+          vec2 blurRad = uTexelSize * coc * 4.2;
+          for (int i = 0; i < 6; i++) {
+            float fi = float(i);
+            float ang = fi * 2.3999632;
+            float rad = sqrt((fi + 0.5) / 6.0);
+            vec2 sampleUv = clamp(baseUv + vec2(cos(ang), sin(ang)) * rad * blurRad, 0.001, 0.999);
+            float sampleRawDepth = texture2D(tDepth, sampleUv).x;
+            if (sampleRawDepth > 0.9992) continue;
+            float sampleDepth = readLinearDepthFromRaw(sampleRawDepth);
+            float depthWeight = 1.0 - smoothstep(0.35, 4.0, abs(sampleDepth - linearDepth));
+            float sampleCoc = clamp((sampleDepth - focusStart) * uDofAperture * 0.014, 0.0, 0.75);
+            float w = mix(0.25, 1.0, sampleCoc) * depthWeight;
+            if (w > 0.01) {
+              bokehAcc += sampleScene(sampleUv) * w;
+              totalW += w;
+            }
+          }
+          color = bokehAcc / totalW;
+        }
+      }
+    #endif
+
+    // 7. Motion Blur (Velocity Space with Depth-Edge Guard)
+    #ifdef USE_MOTION_BLUR
+      if (!isSky && uMotionBlurStrength > 0.005) {
+        vec4 prevClip = uPrevViewProjMatrix * vec4(worldPos, 1.0);
+        vec2 prevUv = (prevClip.xy / max(0.0001, prevClip.w)) * 0.5 + 0.5;
+        vec2 velUv = (baseUv - prevUv) * uMotionBlurStrength;
+        float velLen = length(velUv);
+        if (velLen > 0.0012) {
+          vec2 clampedVel = velUv * min(1.0, 0.022 / velLen);
+          vec3 mbAcc = color;
+          float mbWeight = 1.0;
+          for (int i = 1; i <= 4; i++) {
+            vec2 tapUv = clamp(baseUv - clampedVel * (float(i) * 0.25), 0.001, 0.999);
+            float tapRaw = texture2D(tDepth, tapUv).x;
+            if (tapRaw > 0.9992) continue;
+            float tapDepth = readLinearDepthFromRaw(tapRaw);
+            float w = 1.0 - smoothstep(0.25, 2.5, abs(tapDepth - linearDepth));
+            mbAcc += sampleScene(tapUv) * w;
+            mbWeight += w;
+          }
+          color = mbAcc / mbWeight;
+        }
+      }
+    #endif
+
+    // 2. Screen-Space Ambient Occlusion (SSAO)
+    #ifdef USE_SSAO
+      if (!isSky && linearDepth < 38.0) {
+        float occ = 0.0;
+        float distFade = 1.0 - smoothstep(16.0, 38.0, linearDepth);
+        float minCrease = 0.16 + linearDepth * linearDepth * 0.0014;
+        vec2 radiusUv = uTexelSize * (4.5 * uSsaoRadius) / clamp(linearDepth * 0.08, 0.5, 3.0);
+        for (int i = 0; i < 4; i++) {
           float fi = float(i);
-          float ang = fi * 2.3999632;
-          float rad = sqrt((fi + 0.5) / 8.0);
-          vec2 sampleUv = clamp(baseUv + vec2(cos(ang), sin(ang)) * rad * blurRad, 0.001, 0.999);
-          float sampleRawDepth = texture2D(tDepth, sampleUv).x;
-          if (sampleRawDepth > 0.9992) continue;
-          float sampleDepth = readLinearDepthFromRaw(sampleRawDepth);
-          float depthWeight = 1.0 - smoothstep(0.35, 4.0, abs(sampleDepth - linearDepth));
-          float sampleCoc = clamp((sampleDepth - focusStart) * uDofAperture * 0.014, 0.0, 0.75);
-          float w = mix(0.25, 1.0, sampleCoc) * depthWeight;
-          if (w > 0.01) {
-            bokehAcc += sampleSceneSrgb(sampleUv) * w;
-            totalW += w;
+          float ang = fi * 0.78539816;
+          vec2 offset = vec2(cos(ang), sin(ang)) * radiusUv;
+          vec2 uvPos = clamp(baseUv + offset, 0.001, 0.999);
+          vec2 uvNeg = clamp(baseUv - offset, 0.001, 0.999);
+          float rawPos = texture2D(tDepth, uvPos).x;
+          float rawNeg = texture2D(tDepth, uvNeg).x;
+          if (rawPos > 0.9992 || rawNeg > 0.9992) continue;
+          float dPos = readLinearDepthFromRaw(rawPos);
+          float dNeg = readLinearDepthFromRaw(rawNeg);
+          float valleyDiff = linearDepth - 0.5 * (dPos + dNeg);
+          if (valleyDiff > minCrease && valleyDiff < 1.25 && abs(dPos - dNeg) > minCrease * 1.2) {
+            #if VISUAL_TIER >= 2
+              vec3 pPos = reconstructWorldPos(uvPos, rawPos);
+              vec3 pNeg = reconstructWorldPos(uvNeg, rawNeg);
+              float verticalRise = max(pPos.y, pNeg.y) - worldPos.y;
+              if (verticalRise > 0.22) {
+                float rangeCheck = 1.0 - smoothstep(0.18, 1.25, valleyDiff);
+                occ += rangeCheck * smoothstep(0.22, 0.45, verticalRise);
+              }
+            #else
+              // Fast depth-only crease detection on MEDIUM/LOW (zero mat4 inversions per sample)
+              float rangeCheck = 1.0 - smoothstep(0.18, 1.25, valleyDiff);
+              occ += rangeCheck * smoothstep(minCrease, minCrease * 2.5, valleyDiff);
+            #endif
           }
         }
-        color = bokehAcc / totalW;
+        #if VISUAL_TIER >= 3
+          float minAoFloor = 0.64;
+          float aoWeight = 0.62;
+        #elif VISUAL_TIER == 2
+          float minAoFloor = 0.71;
+          float aoWeight = 0.50;
+        #else
+          float minAoFloor = 0.80;
+          float aoWeight = 0.38;
+        #endif
+        float ao = clamp(1.0 - (occ * 0.25) * uSsaoIntensity * distFade * aoWeight, minAoFloor, 1.0);
+        color *= ao;
       }
-    }
-
-    // 7. Motion Blur (Camera & Vehicle Velocity Space with Depth-Edge Guard)
-    if (uMotionBlurEnabled == 1 && !isSky) {
-      vec4 prevClip = uPrevViewProjMatrix * vec4(worldPos, 1.0);
-      vec2 prevUv = (prevClip.xy / max(0.0001, prevClip.w)) * 0.5 + 0.5;
-      vec2 velUv = (baseUv - prevUv) * uMotionBlurStrength;
-      float velLen = length(velUv);
-      if (velLen > 0.0012) {
-        vec2 clampedVel = velUv * min(1.0, 0.022 / velLen);
-        vec3 mbAcc = color;
-        float mbWeight = 1.0;
-        for (int i = 1; i <= 4; i++) {
-          vec2 tapUv = clamp(baseUv - clampedVel * (float(i) * 0.25), 0.001, 0.999);
-          float tapRaw = texture2D(tDepth, tapUv).x;
-          if (tapRaw > 0.9992) continue;
-          float tapDepth = readLinearDepthFromRaw(tapRaw);
-          float w = 1.0 - smoothstep(0.25, 2.5, abs(tapDepth - linearDepth));
-          mbAcc += sampleSceneSrgb(tapUv) * w;
-          mbWeight += w;
-        }
-        color = mbAcc / mbWeight;
-      }
-    }
-
-    // 2. Screen-Space Ambient Occlusion (SSAO) — 3D World-Space Vertical Crease Detector
-    if (uSsaoEnabled == 1 && !isSky && linearDepth < 38.0) {
-      float occ = 0.0;
-      float distFade = 1.0 - smoothstep(16.0, 38.0, linearDepth);
-      float minCrease = 0.16 + linearDepth * linearDepth * 0.0014;
-      vec2 radiusUv = uTexelSize * (4.5 * uSsaoRadius) / clamp(linearDepth * 0.08, 0.5, 3.0);
-      for (int i = 0; i < 4; i++) {
-        float fi = float(i);
-        float ang = fi * 0.78539816;
-        vec2 offset = vec2(cos(ang), sin(ang)) * radiusUv;
-        vec2 uvPos = clamp(baseUv + offset, 0.001, 0.999);
-        vec2 uvNeg = clamp(baseUv - offset, 0.001, 0.999);
-        float rawPos = texture2D(tDepth, uvPos).x;
-        float rawNeg = texture2D(tDepth, uvNeg).x;
-        if (rawPos > 0.9992 || rawNeg > 0.9992) continue;
-        float dPos = readLinearDepthFromRaw(rawPos);
-        float dNeg = readLinearDepthFromRaw(rawNeg);
-        float valleyDiff = linearDepth - 0.5 * (dPos + dNeg);
-        if (valleyDiff > minCrease && valleyDiff < 1.25) {
-          vec3 pPos = reconstructWorldPos(uvPos, rawPos);
-          vec3 pNeg = reconstructWorldPos(uvNeg, rawNeg);
-          float verticalRise = max(pPos.y, pNeg.y) - worldPos.y;
-          if (verticalRise > 0.22 && abs(dPos - dNeg) > minCrease * 1.2) {
-            float rangeCheck = 1.0 - smoothstep(0.18, 1.25, valleyDiff);
-            occ += rangeCheck * smoothstep(0.22, 0.45, verticalRise);
-          }
-        }
-      }
-      float minAoFloor = uVisualTier >= 3 ? 0.64 : (uVisualTier == 2 ? 0.71 : 0.80);
-      float aoWeight = uVisualTier >= 3 ? 0.62 : (uVisualTier == 2 ? 0.50 : 0.38);
-      float ao = clamp(1.0 - (occ / 4.0) * uSsaoIntensity * distFade * aoWeight, minAoFloor, 1.0);
-      color *= ao;
-    }
+    #endif
 
     // 10. Screen-Space Contact Shadows — 3D World-Elevation Occluder Raymarch
-    if (uContactShadowsEnabled == 1 && !isSky && linearDepth < 34.0) {
-      float contactOcc = 0.0;
-      float distFade = 1.0 - smoothstep(14.0, 34.0, linearDepth);
-      vec2 rayStep = uSunScreenDir * uTexelSize * 2.0;
-      for (int i = 1; i <= 5; i++) {
-        float fi = float(i);
-        vec2 marchUv = baseUv + rayStep * fi;
-        if (marchUv.x < 0.001 || marchUv.x > 0.999 || marchUv.y < 0.001 || marchUv.y > 0.999) break;
-        float sampleRaw = texture2D(tDepth, marchUv).x;
-        if (sampleRaw > 0.9992) continue;
-        float sampleDepth = readLinearDepthFromRaw(sampleRaw);
-        float depthDelta = linearDepth - sampleDepth;
-        if (depthDelta > 0.16 && depthDelta < 1.25) {
-          vec3 marchWorldPos = reconstructWorldPos(marchUv, sampleRaw);
-          float verticalRise = marchWorldPos.y - worldPos.y;
-          float dist3D = length(marchWorldPos - worldPos);
-          if (verticalRise > 0.24 && verticalRise < 1.65 && dist3D < 1.45) {
-            contactOcc = max(contactOcc, (1.0 - fi / 6.0) * smoothstep(0.24, 0.45, verticalRise));
+    #ifdef USE_CONTACT_SHADOWS
+      if (!isSky && linearDepth < 34.0) {
+        float contactOcc = 0.0;
+        float distFade = 1.0 - smoothstep(14.0, 34.0, linearDepth);
+        vec2 rayStep = uSunScreenDir * uTexelSize * 2.2;
+        for (int i = 1; i <= 4; i++) {
+          float fi = float(i);
+          vec2 marchUv = baseUv + rayStep * fi;
+          if (marchUv.x < 0.001 || marchUv.x > 0.999 || marchUv.y < 0.001 || marchUv.y > 0.999) break;
+          float sampleRaw = texture2D(tDepth, marchUv).x;
+          if (sampleRaw > 0.9992) continue;
+          float sampleDepth = readLinearDepthFromRaw(sampleRaw);
+          float depthDelta = linearDepth - sampleDepth;
+          if (depthDelta > 0.16 && depthDelta < 1.25) {
+            vec3 marchWorldPos = reconstructWorldPos(marchUv, sampleRaw);
+            float verticalRise = marchWorldPos.y - worldPos.y;
+            float dist3D = length(marchWorldPos - worldPos);
+            if (verticalRise > 0.24 && verticalRise < 1.65 && dist3D < 1.45) {
+              contactOcc = max(contactOcc, (1.0 - fi / 5.0) * smoothstep(0.24, 0.45, verticalRise));
+            }
           }
         }
+        #if VISUAL_TIER >= 3
+          float maxContactShadow = 0.30;
+        #else
+          float maxContactShadow = 0.22;
+        #endif
+        color *= 1.0 - contactOcc * distFade * clamp(uContactShadowsIntensity * 0.26, 0.0, maxContactShadow);
       }
-      float maxContactShadow = uVisualTier >= 3 ? 0.30 : 0.22;
-      color *= 1.0 - contactOcc * distFade * clamp(uContactShadowsIntensity * 0.26, 0.0, maxContactShadow);
-    }
+    #endif
 
     // 10B. 3D Voxel Micro-Bevel Specular Rim & Sunlit Edge Catch (HIGH & ULTRA Tiers)
-    if (uVisualTier >= 2 && !isSky && linearDepth < 42.0) {
-      float dRight = readLinearDepth(baseUv + vec2(uTexelSize.x, 0.0));
-      float dUp = readLinearDepth(baseUv + vec2(0.0, uTexelSize.y));
-      float edgeGrad = abs(dRight - linearDepth) + abs(dUp - linearDepth);
-      float voxelBevel = smoothstep(0.018, 0.12, edgeGrad) * (1.0 - smoothstep(0.22, 0.65, edgeGrad));
-      float distAtten = 1.0 - smoothstep(14.0, 42.0, linearDepth);
-      float lumaBase = dot(color, vec3(0.299, 0.587, 0.114));
-      float sunlitMask = smoothstep(0.32, 0.78, lumaBase);
-      if (uVisualTier == 2) {
-        color += vec3(1.0, 0.97, 0.88) * voxelBevel * sunlitMask * distAtten * 0.09;
-      } else {
-        color += vec3(1.0, 0.95, 0.82) * voxelBevel * sunlitMask * distAtten * 0.15;
-        color += vec3(0.55, 0.82, 1.0) * voxelBevel * (1.0 - sunlitMask) * distAtten * 0.05;
+    #ifdef USE_MICRO_BEVEL
+      if (!isSky && linearDepth < 42.0) {
+        float dRight = readLinearDepth(baseUv + vec2(uTexelSize.x, 0.0));
+        float dUp = readLinearDepth(baseUv + vec2(0.0, uTexelSize.y));
+        float edgeGrad = abs(dRight - linearDepth) + abs(dUp - linearDepth);
+        float voxelBevel = smoothstep(0.018, 0.12, edgeGrad) * (1.0 - smoothstep(0.22, 0.65, edgeGrad));
+        float distAtten = 1.0 - smoothstep(14.0, 42.0, linearDepth);
+        float lumaBase = dot(color, vec3(0.299, 0.587, 0.114));
+        float sunlitMask = smoothstep(0.32, 0.78, lumaBase);
+        #if VISUAL_TIER == 2
+          color += vec3(1.0, 0.97, 0.88) * voxelBevel * sunlitMask * distAtten * 0.08;
+        #else
+          color += vec3(1.0, 0.95, 0.82) * voxelBevel * sunlitMask * distAtten * 0.13;
+          color += vec3(0.55, 0.82, 1.0) * voxelBevel * (1.0 - sunlitMask) * distAtten * 0.04;
+        #endif
       }
-    }
+    #endif
 
-    // 3. Screen-Space Reflections (SSR) — Jittered Multi-step Screen-Space Raymarch on Water Surfaces Only
-    if (uSsrEnabled == 1 && !isSky && isWaterSurfaceWorld(worldPos, color)) {
-      vec3 hitColor = vec3(0.0);
-      float hitFound = 0.0;
-      float rippleX = sin(worldPos.x * 1.45 + uTime * 2.2) * 0.004;
-      vec2 reflDirUv = normalize(vec2(rippleX * 2.0, 1.0));
-      float ignJitter = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
-      float rayStepLen = 0.036;
-      for (int s = 1; s <= 8; s++) {
-        float stepDist = rayStepLen * (float(s) - 0.35 + ignJitter * 0.7);
-        vec2 sampleUv = baseUv + reflDirUv * stepDist;
-        sampleUv.x += rippleX * float(s) * 0.45;
-        if (sampleUv.x < 0.01 || sampleUv.x > 0.99 || sampleUv.y < 0.01 || sampleUv.y > 0.99) break;
-        float reflRaw = texture2D(tDepth, sampleUv).x;
-        float reflDepth = readLinearDepthFromRaw(reflRaw);
-        if (reflRaw <= 0.9992 && reflDepth > linearDepth + 1.8 && reflDepth < linearDepth + 95.0) {
-          vec3 candPos = reconstructWorldPos(sampleUv, reflRaw);
-          if (candPos.y > max(worldPos.y + 0.35, 14.3)) {
-            float edgeFade =
-              smoothstep(0.01, 0.12, sampleUv.x) * smoothstep(0.99, 0.88, sampleUv.x) *
-              smoothstep(0.01, 0.12, sampleUv.y) * smoothstep(0.99, 0.88, sampleUv.y);
-            float distFade = 1.0 - smoothstep(2.0, 8.0, float(s)) * 0.45;
-            hitColor = sampleSceneSrgb(sampleUv);
-            hitFound = edgeFade * distFade;
-            break;
+    // 3. Screen-Space Reflections (SSR) — Jittered Multi-Step Raymarch on Water Surfaces Only
+    #ifdef USE_SSR
+      if (!isSky && isWaterSurfaceWorld(worldPos, color)) {
+        vec3 hitColor = vec3(0.0);
+        float hitFound = 0.0;
+        float rippleX = sin(worldPos.x * 1.45 + uTime * 2.2) * 0.004;
+        vec2 reflDirUv = normalize(vec2(rippleX * 2.0, 1.0));
+        float ignJitter = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+        float rayStepLen = 0.042;
+        for (int s = 1; s <= 6; s++) {
+          float stepDist = rayStepLen * (float(s) - 0.35 + ignJitter * 0.7);
+          vec2 sampleUv = baseUv + reflDirUv * stepDist;
+          sampleUv.x += rippleX * float(s) * 0.45;
+          if (sampleUv.x < 0.01 || sampleUv.x > 0.99 || sampleUv.y < 0.01 || sampleUv.y > 0.99) break;
+          float reflRaw = texture2D(tDepth, sampleUv).x;
+          float reflDepth = readLinearDepthFromRaw(reflRaw);
+          if (reflRaw <= 0.9992 && reflDepth > linearDepth + 1.8 && reflDepth < linearDepth + 95.0) {
+            vec3 candPos = reconstructWorldPos(sampleUv, reflRaw);
+            if (candPos.y > max(worldPos.y + 0.35, 14.3)) {
+              float edgeFade =
+                smoothstep(0.01, 0.12, sampleUv.x) * smoothstep(0.99, 0.88, sampleUv.x) *
+                smoothstep(0.01, 0.12, sampleUv.y) * smoothstep(0.99, 0.88, sampleUv.y);
+              float distFade = 1.0 - smoothstep(2.0, 6.0, float(s)) * 0.45;
+              hitColor = sampleScene(sampleUv);
+              hitFound = edgeFade * distFade;
+              break;
+            }
           }
         }
-      }
-      if (hitFound > 0.01) {
-        vec3 viewV = normalize(uCameraPos - worldPos);
-        float ssrFresnel = clamp(0.16 + 0.84 * pow(1.0 - max(viewV.y, 0.02), 3.0), 0.12, 0.82);
-        float ssrMix = clamp(uSsrIntensity * ssrFresnel * hitFound * 0.44, 0.0, 0.52);
-        color = mix(color, hitColor, ssrMix);
-      }
-    }
-
-    // 9. Volumetric Smoke & Dust Raymarching — Sunlit Atmospheric Scattering
-    if (uVolumetricSmokeEnabled == 1) {
-      vec3 rayVec = worldPos - uCameraPos;
-      float rayLen = min(length(rayVec), 85.0);
-      vec3 rayDir = rayVec / max(0.001, length(rayVec));
-      float accumSmoke = 0.0;
-      for (int i = 0; i < 5; i++) {
-        float t = ((float(i) + 0.5) / 5.0) * rayLen;
-        vec3 sampleP = uCameraPos + rayDir * t;
-        float distToFocus = length(sampleP - uSmokeFocusPos);
-        float plumeMask = (1.0 - smoothstep(2.5, 22.0, distToFocus)) * (0.12 + uExplosionTrauma * 0.95);
-        float lowMistMask = (1.0 - smoothstep(11.0, 18.0, sampleP.y)) * 0.05;
-        if (plumeMask + lowMistMask > 0.01) {
-          vec3 windP = sampleP * 0.24 + vec3(uTime * 0.45, -uTime * 0.65, uTime * 0.25);
-          float n = noise3D(windP) * 0.65 + noise3D(windP * 2.1) * 0.35;
-          accumSmoke += max(0.0, n - 0.38) * (plumeMask + lowMistMask) * (rayLen / 5.0) * 0.022;
+        if (hitFound > 0.01) {
+          vec3 viewV = normalize(uCameraPos - worldPos);
+          float invVy = 1.0 - max(viewV.y, 0.02);
+          float ssrFresnel = clamp(0.16 + 0.84 * (invVy * invVy * invVy), 0.12, 0.82);
+          float ssrMix = clamp(uSsrIntensity * ssrFresnel * hitFound * 0.44, 0.0, 0.52);
+          color = mix(color, hitColor, ssrMix);
         }
       }
-      float smokeAlpha = clamp(accumSmoke * uVolumetricSmokeDensity, 0.0, 0.38);
-      vec3 sunlitMist = mix(vec3(0.86, 0.93, 1.0), vec3(1.0, 0.72, 0.38), clamp(uExplosionTrauma, 0.0, 1.0));
-      // Screen-like warm scattering so atmospheric dust/mist illuminates rather than darkens
-      color = mix(color, max(color, sunlitMist), smokeAlpha * 0.65);
-    }
+    #endif
 
-    // 6. Volumetric God Rays & Golden Sun Shafts
-    if (uGodRaysEnabled == 1 && uSunVisible > 0.01) {
-      vec2 deltaUv = (baseUv - uSunScreenPos) * (1.0 / 14.0) * 0.85;
-      vec2 marchUv = baseUv;
-      float illumination = 0.0;
-      float decay = 1.0;
-      for (int i = 0; i < 14; i++) {
-        marchUv -= deltaUv;
-        float d = texture2D(tDepth, clamp(marchUv, 0.001, 0.999)).x;
-        float isSkySample = step(0.997, d);
-        illumination += isSkySample * decay;
-        decay *= 0.94;
+    // 9. Volumetric Smoke & Dust Raymarching — Sunlit Atmospheric Scattering (4 jittered steps)
+    #ifdef USE_VOLUMETRIC_SMOKE
+      {
+        vec3 rayVec = worldPos - uCameraPos;
+        float fullLen = max(0.001, length(rayVec));
+        float rayLen = min(fullLen, 85.0);
+        vec3 rayDir = rayVec / fullLen;
+        float accumSmoke = 0.0;
+        float stepScale = (rayLen * 0.25) * 0.026;
+        for (int i = 0; i < 4; i++) {
+          float t = ((float(i) + 0.5) * 0.25) * rayLen;
+          vec3 sampleP = uCameraPos + rayDir * t;
+          float distToFocus = length(sampleP - uSmokeFocusPos);
+          float plumeMask = (1.0 - smoothstep(2.5, 22.0, distToFocus)) * (0.12 + uExplosionTrauma * 0.95);
+          float lowMistMask = (1.0 - smoothstep(11.0, 18.0, sampleP.y)) * 0.05;
+          float densityMask = plumeMask + lowMistMask;
+          if (densityMask > 0.01) {
+            vec3 windP = sampleP * 0.24 + vec3(uTime * 0.45, -uTime * 0.65, uTime * 0.25);
+            float n = noise3D(windP);
+            accumSmoke += max(0.0, n - 0.38) * densityMask * stepScale;
+          }
+        }
+        float smokeAlpha = clamp(accumSmoke * uVolumetricSmokeDensity, 0.0, 0.36);
+        vec3 sunlitMist = mix(vec3(0.86, 0.93, 1.0), vec3(1.0, 0.72, 0.38), clamp(uExplosionTrauma, 0.0, 1.0));
+        color = mix(color, max(color, sunlitMist), smokeAlpha * 0.65);
       }
-      float radialFalloff = 1.0 - smoothstep(0.0, 1.25, length(baseUv - uSunScreenPos));
-      vec3 shaftColor = vec3(1.0, 0.94, 0.76) * (illumination / 14.0) * radialFalloff * uSunVisible * uGodRaysIntensity * 0.72;
-      color += shaftColor;
-    }
+    #endif
 
-    // 4. HDR Bloom & Emissive Glow (Multi-Pass Gaussian or Single-Pass Cheap 5-Tap for PENTIUM)
-    if (uBloomEnabled == 1) {
-      if (uCheapBloomEnabled == 1) {
+    // 6. Volumetric God Rays & Golden Sun Shafts (8 dithered taps instead of 14)
+    #ifdef USE_GODRAYS
+      if (uSunVisible > 0.01) {
+        float ignDither = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+        vec2 deltaUv = (baseUv - uSunScreenPos) * (1.0 / 8.0) * 0.85;
+        vec2 marchUv = baseUv - deltaUv * ignDither;
+        float illumination = 0.0;
+        float decay = 1.0;
+        for (int i = 0; i < 8; i++) {
+          marchUv -= deltaUv;
+          float d = texture2D(tDepth, clamp(marchUv, 0.001, 0.999)).x;
+          illumination += step(0.997, d) * decay;
+          decay *= 0.90;
+        }
+        float radialFalloff = 1.0 - smoothstep(0.0, 1.25, length(baseUv - uSunScreenPos));
+        vec3 shaftColor = vec3(1.0, 0.94, 0.76) * (illumination * 0.125) * radialFalloff * uSunVisible * uGodRaysIntensity * 0.68;
+        color += shaftColor;
+      }
+    #endif
+
+    // 4. HDR Bloom & Emissive Glow
+    #ifdef USE_CHEAP_BLOOM
+      {
         vec2 offX = vec2(uTexelSize.x * 2.5, 0.0);
         vec2 offY = vec2(0.0, uTexelSize.y * 2.5);
-        vec3 c0 = color;
-        vec3 c1 = sampleSceneSrgb(baseUv + offX);
-        vec3 c2 = sampleSceneSrgb(baseUv - offX);
-        vec3 c3 = sampleSceneSrgb(baseUv + offY);
-        vec3 c4 = sampleSceneSrgb(baseUv - offY);
-        vec3 avg = c0 * 0.28 + (c1 + c2 + c3 + c4) * 0.18;
+        vec3 c1 = sampleScene(baseUv + offX);
+        vec3 c2 = sampleScene(baseUv - offX);
+        vec3 c3 = sampleScene(baseUv + offY);
+        vec3 c4 = sampleScene(baseUv - offY);
+        vec3 avg = color * 0.28 + (c1 + c2 + c3 + c4) * 0.18;
         float lum = dot(avg, vec3(0.2126, 0.7152, 0.0722));
         float maxCh = max(avg.r, max(avg.g, avg.b));
         float brightness = max(lum, maxCh * 0.9);
@@ -464,70 +626,74 @@ const COMPOSITE_POST_FRAGMENT_SHADER = /* glsl */ `
         float soft = clamp(brightness - uBloomThreshold + knee, 0.0, 2.0 * knee);
         soft = (soft * soft) / (4.0 * knee);
         float contrib = max(soft, brightness - uBloomThreshold) / max(brightness, 0.0001);
-        color += avg * clamp(contrib, 0.0, 2.5) * (uBloomStrength * 0.85);
-      } else {
-        vec3 bloom = texture2D(tBloom, baseUv).rgb;
-        color += bloom * (uBloomStrength * 0.85);
+        color += avg * clamp(contrib, 0.0, 2.2) * (uBloomStrength * 0.78);
       }
-    }
+    #elif defined(USE_BLOOM)
+      color += texture2D(tBloom, baseUv).rgb * (uBloomStrength * 0.78);
+    #endif
 
-    // 11. Temporal Anti-Aliasing (TAA) with Velocity Reprojection & 5-Tap Neighborhood Clamping (Zero Ghosting)
-    if (uTaaEnabled == 1) {
-      vec3 n1 = sampleSceneSrgb(baseUv + vec2(uTexelSize.x, 0.0));
-      vec3 n2 = sampleSceneSrgb(baseUv - vec2(uTexelSize.x, 0.0));
-      vec3 n3 = sampleSceneSrgb(baseUv + vec2(0.0, uTexelSize.y));
-      vec3 n4 = sampleSceneSrgb(baseUv - vec2(0.0, uTexelSize.y));
-      vec3 nMin = min(color, min(min(n1, n2), min(n3, n4)));
-      vec3 nMax = max(color, max(max(n1, n2), max(n3, n4)));
+    // 11. Temporal Anti-Aliasing (TAA) with Velocity Reprojection & 5-Tap Neighborhood Clamping
+    #ifdef USE_TAA
+      {
+        vec3 n1 = sampleScene(baseUv + vec2(uTexelSize.x, 0.0));
+        vec3 n2 = sampleScene(baseUv - vec2(uTexelSize.x, 0.0));
+        vec3 n3 = sampleScene(baseUv + vec2(0.0, uTexelSize.y));
+        vec3 n4 = sampleScene(baseUv - vec2(0.0, uTexelSize.y));
+        vec3 nMin = min(color, min(min(n1, n2), min(n3, n4)));
+        vec3 nMax = max(color, max(max(n1, n2), max(n3, n4)));
 
-      bool blendedTemporal = false;
-      if (uTaaHistoryValid == 1) {
-        vec4 prevClip = uPrevViewProjMatrix * vec4(worldPos, 1.0);
-        if (prevClip.w > 0.01) {
-          vec2 prevUv = (prevClip.xy / prevClip.w) * 0.5 + 0.5;
-          if (prevUv.x >= 0.002 && prevUv.x <= 0.998 && prevUv.y >= 0.002 && prevUv.y <= 0.998) {
-            vec3 histCol = clamp(texture2D(tHistory, prevUv).rgb, nMin, nMax);
-            color = mix(color, histCol, clamp(uTaaBlendFactor, 0.0, 0.92));
-            blendedTemporal = true;
+        bool blendedTemporal = false;
+        if (uTaaHistoryValid == 1) {
+          vec4 prevClip = uPrevViewProjMatrix * vec4(worldPos, 1.0);
+          if (prevClip.w > 0.01) {
+            vec2 prevUv = (prevClip.xy / prevClip.w) * 0.5 + 0.5;
+            if (prevUv.x >= 0.002 && prevUv.x <= 0.998 && prevUv.y >= 0.002 && prevUv.y <= 0.998) {
+              vec3 histCol = clamp(texture2D(tHistory, prevUv).rgb, nMin, nMax);
+              color = mix(color, histCol, clamp(uTaaBlendFactor, 0.0, 0.92));
+              blendedTemporal = true;
+            }
+          }
+        }
+        if (!blendedTemporal) {
+          float lumaM = dot(color, vec3(0.299, 0.587, 0.114));
+          float luma1 = dot(n1, vec3(0.299, 0.587, 0.114));
+          float luma2 = dot(n2, vec3(0.299, 0.587, 0.114));
+          float luma3 = dot(n3, vec3(0.299, 0.587, 0.114));
+          float luma4 = dot(n4, vec3(0.299, 0.587, 0.114));
+          float lumaContrast = max(lumaM, max(max(luma1, luma2), max(luma3, luma4))) -
+                               min(lumaM, min(min(luma1, luma2), min(luma3, luma4)));
+          if (lumaContrast > 0.06) {
+            vec3 avgNeighbor = 0.25 * (n1 + n2 + n3 + n4);
+            float edgeBlend = clamp((lumaContrast - 0.06) * 1.5, 0.0, 0.35) * clamp(uTaaBlendFactor, 0.0, 1.0);
+            color = mix(color, avgNeighbor, edgeBlend);
           }
         }
       }
-      if (!blendedTemporal) {
-        float lumaM = dot(color, vec3(0.299, 0.587, 0.114));
-        float luma1 = dot(n1, vec3(0.299, 0.587, 0.114));
-        float luma2 = dot(n2, vec3(0.299, 0.587, 0.114));
-        float luma3 = dot(n3, vec3(0.299, 0.587, 0.114));
-        float luma4 = dot(n4, vec3(0.299, 0.587, 0.114));
-        float lumaContrast = max(lumaM, max(max(luma1, luma2), max(luma3, luma4))) -
-                             min(lumaM, min(min(luma1, luma2), min(luma3, luma4)));
-        if (lumaContrast > 0.06) {
-          vec3 avgNeighbor = 0.25 * (n1 + n2 + n3 + n4);
-          float edgeBlend = clamp((lumaContrast - 0.06) * 1.5, 0.0, 0.35) * clamp(uTaaBlendFactor, 0.0, 1.0);
-          color = mix(color, avgNeighbor, edgeBlend);
-        }
-      }
-    }
+    #endif
 
-    // 13. Tiered Color Grading & ACES Filmic Contrast Curve (Makes MEDIUM, HIGH, and ULTRA visibly distinct!)
-    if (uVisualTier == 1) {
-      // MEDIUM: Clean, balanced natural daylight
-      float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
-      color = mix(vec3(luma), color, 1.04);
-    } else if (uVisualTier == 2) {
-      // HIGH: Cinematic HD — Crisp S-curve contrast, vibrant saturation, warm sunlit highlights
-      float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
-      color = mix(vec3(luma), color, 1.12);
-      color = clamp((color - 0.5) * 1.06 + 0.505, 0.0, 1.0);
-      color *= mix(vec3(0.97, 0.99, 1.02), vec3(1.03, 1.01, 0.97), clamp(luma, 0.0, 1.0));
-    } else if (uVisualTier >= 3) {
-      // ULTRA: Photorealistic Next-Gen Showcase — Rich ACES-inspired filmic tonemap, golden-hour warmth & deep azure shadows
-      float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
-      color = mix(vec3(luma), color, 1.18);
-      vec3 shadowTint = vec3(0.93, 0.97, 1.05);
-      vec3 highlightTint = vec3(1.06, 1.02, 0.95);
-      color *= mix(shadowTint, highlightTint, smoothstep(0.15, 0.85, luma));
-      color = clamp((color - 0.5) * 1.10 + 0.51, 0.0, 1.0);
-    }
+    // 13. Tiered Color Grading & ACES Filmic Contrast Curve (properly calibrated for true sRGB input)
+    #if VISUAL_TIER == 1
+      {
+        float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
+        color = mix(vec3(luma), color, 1.05);
+      }
+    #elif VISUAL_TIER == 2
+      {
+        float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
+        color = mix(vec3(luma), color, 1.12);
+        color = clamp((color - 0.5) * 1.07 + 0.505, 0.0, 1.0);
+        color *= mix(vec3(0.97, 0.99, 1.02), vec3(1.03, 1.01, 0.97), clamp(luma, 0.0, 1.0));
+      }
+    #elif VISUAL_TIER >= 3
+      {
+        float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
+        color = mix(vec3(luma), color, 1.16);
+        vec3 shadowTint = vec3(0.94, 0.97, 1.04);
+        vec3 highlightTint = vec3(1.05, 1.02, 0.96);
+        color *= mix(shadowTint, highlightTint, smoothstep(0.15, 0.85, luma));
+        color = clamp((color - 0.5) * 1.09 + 0.51, 0.0, 1.0);
+      }
+    #endif
 
     gl_FragColor = vec4(clamp(color, 0.0, 1.0), 1.0);
   }
@@ -543,6 +709,8 @@ const BLIT_FRAGMENT_SHADER = /* glsl */ `
 `;
 
 const PLANAR_MIRROR_VERTEX_SHADER = /* glsl */ `
+  #include <common>
+  #include <logdepthbuf_pars_vertex>
   varying vec3 vWorldPos;
   varying vec4 vScreenPos;
   void main() {
@@ -550,11 +718,13 @@ const PLANAR_MIRROR_VERTEX_SHADER = /* glsl */ `
     vWorldPos = worldPosition.xyz;
     vScreenPos = projectionMatrix * viewMatrix * worldPosition;
     gl_Position = vScreenPos;
+    #include <logdepthbuf_vertex>
   }
 `;
 
 const PLANAR_MIRROR_FRAGMENT_SHADER = /* glsl */ `
   precision highp float;
+  #include <logdepthbuf_pars_fragment>
   varying vec3 vWorldPos;
   varying vec4 vScreenPos;
   uniform sampler2D tReflection;
@@ -564,8 +734,7 @@ const PLANAR_MIRROR_FRAGMENT_SHADER = /* glsl */ `
   uniform float uTime;
 
   void main() {
-    // Strictly clip planar mirror to actual water basins (West Ocean or Inland Pond) and within active chunk draw distance
-    // so it NEVER sticks out at the horizon beyond green terrain and NEVER appears inside dry-land craters!
+    #include <logdepthbuf_fragment>
     float distFromFocus = length(vWorldPos.xz - uFocusPos.xz);
     if (distFromFocus > uMaxWaterDist) {
       discard;
@@ -584,10 +753,10 @@ const PLANAR_MIRROR_FRAGMENT_SHADER = /* glsl */ `
       cos(vWorldPos.x * 1.05 - uTime * 2.1) + sin(vWorldPos.z * 1.45 + uTime * 2.6)
     ) * 0.0035;
     vec2 reflUv = clamp(vec2(ndc.x, ndc.y) + ripple, 0.002, 0.998);
-    vec3 rawRefl = texture2D(tReflection, reflUv).rgb;
-    vec3 reflCol = pow(max(rawRefl, vec3(0.0)), vec3(1.0 / 2.2)) * 1.08;
+    // Custom WebGL2 engine already renders sRGB into tReflection — no double-gamma!
+    vec3 reflCol = texture2D(tReflection, reflUv).rgb;
     vec3 viewDir = normalize(uCamPos - vWorldPos);
-    float fresnel = pow(1.0 - clamp( abs(viewDir.y), 0.0, 1.0 ), 2.2);
+    float fresnel = pow(1.0 - clamp(abs(viewDir.y), 0.0, 1.0), 2.2);
     vec3 waterTint = vec3(0.12, 0.54, 0.88);
     vec3 finalCol = mix(waterTint, reflCol, clamp(0.45 + fresnel * 0.52, 0.35, 0.94));
     float alpha = clamp(0.38 + fresnel * 0.42, 0.30, 0.76) * horizonFade;
@@ -633,10 +802,12 @@ export class VoxelGraphicsPipeline {
   private bloomBlurMat: THREE.ShaderMaterial;
   private compositeMat: THREE.ShaderMaterial;
   private blitMat: THREE.ShaderMaterial;
+  private activeCompositeKey = 'composite_v2_0';
+  private prewarmTimerId: number | null = null;
+  private disposed = false;
 
   private prevViewProjMatrix = new THREE.Matrix4();
   private hasPrevViewProj = false;
-  private currentShadowMapSize = 1024;
   private currentPlanarRes = 512;
   private width = 1280;
   private height = 720;
@@ -750,9 +921,7 @@ export class VoxelGraphicsPipeline {
       fragmentShader: BLOOM_EXTRACT_FRAGMENT_SHADER,
       uniforms: {
         tColor: { value: this.sceneTarget.texture },
-        tDepth: { value: this.sceneTarget.depthTexture },
         uThreshold: { value: 0.65 },
-        uSceneIsAlreadySrgb: { value: 0 },
       },
       depthTest: false,
       depthWrite: false,
@@ -769,9 +938,13 @@ export class VoxelGraphicsPipeline {
       depthWrite: false,
     });
 
+    const initSpec = computeCompositeFeatureKey(GRAPHICS_PRESETS.MEDIUM, false);
+    this.activeCompositeKey = initSpec.key;
+
     this.compositeMat = new THREE.ShaderMaterial({
       vertexShader: FULLSCREEN_VERTEX_SHADER,
       fragmentShader: COMPOSITE_POST_FRAGMENT_SHADER,
+      defines: initSpec.defines,
       uniforms: {
         tColor: { value: this.sceneTarget.texture },
         tDepth: { value: this.sceneTarget.depthTexture },
@@ -781,59 +954,49 @@ export class VoxelGraphicsPipeline {
         uTexelSize: { value: new THREE.Vector2(1 / w, 1 / h) },
         uNear: { value: camera.near },
         uFar: { value: camera.far },
+        uUseLogDepth: { value: renderer.capabilities.logarithmicDepthBuffer ? 1.0 : 0.0 },
         uTime: { value: 0 },
 
-        uSsaoEnabled: { value: 0 },
         uSsaoIntensity: { value: 0.8 },
         uSsaoRadius: { value: 1.0 },
 
-        uSsrEnabled: { value: 0 },
         uSsrIntensity: { value: 0.6 },
 
-        uBloomEnabled: { value: 0 },
-        uCheapBloomEnabled: { value: 0 },
         uBloomStrength: { value: 0.8 },
         uBloomThreshold: { value: 0.65 },
 
-        uGodRaysEnabled: { value: 0 },
         uGodRaysIntensity: { value: 0.6 },
         uSunScreenPos: { value: new THREE.Vector2(0.5, 0.8) },
         uSunVisible: { value: 1.0 },
 
-        uMotionBlurEnabled: { value: 0 },
         uMotionBlurStrength: { value: 0.45 },
         uInvViewProjMatrix: { value: new THREE.Matrix4() },
         uPrevViewProjMatrix: { value: new THREE.Matrix4() },
 
-        uDofEnabled: { value: 0 },
         uDofFocusDistance: { value: 26.0 },
         uDofAperture: { value: 0.6 },
 
-        uVolumetricSmokeEnabled: { value: 0 },
         uVolumetricSmokeDensity: { value: 0.8 },
         uCameraPos: { value: new THREE.Vector3() },
         uSmokeFocusPos: { value: new THREE.Vector3() },
         uExplosionTrauma: { value: 0.0 },
 
-        uContactShadowsEnabled: { value: 0 },
         uContactShadowsIntensity: { value: 0.6 },
         uSunScreenDir: { value: new THREE.Vector2(0.4, 0.7) },
 
-        uTaaEnabled: { value: 0 },
         uTaaHistoryValid: { value: 0 },
         uTaaBlendFactor: { value: 0.82 },
-        uJitterOffset: { value: new THREE.Vector2(0, 0) },
 
-        uChromaticEnabled: { value: 0 },
         uChromaticIntensity: { value: 0.3 },
         uLensDistortion: { value: 0.0 },
-        uVisualTier: { value: 1 },
-        uSceneIsAlreadySrgb: { value: 0 },
         uWorldGenMode: { value: 0 },
       },
       depthTest: false,
       depthWrite: false,
     });
+    // Key compiled variants by feature bitmask so switching between MEDIUM / HIGH / ULTRA
+    // reuses cached WebGLPrograms with zero shader destruction or recompilation.
+    this.compositeMat.customProgramCacheKey = () => this.activeCompositeKey;
 
     this.blitMat = new THREE.ShaderMaterial({
       vertexShader: FULLSCREEN_VERTEX_SHADER,
@@ -849,6 +1012,20 @@ export class VoxelGraphicsPipeline {
     this.quadScene.add(this.quadMesh);
   }
 
+  /**
+   * Incrementally pre-warms specialized composite shader programs for MEDIUM, HIGH,
+   * and ULTRA during idle browser slices so preset switching never stalls.
+   */
+  public schedulePresetShaderPrewarm(isHeadless = false): void {
+    // Only pre-warm the currently active post-processing shader if needed; avoid synchronous
+    // multi-preset GLSL compilation hitches on PENTIUM / LOW / CARTOON or during startup.
+    if (isHeadless || this.disposed || typeof window === 'undefined') return;
+    if (this.prewarmTimerId !== null) {
+      window.clearTimeout(this.prewarmTimerId);
+      this.prewarmTimerId = null;
+    }
+  }
+
   public getPlanarReflectionTexture(): THREE.Texture | null {
     return this.hasPlanarReflection ? this.planarReflectionTarget.texture : null;
   }
@@ -858,13 +1035,31 @@ export class VoxelGraphicsPipeline {
   }
 
   public applySettings(settings: GraphicsSettings, isHeadless = false): void {
-    // 1. Custom WebGL2 engine uses fast Blob Shadow Sprites (not GPU shadow maps)
+    // 1. Custom WebGL2 engine uses instanced Blob Shadow sprites (not GPU shadow maps)
     this.renderer.shadowMap.enabled = false;
     this.sunLight.castShadow = false;
 
     // 5. Resolution Scale / Super-Sampling (HiDPI devicePixelRatio * resolutionScale)
-    const dpr = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1;
-    const pixelRatio = resolveEffectivePixelRatio(settings.resolutionScale, dpr, isHeadless);
+    const isInIframe = (() => {
+      try {
+        return typeof window !== 'undefined' && window.self !== window.top;
+      } catch {
+        return true;
+      }
+    })();
+    const rawDpr = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1;
+    const isLowEndPreset =
+      settings.usePotatoShader ||
+      settings.preset === 'PENTIUM' ||
+      settings.preset === 'LOW';
+    const effectiveDpr = isLowEndPreset
+      ? 1
+      : Math.min(rawDpr, isInIframe ? 1.25 : 1.5);
+    const pixelRatio = resolveEffectivePixelRatio(
+      settings.resolutionScale,
+      effectiveDpr,
+      isHeadless,
+    );
     this.renderer.setPixelRatio(pixelRatio);
     this.renderer.setSize(window.innerWidth, window.innerHeight);
     if (hasActivePostProcessing(settings)) {
@@ -963,8 +1158,6 @@ export class VoxelGraphicsPipeline {
 
     const useRealisticWater = shouldUseRealisticWater(settings);
     const hasPostFx = hasActivePostProcessing(settings);
-    const sceneIsAlreadySrgb =
-      settings.usePotatoShader || settings.useCartoonShader ? 1 : 0;
 
     if (oceanUniforms) {
       oceanUniforms.uRealisticWater.value = useRealisticWater ? 1.0 : 0.0;
@@ -988,7 +1181,6 @@ export class VoxelGraphicsPipeline {
         this.camera.position.y > WATER_LEVEL - 0.5
       ) {
         if (oceanUniforms) {
-          // Unbind reflection target texture and suppress water voxels before rendering planar mirror pass
           oceanUniforms.uHasPlanarTex.value = 0.0;
           oceanUniforms.uPlanarTex.value = null;
           oceanUniforms.uRenderingPlanar.value = 1.0;
@@ -1047,11 +1239,10 @@ export class VoxelGraphicsPipeline {
         : null;
       oceanUniforms.uReflViewProj.value.copy(_planarReflViewProj);
       oceanUniforms.uPlanarStrength.value = 0.85;
-      oceanUniforms.uWaterOutputSrgb.value =
-        hasPostFx && sceneIsAlreadySrgb === 1 ? 1.0 : 0.0;
+      oceanUniforms.uWaterOutputSrgb.value = 0.0;
     }
 
-    // Direct render path when no screen-space post-processing is enabled
+    // Direct render path when no screen-space post-processing is enabled (PENTIUM, CARTOON, LOW)
     if (!hasPostFx) {
       this.camera.clearViewOffset();
       this.renderer.setRenderTarget(null);
@@ -1095,9 +1286,7 @@ export class VoxelGraphicsPipeline {
       const halfW = this.bloomBrightTarget.width;
       const halfH = this.bloomBrightTarget.height;
       this.bloomExtractMat.uniforms.tColor.value = this.sceneTarget.texture;
-      this.bloomExtractMat.uniforms.tDepth.value = this.sceneTarget.depthTexture;
       this.bloomExtractMat.uniforms.uThreshold.value = settings.bloomThreshold;
-      this.bloomExtractMat.uniforms.uSceneIsAlreadySrgb.value = sceneIsAlreadySrgb;
       this.quadMesh.material = this.bloomExtractMat;
       this.renderer.setRenderTarget(this.bloomBrightTarget);
       this.renderer.render(this.quadScene, this.quadCamera);
@@ -1114,30 +1303,30 @@ export class VoxelGraphicsPipeline {
       this.renderer.render(this.quadScene, this.quadCamera);
     }
 
-    // Compute unjittered view-projection matrices for world-position reconstruction & TAA/motion blur
-    _currViewProj.multiplyMatrices(
-      this.camera.projectionMatrix,
-      this.camera.matrixWorldInverse,
-    );
-    _invViewProj.copy(_currViewProj).invert();
-    if (!this.hasPrevViewProj) {
-      this.prevViewProjMatrix.copy(_currViewProj);
-      this.hasPrevViewProj = true;
+    // Select compile-time specialized composite shader variant for active feature flags
+    const featureSpec = computeCompositeFeatureKey(settings, useTaaPass);
+    if (featureSpec.key !== this.activeCompositeKey) {
+      this.activeCompositeKey = featureSpec.key;
+      this.compositeMat.defines = featureSpec.defines;
     }
 
-    // Project Sun position into screen UV for God Rays & Contact Shadows
-    _sunWorldPos
-      .copy(this.sunLight.position)
-      .sub(this.sunLight.target.position)
-      .normalize()
-      .multiplyScalar(300.0)
-      .add(this.camera.position);
-    _sunProjected.copy(_sunWorldPos).project(this.camera);
-    const sunScreenX = _sunProjected.x * 0.5 + 0.5;
-    const sunScreenY = _sunProjected.y * 0.5 + 0.5;
-    this.camera.getWorldDirection(_camDir);
-    const sunDirWorld = _sunWorldPos.sub(this.camera.position).normalize();
-    const sunForwardDot = Math.max(0, _camDir.dot(sunDirWorld));
+    // Only compute view-projection inverse when the active composite shader variant uses it
+    const needsWorldMatrices = Boolean(
+      featureSpec.defines.NEEDS_WORLD_POS ||
+        featureSpec.defines.USE_MOTION_BLUR ||
+        featureSpec.defines.USE_TAA,
+    );
+    if (needsWorldMatrices) {
+      _currViewProj.multiplyMatrices(
+        this.camera.projectionMatrix,
+        this.camera.matrixWorldInverse,
+      );
+      _invViewProj.copy(_currViewProj).invert();
+      if (!this.hasPrevViewProj) {
+        this.prevViewProjMatrix.copy(_currViewProj);
+        this.hasPrevViewProj = true;
+      }
+    }
 
     const readTaaTarget = this.taaTargets[this.taaIndex];
     const writeTaaTarget = this.taaTargets[1 - this.taaIndex];
@@ -1151,61 +1340,67 @@ export class VoxelGraphicsPipeline {
     u.uFar.value = this.camera.far;
     u.uTime.value = timeSec;
 
-    u.uSsaoEnabled.value = settings.ssaoEnabled ? 1 : 0;
     u.uSsaoIntensity.value = settings.ssaoIntensity;
     u.uSsaoRadius.value = settings.ssaoRadius;
 
-    u.uSsrEnabled.value = settings.ssrEnabled ? 1 : 0;
     u.uSsrIntensity.value = settings.ssrIntensity;
 
-    u.uBloomEnabled.value = settings.bloomEnabled ? 1 : 0;
-    u.uCheapBloomEnabled.value = settings.cheapBloom ? 1 : 0;
     u.uBloomStrength.value = settings.bloomStrength;
     u.uBloomThreshold.value = settings.bloomThreshold;
 
-    u.uGodRaysEnabled.value = settings.godRaysEnabled ? 1 : 0;
-    u.uGodRaysIntensity.value = settings.godRaysIntensity;
-    u.uSunScreenPos.value.set(sunScreenX, sunScreenY);
-    u.uSunVisible.value = sunForwardDot;
+    if (featureSpec.defines.USE_GODRAYS || featureSpec.defines.USE_CONTACT_SHADOWS) {
+      _sunWorldPos
+        .copy(this.sunLight.position)
+        .sub(this.sunLight.target.position)
+        .normalize()
+        .multiplyScalar(300.0)
+        .add(this.camera.position);
+      _sunProjected.copy(_sunWorldPos).project(this.camera);
+      const sunScreenX = _sunProjected.x * 0.5 + 0.5;
+      const sunScreenY = _sunProjected.y * 0.5 + 0.5;
+      this.camera.getWorldDirection(_camDir);
+      const sunDirWorld = _sunWorldPos.sub(this.camera.position).normalize();
+      const sunForwardDot = Math.max(0, _camDir.dot(sunDirWorld));
 
-    const speedBlurFactor = Math.min(1.0, Math.max(0.0, (vehicleSpeedMPS - 8.0) / 22.0));
-    u.uMotionBlurEnabled.value = settings.motionBlurEnabled && speedBlurFactor > 0.01 ? 1 : 0;
-    u.uMotionBlurStrength.value = settings.motionBlurStrength * speedBlurFactor;
-    u.uInvViewProjMatrix.value.copy(_invViewProj);
-    u.uPrevViewProjMatrix.value.copy(this.prevViewProjMatrix);
+      u.uGodRaysIntensity.value = settings.godRaysIntensity;
+      u.uSunScreenPos.value.set(sunScreenX, sunScreenY);
+      u.uSunVisible.value = sunForwardDot;
 
-    u.uDofEnabled.value = settings.dofEnabled ? 1 : 0;
+      u.uContactShadowsIntensity.value = settings.contactShadowsIntensity;
+      const sunDir2D = u.uSunScreenDir.value as THREE.Vector2;
+      sunDir2D.set(sunScreenX - 0.5, sunScreenY - 0.5);
+      if (sunDir2D.lengthSq() > 1e-4) {
+        sunDir2D.normalize();
+      } else {
+        sunDir2D.set(0.5, 0.86);
+      }
+    }
+
+    if (needsWorldMatrices) {
+      const speedBlurFactor = Math.min(1.0, Math.max(0.0, (vehicleSpeedMPS - 8.0) / 22.0));
+      u.uMotionBlurStrength.value =
+        settings.motionBlurEnabled && speedBlurFactor > 0.01
+          ? settings.motionBlurStrength * speedBlurFactor
+          : 0.0;
+      u.uInvViewProjMatrix.value.copy(_invViewProj);
+      u.uPrevViewProjMatrix.value.copy(this.prevViewProjMatrix);
+    }
+
     u.uDofFocusDistance.value = settings.dofFocusDistance;
     u.uDofAperture.value = settings.dofAperture;
 
-    u.uVolumetricSmokeEnabled.value = settings.volumetricSmokeEnabled ? 1 : 0;
     u.uVolumetricSmokeDensity.value = settings.volumetricSmokeDensity;
     u.uCameraPos.value.copy(this.camera.position);
     u.uSmokeFocusPos.value.copy(focusPos);
     u.uExplosionTrauma.value = explosionTrauma;
 
-    u.uContactShadowsEnabled.value = settings.contactShadowsEnabled ? 1 : 0;
-    u.uContactShadowsIntensity.value = settings.contactShadowsIntensity;
-    const sunDir2D = u.uSunScreenDir.value as THREE.Vector2;
-    sunDir2D.set(sunScreenX - 0.5, sunScreenY - 0.5);
-    if (sunDir2D.lengthSq() > 1e-4) {
-      sunDir2D.normalize();
-    } else {
-      sunDir2D.set(0.5, 0.86);
-    }
-
-    u.uTaaEnabled.value = settings.taaEnabled ? 1 : 0;
     u.uTaaHistoryValid.value = useTaaPass && this.hasTaaHistory ? 1 : 0;
     u.uTaaBlendFactor.value = settings.taaBlendFactor;
-    u.uJitterOffset.value.set(jx, jy);
 
     const speedBoostCA = Math.min(0.65, vehicleSpeedMPS * 0.012) + explosionTrauma * 0.85;
-    u.uChromaticEnabled.value = settings.chromaticAberrationEnabled ? 1 : 0;
     u.uChromaticIntensity.value =
       settings.chromaticAberrationIntensity + speedBoostCA * 0.5;
     u.uLensDistortion.value = settings.lensDistortion;
-    u.uVisualTier.value = resolveVisualQualityTier(settings);
-    u.uSceneIsAlreadySrgb.value = sceneIsAlreadySrgb;
     u.uWorldGenMode.value = worldGenModeToShaderId(worldGenMode);
 
     this.quadMesh.material = this.compositeMat;
@@ -1213,10 +1408,16 @@ export class VoxelGraphicsPipeline {
       this.renderer.setRenderTarget(writeTaaTarget);
       this.renderer.render(this.quadScene, this.quadCamera);
 
-      this.blitMat.uniforms.tInput.value = writeTaaTarget.texture;
-      this.quadMesh.material = this.blitMat;
-      this.renderer.setRenderTarget(null);
-      this.renderer.render(this.quadScene, this.quadCamera);
+      // Prefer hardware WebGL2 gl.blitFramebuffer over a second fullscreen quad pass
+      const blitted =
+        typeof (this.renderer as any).blitToScreen === 'function' &&
+        (this.renderer as any).blitToScreen(writeTaaTarget) === true;
+      if (!blitted) {
+        this.blitMat.uniforms.tInput.value = writeTaaTarget.texture;
+        this.quadMesh.material = this.blitMat;
+        this.renderer.setRenderTarget(null);
+        this.renderer.render(this.quadScene, this.quadCamera);
+      }
 
       this.taaIndex = 1 - this.taaIndex;
       this.hasTaaHistory = true;
@@ -1226,10 +1427,17 @@ export class VoxelGraphicsPipeline {
       this.hasTaaHistory = false;
     }
 
-    this.prevViewProjMatrix.copy(_currViewProj);
+    if (needsWorldMatrices) {
+      this.prevViewProjMatrix.copy(_currViewProj);
+    }
   }
 
   public dispose(): void {
+    this.disposed = true;
+    if (this.prewarmTimerId !== null && typeof window !== 'undefined') {
+      window.clearTimeout(this.prewarmTimerId);
+      this.prewarmTimerId = null;
+    }
     this.sceneTarget.dispose();
     this.sceneTarget.depthTexture?.dispose();
     this.bloomBrightTarget.dispose();

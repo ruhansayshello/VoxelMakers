@@ -8,8 +8,11 @@ import {
   Vector2,
   Vector3,
   Vector4,
+  WebGLCoordinateSystem,
   type ColorRepresentation,
+  type CoordinateSystem,
 } from '../math';
+import { DEG2RAD } from '../math/MathUtils';
 import { BufferAttribute } from '../core/BufferAttribute';
 import { BufferGeometry, type GeometryGroup } from '../core/BufferGeometry';
 import { DynamicDrawUsage } from '../core/constants';
@@ -68,11 +71,26 @@ export interface WebGLRendererParameters {
   logarithmicDepthBuffer?: boolean;
 }
 
+export interface BigSectorPositionLike {
+  sectorX: bigint;
+  sectorZ: bigint;
+  localX: number;
+  localY: number;
+  localZ: number;
+}
+
 export interface RenderCameraLike extends Object3D {
   isCamera?: boolean;
+  isPerspectiveCamera?: boolean;
+  isOrthographicCamera?: boolean;
   matrixWorldInverse: Matrix4;
   projectionMatrix: Matrix4;
   projectionMatrixInverse?: Matrix4;
+  coordinateSystem?: CoordinateSystem;
+  reversedDepth?: boolean;
+  fov?: number;
+  aspect?: number;
+  zoom?: number;
   near?: number;
   far?: number;
 }
@@ -90,6 +108,7 @@ export interface RenderableObjectLike extends Object3D, InstancedMeshLike {
 
 export interface WebGLCapabilities {
   isWebGL2: boolean;
+  logarithmicDepthBuffer: boolean;
   precision: 'highp' | 'mediump' | 'lowp';
   maxTextures: number;
   maxVertexTextures: number;
@@ -159,6 +178,16 @@ const _modelViewMatrix = new Matrix4();
 const _normalMatrix = new Matrix3();
 const _cameraWorldPos = new Vector3();
 const _emissiveColor = new Color();
+const _bandProjMatrix = new Matrix4();
+const _savedProjMatrix = new Matrix4();
+const BIG_SECTOR_SIZE_METERS = 1024n;
+const SCALE_BAND_NEAR = 0.25;
+const SCALE_BAND_FAR = 65536;
+
+interface ScaleBandBucket {
+  opaque: RenderItem[];
+  water: RenderItem[];
+}
 
 function createCanvasElement(): HTMLCanvasElement {
   if (typeof document !== 'undefined' && typeof document.createElement === 'function') {
@@ -232,7 +261,12 @@ export class WebGLRenderer {
   private _currentRenderTarget: RenderTargetLike | null = null;
   private _isContextLost = false;
   public currentTime = 0;
+  /** Optional planetary curvature radius in meters (0 = flat world, e.g. 1_600_000 = curved horizon) */
+  public planetCurvatureRadius = 0;
+  /** Optional BigInt macro-sector + local Float64 camera coordinates for exact 10^31 km RTE rendering */
+  public cameraBigSector: BigSectorPositionLike | null = null;
   private _trackedGeometries = new WeakSet<BufferGeometry>();
+  private _trackedInstancedMeshes = new WeakSet<RenderableObjectLike>();
   private _wireframeIndexCache = new WeakMap<
     BufferGeometry,
     { version: number; indexCount: number; attribute: BufferAttribute }
@@ -242,6 +276,13 @@ export class WebGLRenderer {
   private _terrainChunks: RenderableObjectLike[] = [];
   private _batchEligibleChunks: RenderableObjectLike[] = [];
   private _batchFallbackChunks: RenderableObjectLike[] = [];
+
+  // Scale-Space Multi-Pass rendering scratchpads (zero per-frame allocations)
+  private _scaleBandBuckets = new Map<number, ScaleBandBucket>();
+  private _activeScaleBandKeys: number[] = [];
+  private _skyDomeItems: RenderItem[] = [];
+  private _activeScaleBand = 0;
+  private _activeBandScaleBig = 1n;
 
   private _attributes: WebGLAttributes;
   private _bindingStates: WebGLBindingStates;
@@ -311,6 +352,7 @@ export class WebGLRenderer {
 
     this.capabilities = {
       isWebGL2: true,
+      logarithmicDepthBuffer: Boolean(parameters.logarithmicDepthBuffer),
       precision,
       maxTextures,
       maxVertexTextures: getParam(gl.MAX_VERTEX_TEXTURE_IMAGE_UNITS, 16),
@@ -801,6 +843,21 @@ export class WebGLRenderer {
     }
   }
 
+  private trackInstancedMesh(object: RenderableObjectLike): void {
+    if (!this._trackedInstancedMeshes.has(object)) {
+      this._trackedInstancedMeshes.add(object);
+      object.addEventListener('dispose', () => {
+        this._bindingStates.releaseStatesOfObject(object.id);
+        if (object.instanceMatrix) {
+          this._attributes.remove(object.instanceMatrix);
+        }
+        if (object.instanceColor) {
+          this._attributes.remove(object.instanceColor);
+        }
+      });
+    }
+  }
+
   private getWireframeIndexAttribute(geometry: BufferGeometry): BufferAttribute | null {
     const customWire = geometry.userData?.wireframeIndex;
     if (customWire && typeof customWire === 'object' && 'array' in customWire) {
@@ -871,6 +928,7 @@ export class WebGLRenderer {
     if (props.version !== material.version) {
       if (props.programs) {
         for (const oldProg of props.programs.values()) {
+          this._bindingStates.releaseStatesOfProgram(oldProg);
           this._programs.releaseProgram(oldProg);
         }
         props.programs.clear();
@@ -1046,7 +1104,93 @@ export class WebGLRenderer {
 
     this._textures.resetTextureUnits();
 
-    _modelViewMatrix.multiplyMatrices(camera.matrixWorldInverse, object.matrixWorld);
+    const objUserData = (
+      object as unknown as {
+        userData?: {
+          worldOrigin64?: { x: number; y: number; z: number };
+          worldOriginBigInt?: { x: bigint; y: bigint; z: bigint };
+          worldOriginYOffset?: number;
+          scaleBand?: number;
+          bandScaleMetersBig?: bigint;
+        };
+      }
+    ).userData;
+    const originBig = objUserData?.worldOriginBigInt;
+    const origin64 = objUserData?.worldOrigin64;
+    const objScaleBand = objUserData?.scaleBand ?? 0;
+
+    if (originBig && (this._activeScaleBand > 0 || objScaleBand > 0 || this.cameraBigSector !== null)) {
+      // Exact BigInt Sector subtraction + CPU scale-band division BEFORE converting to Float32:
+      // Fixes JS Float64 2^53 precision loss AND WebGL Float32 overflow up to 10^31 km (10^34 m)!
+      const ve = camera.matrixWorldInverse.elements;
+      const useDirectCamPos = !camera.parent || camera.parent === scene;
+      const fallbackCamX = useDirectCamPos ? camera.position.x : camera.matrixWorld.elements[12];
+      const fallbackCamY = useDirectCamPos ? camera.position.y : camera.matrixWorld.elements[13];
+      const fallbackCamZ = useDirectCamPos ? camera.position.z : camera.matrixWorld.elements[14];
+      const camSector = this.cameraBigSector;
+      const camOriginXBig = camSector ? camSector.sectorX * BIG_SECTOR_SIZE_METERS : 0n;
+      const camOriginZBig = camSector ? camSector.sectorZ * BIG_SECTOR_SIZE_METERS : 0n;
+      const camLocalX = camSector ? camSector.localX : fallbackCamX;
+      const camLocalY = camSector ? camSector.localY : fallbackCamY;
+      const camLocalZ = camSector ? camSector.localZ : fallbackCamZ;
+
+      const diffXBig = originBig.x - camOriginXBig;
+      const diffZBig = originBig.z - camOriginZBig;
+      const extraY = typeof objUserData?.worldOriginYOffset === 'number' ? objUserData.worldOriginYOffset : 0;
+      const diffY = Number(originBig.y) + extraY - camLocalY;
+
+      const bandScaleBig =
+        objUserData?.bandScaleMetersBig && objUserData.bandScaleMetersBig > 1n
+          ? objUserData.bandScaleMetersBig
+          : this._activeBandScaleBig;
+
+      let dx: number;
+      let dy: number;
+      let dz: number;
+      if (bandScaleBig <= 1n) {
+        dx = Number(diffXBig) - camLocalX;
+        dy = diffY;
+        dz = Number(diffZBig) - camLocalZ;
+      } else {
+        const qX = diffXBig / bandScaleBig;
+        const rX = diffXBig % bandScaleBig;
+        const qZ = diffZBig / bandScaleBig;
+        const rZ = diffZBig % bandScaleBig;
+        const invScale = 1 / Number(bandScaleBig);
+        dx = Number(qX) + (Number(rX) - camLocalX) * invScale;
+        dy = diffY * invScale;
+        dz = Number(qZ) + (Number(rZ) - camLocalZ) * invScale;
+      }
+
+      const mv = _modelViewMatrix.elements;
+      mv[0] = ve[0]; mv[1] = ve[1]; mv[2] = ve[2]; mv[3] = 0;
+      mv[4] = ve[4]; mv[5] = ve[5]; mv[6] = ve[6]; mv[7] = 0;
+      mv[8] = ve[8]; mv[9] = ve[9]; mv[10] = ve[10]; mv[11] = 0;
+      mv[12] = ve[0] * dx + ve[4] * dy + ve[8] * dz;
+      mv[13] = ve[1] * dx + ve[5] * dy + ve[9] * dz;
+      mv[14] = ve[2] * dx + ve[6] * dy + ve[10] * dz;
+      mv[15] = 1;
+    } else if (origin64) {
+      // Exact IEEE-754 Float64 Relative-to-Eye (RTE) modelViewMatrix for Band-0 mega-tiles
+      const ve = camera.matrixWorldInverse.elements;
+      const useDirectCamPos = !camera.parent || camera.parent === scene;
+      const camX = useDirectCamPos ? camera.position.x : camera.matrixWorld.elements[12];
+      const camY = useDirectCamPos ? camera.position.y : camera.matrixWorld.elements[13];
+      const camZ = useDirectCamPos ? camera.position.z : camera.matrixWorld.elements[14];
+      const dx = origin64.x - camX;
+      const dy = origin64.y - camY;
+      const dz = origin64.z - camZ;
+      const mv = _modelViewMatrix.elements;
+      mv[0] = ve[0]; mv[1] = ve[1]; mv[2] = ve[2]; mv[3] = 0;
+      mv[4] = ve[4]; mv[5] = ve[5]; mv[6] = ve[6]; mv[7] = 0;
+      mv[8] = ve[8]; mv[9] = ve[9]; mv[10] = ve[10]; mv[11] = 0;
+      mv[12] = ve[0] * dx + ve[4] * dy + ve[8] * dz;
+      mv[13] = ve[1] * dx + ve[5] * dy + ve[9] * dz;
+      mv[14] = ve[2] * dx + ve[6] * dy + ve[10] * dz;
+      mv[15] = 1;
+    } else {
+      _modelViewMatrix.multiplyMatrices(camera.matrixWorldInverse, object.matrixWorld);
+    }
     _normalMatrix.getNormalMatrix(_modelViewMatrix);
     _cameraWorldPos.setFromMatrixPosition(camera.matrixWorld);
 
@@ -1064,12 +1208,35 @@ export class WebGLRenderer {
           ? performance.now() * 0.001
           : 0;
     uniforms.setValue(gl, 'uCurrentTime', shaderClockSec);
+    const isOrtho = Boolean(camera.isOrthographicCamera);
+    let curvatureInv2R = 0.0;
+    if (!isOrtho && this.planetCurvatureRadius > 0) {
+      if (this._activeScaleBand === 0) {
+        curvatureInv2R = 1.0 / (2.0 * this.planetCurvatureRadius);
+      } else if (this._activeScaleBand === 1) {
+        // Scale curvature drop consistently into Band 1 coordinates (bandScale / (2 * R))
+        curvatureInv2R = Number(this._activeBandScaleBig) / (2.0 * this.planetCurvatureRadius);
+      }
+    }
+    uniforms.setValue(gl, 'uPlanetCurvatureInv2R', curvatureInv2R);
+    if (this.capabilities.logarithmicDepthBuffer) {
+      const camFar = typeof camera.far === 'number' && camera.far > 1 ? camera.far : 1000;
+      uniforms.setValue(gl, 'logDepthBufFC', 2.0 / Math.log2(camFar + 1.0));
+    }
 
-    // Fog uniforms
+    // Fog uniforms (in cosmic scale bands > 0, use gentle band-local aerial perspective bounds
+    // so Band-0 meter-scale fog distances never wipe out planetary/cosmic horizons!)
     if (scene && scene.fog && material.fog) {
       const fog = scene.fog;
       uniforms.setValue(gl, 'fogColor', fog.color);
-      if ((fog as FogExp2).isFogExp2) {
+      if (this._activeScaleBand > 0) {
+        if ((fog as FogExp2).isFogExp2) {
+          uniforms.setValue(gl, 'fogDensity', 0.0);
+        } else {
+          uniforms.setValue(gl, 'fogNear', 28000);
+          uniforms.setValue(gl, 'fogFar', 120000);
+        }
+      } else if ((fog as FogExp2).isFogExp2) {
         uniforms.setValue(gl, 'fogDensity', (fog as FogExp2).density);
       } else {
         uniforms.setValue(gl, 'fogNear', (fog as Fog).near);
@@ -1152,6 +1319,9 @@ export class WebGLRenderer {
 
     const gl = this._gl;
     this.trackGeometry(geometry);
+    if (object.isInstancedMesh) {
+      this.trackInstancedMesh(object);
+    }
 
     const frontFaceCW = object.matrixWorld.determinant() < 0;
     const program = this.getProgram(material, scene, object, geometry);
@@ -1261,16 +1431,69 @@ export class WebGLRenderer {
         renderable.material !== undefined &&
         (renderable.isMesh || renderable.isLine || renderable.isPoints)
       ) {
-        if (!object.frustumCulled || this.isObjectInFrustum(renderable)) {
+        const objUserData = (
+          renderable as unknown as {
+            userData?: { scaleBand?: number; isSkyDome?: boolean };
+          }
+        ).userData;
+        const scaleBand = objUserData?.scaleBand ?? 0;
+        const isSkyDome = Boolean(objUserData?.isSkyDome);
+        const overrideMat = scene.overrideMaterial as Material | null;
+
+        // Cosmic Scale-Space Band objects (scaleBand > 0) skip Band-0 frustum culling and
+        // route to their own farthest-to-nearest multi-pass bucket (skipped in ortho/shadow passes)
+        if (scaleBand > 0) {
+          if (overrideMat === null && !camera.isOrthographicCamera) {
+            const geometry = renderable.geometry;
+            const material = Array.isArray(renderable.material)
+              ? renderable.material[0]
+              : renderable.material;
+            if (material && material.visible) {
+              let bucket = this._scaleBandBuckets.get(scaleBand);
+              if (!bucket) {
+                bucket = { opaque: [], water: [] };
+                this._scaleBandBuckets.set(scaleBand, bucket);
+              }
+              if (bucket.opaque.length === 0 && bucket.water.length === 0) {
+                this._activeScaleBandKeys.push(scaleBand);
+              }
+              const item: RenderItem = {
+                id: object.id,
+                object,
+                geometry,
+                material,
+                groupOrder,
+                renderOrder: object.renderOrder,
+                z: 0,
+                group: null,
+              };
+              if (material.transparent) {
+                bucket.water.push(item);
+              } else {
+                bucket.opaque.push(item);
+              }
+            }
+          }
+        } else if (!object.frustumCulled || this.isObjectInFrustum(renderable)) {
           _vector3.setFromMatrixPosition(object.matrixWorld).applyMatrix4(_projScreenMatrix);
           const z = _vector3.z;
 
           const geometry = renderable.geometry;
-          const overrideMat = scene.overrideMaterial as Material | null;
           const material = overrideMat ?? renderable.material;
           const list = this._renderLists.get(scene);
 
-          if (Array.isArray(material)) {
+          if (isSkyDome && overrideMat === null && !Array.isArray(material) && material.visible) {
+            this._skyDomeItems.push({
+              id: object.id,
+              object,
+              geometry,
+              material,
+              groupOrder,
+              renderOrder: object.renderOrder,
+              z,
+              group: null,
+            });
+          } else if (Array.isArray(material)) {
             const groups = geometry.groups;
             for (let i = 0; i < groups.length; i++) {
               const group = groups[i];
@@ -1490,6 +1713,28 @@ export class WebGLRenderer {
     return Promise.resolve(scene);
   }
 
+  private buildScaleBandProjectionMatrix(camera: RenderCameraLike, target: Matrix4): void {
+    const fov = typeof camera.fov === 'number' && camera.fov > 0 ? camera.fov : 50;
+    const aspect = typeof camera.aspect === 'number' && camera.aspect > 0 ? camera.aspect : 1;
+    const zoom = typeof camera.zoom === 'number' && camera.zoom > 0 ? camera.zoom : 1;
+    const near = SCALE_BAND_NEAR;
+    const far = SCALE_BAND_FAR;
+    const top = (near * Math.tan(DEG2RAD * 0.5 * fov)) / zoom;
+    const height = 2 * top;
+    const width = aspect * height;
+    const left = -0.5 * width;
+    target.makePerspective(
+      left,
+      left + width,
+      top,
+      top - height,
+      near,
+      far,
+      camera.coordinateSystem ?? WebGLCoordinateSystem,
+      Boolean(camera.reversedDepth),
+    );
+  }
+
   render(scene: Scene, camera: RenderCameraLike): void {
     if (this._isContextLost) return;
 
@@ -1510,6 +1755,15 @@ export class WebGLRenderer {
     const renderList = this._renderLists.get(scene);
     renderList.init();
     this._terrainChunks.length = 0;
+    this._skyDomeItems.length = 0;
+    for (let i = 0; i < this._activeScaleBandKeys.length; i++) {
+      const b = this._scaleBandBuckets.get(this._activeScaleBandKeys[i]);
+      if (b) {
+        b.opaque.length = 0;
+        b.water.length = 0;
+      }
+    }
+    this._activeScaleBandKeys.length = 0;
 
     this.projectObject(scene, camera, scene, 0);
     renderList.finish();
@@ -1522,6 +1776,50 @@ export class WebGLRenderer {
 
     this._background.render(this, scene);
 
+    // 1. Paint SkyDome FIRST behind every cosmic scale band (depthWrite: false, depth = 1.0)
+    if (this._skyDomeItems.length > 0) {
+      this.renderObjects(this._skyDomeItems, scene, camera);
+    }
+
+    // 2. Scale-Space Multi-Pass Rendering: render outer scale bands from FARTHEST -> NEAREST,
+    //    clearing the depth buffer (`gl.clear(gl.DEPTH_BUFFER_BIT)`) between every band so each
+    //    band uses a tight [0.25 .. 65536] frustum with full 24-bit depth precision & zero z-fighting!
+    if (this._activeScaleBandKeys.length > 0 && !camera.isOrthographicCamera) {
+      this._activeScaleBandKeys.sort((a, b) => b - a);
+      this.buildScaleBandProjectionMatrix(camera, _bandProjMatrix);
+      _savedProjMatrix.copy(camera.projectionMatrix);
+      const savedFar = camera.far;
+
+      camera.projectionMatrix.copy(_bandProjMatrix);
+      camera.far = SCALE_BAND_FAR;
+
+      for (let i = 0; i < this._activeScaleBandKeys.length; i++) {
+        const bandIdx = this._activeScaleBandKeys[i];
+        const bucket = this._scaleBandBuckets.get(bandIdx);
+        if (!bucket || (bucket.opaque.length === 0 && bucket.water.length === 0)) continue;
+
+        this._activeScaleBand = bandIdx;
+        this._activeBandScaleBig = 1n << BigInt(bandIdx * 12);
+
+        if (bucket.opaque.length > 0) {
+          this.renderObjects(bucket.opaque, scene, camera);
+        }
+        if (bucket.water.length > 0) {
+          this.renderObjects(bucket.water, scene, camera);
+        }
+
+        // Clear depth buffer between scale bands so nearer bands composite cleanly with full 24-bit depth
+        this.state.setDepthWrite(true);
+        this._gl.clear(this._gl.DEPTH_BUFFER_BIT);
+      }
+
+      this._activeScaleBand = 0;
+      this._activeBandScaleBig = 1n;
+      camera.projectionMatrix.copy(_savedProjMatrix);
+      camera.far = savedFar;
+    }
+
+    // 3. Band 0 (Local Scene): LOD0 real chunks, vehicles, nearby horizon rings, particles, water
     if (this._terrainChunks.length > 0) {
       this.renderChunkBatch(this._terrainChunks, camera, scene, true);
     }
@@ -1546,6 +1844,9 @@ export class WebGLRenderer {
     this._terrainChunks.length = 0;
     this._batchEligibleChunks.length = 0;
     this._batchFallbackChunks.length = 0;
+    this._skyDomeItems.length = 0;
+    this._activeScaleBandKeys.length = 0;
+    this._scaleBandBuckets.clear();
     this._renderLists.dispose();
     this._renderStates.dispose();
     this._bindingStates.dispose();

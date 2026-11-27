@@ -24,6 +24,13 @@ import {
   type FrameRateCapOption,
   type HardwareTier,
 } from './frameRateCap';
+import {
+  DEFAULT_LOD_SPACING,
+  MAX_RENDER_DISTANCE_CHUNKS,
+  sanitizeLodSpacing,
+  sanitizePositiveRenderDistance,
+  sanitizePositiveRenderDistanceBigInt,
+} from './distantHorizonMath.ts';
 
 export type { FrameRateCapOption, HardwareTier };
 
@@ -111,9 +118,13 @@ export interface GraphicsSettings {
   planarReflectionsEnabled: boolean;
   planarReflectionResolution: PlanarReflectionResolution;
 
-  // 15. Voxel Draw Distance / Uncapped Chunk LOD
-  voxelDrawDistance: number; // 2 .. 16 chunks
+  // 15. Voxel Draw Distance / Dynamic Distant Horizons LOD
+  voxelDrawDistance: number; // 2 .. 62,500 chunks (legacy numeric view synced with voxelDrawDistanceBig)
+  /** Exact decimal string chunk radius up to 625000000000000000000000000000063 (10^31 + 1 km); safe for JSON localStorage */
+  voxelDrawDistanceBig?: string;
+  lodSpacing: number; // 0.5 .. 2.5x spacing between LOD ring transitions
   uncappedChunkLod: boolean;
+  planetCurvatureEnabled: boolean; // Optional horizon curve (R = 1,600 km) for panoramic planetary views
 
   // 16. Animated 3D Voxel Ocean Waves (GPU Shader + CPU Buoyancy)
   waveQuality: 'OFF' | 'LOW' | 'MEDIUM' | 'HIGH';
@@ -142,6 +153,20 @@ export function sanitizePlanarResolution(val: number): PlanarReflectionResolutio
   return 256;
 }
 
+/**
+ * Resolves the exact BigInt chunk render distance from a GraphicsSettings object
+ * (supporting arbitrary precision up to 10^31 + 1 km without JSON BigInt errors).
+ */
+export function getVoxelDrawDistanceBigInt(
+  settings: Pick<GraphicsSettings, 'voxelDrawDistance' | 'voxelDrawDistanceBig'>,
+): bigint {
+  const fallback = BigInt(sanitizePositiveRenderDistance(settings.voxelDrawDistance, 6));
+  if (typeof settings.voxelDrawDistanceBig === 'string' && settings.voxelDrawDistanceBig.trim().length > 0) {
+    return sanitizePositiveRenderDistanceBigInt(settings.voxelDrawDistanceBig, fallback);
+  }
+  return fallback;
+}
+
 export const GRAPHICS_PRESETS: Record<Exclude<GraphicsPresetId, 'CUSTOM'>, GraphicsSettings> = {
   PENTIUM: {
     preset: 'PENTIUM',
@@ -161,7 +186,7 @@ export const GRAPHICS_PRESETS: Record<Exclude<GraphicsPresetId, 'CUSTOM'>, Graph
     cheapBloom: false,
     bloomStrength: 0.55,
     bloomThreshold: 0.72,
-    resolutionScale: 0.6,
+    resolutionScale: 0.55,
     godRaysEnabled: false,
     godRaysIntensity: 0.4,
     motionBlurEnabled: false,
@@ -181,15 +206,17 @@ export const GRAPHICS_PRESETS: Record<Exclude<GraphicsPresetId, 'CUSTOM'>, Graph
     particleMultiplier: 0.4,
     planarReflectionsEnabled: false,
     planarReflectionResolution: 256,
-    voxelDrawDistance: 3,
+    voxelDrawDistance: 4,
+    lodSpacing: 0.75,
     uncappedChunkLod: false,
+    planetCurvatureEnabled: false,
     waveQuality: 'OFF',
     fog: true,
     frameRateCap: 'AUTO',
   },
   CARTOON: {
     preset: 'CARTOON',
-    dynamicShadows: true,
+    dynamicShadows: false,
     shadowMapSize: 1024,
     shadowSoftness: 0.9,
     blobShadows: true,
@@ -201,8 +228,8 @@ export const GRAPHICS_PRESETS: Record<Exclude<GraphicsPresetId, 'CUSTOM'>, Graph
     ssaoRadius: 0.8,
     ssrEnabled: false,
     ssrIntensity: 0.4,
-    bloomEnabled: true,
-    cheapBloom: true,
+    bloomEnabled: false,
+    cheapBloom: false,
     bloomStrength: 0.65,
     bloomThreshold: 0.72,
     resolutionScale: 0.85,
@@ -225,8 +252,10 @@ export const GRAPHICS_PRESETS: Record<Exclude<GraphicsPresetId, 'CUSTOM'>, Graph
     particleMultiplier: 0.85,
     planarReflectionsEnabled: false,
     planarReflectionResolution: 256,
-    voxelDrawDistance: 4,
+    voxelDrawDistance: 8,
+    lodSpacing: 1.0,
     uncappedChunkLod: false,
+    planetCurvatureEnabled: false,
     waveQuality: 'MEDIUM',
     fog: true,
     frameRateCap: 'AUTO',
@@ -269,8 +298,10 @@ export const GRAPHICS_PRESETS: Record<Exclude<GraphicsPresetId, 'CUSTOM'>, Graph
     particleMultiplier: 0.5,
     planarReflectionsEnabled: false,
     planarReflectionResolution: 256,
-    voxelDrawDistance: 3,
+    voxelDrawDistance: 6,
+    lodSpacing: 0.85,
     uncappedChunkLod: false,
+    planetCurvatureEnabled: false,
     waveQuality: 'LOW',
     fog: true,
     frameRateCap: 'AUTO',
@@ -313,8 +344,10 @@ export const GRAPHICS_PRESETS: Record<Exclude<GraphicsPresetId, 'CUSTOM'>, Graph
     particleMultiplier: 1.0,
     planarReflectionsEnabled: false,
     planarReflectionResolution: 256,
-    voxelDrawDistance: 5,
+    voxelDrawDistance: 12,
+    lodSpacing: 1.0,
     uncappedChunkLod: false,
+    planetCurvatureEnabled: false,
     waveQuality: 'LOW',
     fog: true,
     frameRateCap: 'AUTO',
@@ -345,7 +378,7 @@ export const GRAPHICS_PRESETS: Record<Exclude<GraphicsPresetId, 'CUSTOM'>, Graph
     dofEnabled: false,
     dofFocusDistance: 28,
     dofAperture: 0.65,
-    volumetricSmokeEnabled: true,
+    volumetricSmokeEnabled: false,
     volumetricSmokeDensity: 0.8,
     contactShadowsEnabled: true,
     contactShadowsIntensity: 0.85,
@@ -353,12 +386,14 @@ export const GRAPHICS_PRESETS: Record<Exclude<GraphicsPresetId, 'CUSTOM'>, Graph
     taaBlendFactor: 0.84,
     chromaticAberrationEnabled: false,
     chromaticAberrationIntensity: 0.35,
-    lensDistortion: 0.03,
+    lensDistortion: 0.0,
     particleMultiplier: 1.4,
     planarReflectionsEnabled: false,
     planarReflectionResolution: 512,
-    voxelDrawDistance: 6,
+    voxelDrawDistance: 20,
+    lodSpacing: 1.35,
     uncappedChunkLod: false,
+    planetCurvatureEnabled: false,
     waveQuality: 'MEDIUM',
     fog: true,
     frameRateCap: 'AUTO',
@@ -379,9 +414,9 @@ export const GRAPHICS_PRESETS: Record<Exclude<GraphicsPresetId, 'CUSTOM'>, Graph
     ssrIntensity: 0.98,
     bloomEnabled: true,
     cheapBloom: false,
-    bloomStrength: 1.22,
-    bloomThreshold: 0.54,
-    resolutionScale: 1.25,
+    bloomStrength: 1.12,
+    bloomThreshold: 0.58,
+    resolutionScale: 1.2,
     godRaysEnabled: true,
     godRaysIntensity: 0.98,
     motionBlurEnabled: true,
@@ -401,8 +436,10 @@ export const GRAPHICS_PRESETS: Record<Exclude<GraphicsPresetId, 'CUSTOM'>, Graph
     particleMultiplier: 2.0,
     planarReflectionsEnabled: true,
     planarReflectionResolution: 512,
-    voxelDrawDistance: 8,
+    voxelDrawDistance: 32,
+    lodSpacing: 1.75,
     uncappedChunkLod: true,
+    planetCurvatureEnabled: false,
     waveQuality: 'HIGH',
     fog: true,
     frameRateCap: 'AUTO',
@@ -486,6 +523,32 @@ export function sanitizeGraphicsSettings(
   }
 
   const usePBR = !usePotatoShader && !useCartoonShader;
+
+  const fallbackDrawBig = getVoxelDrawDistanceBigInt(fallback);
+  let resolvedDrawBig: bigint;
+  if (
+    typeof partial.voxelDrawDistanceBig === 'string' &&
+    partial.voxelDrawDistanceBig.trim().length > 0
+  ) {
+    resolvedDrawBig = sanitizePositiveRenderDistanceBigInt(
+      partial.voxelDrawDistanceBig,
+      fallbackDrawBig,
+    );
+  } else if (
+    typeof partial.voxelDrawDistance === 'number' &&
+    Number.isFinite(partial.voxelDrawDistance) &&
+    partial.voxelDrawDistance > 0
+  ) {
+    resolvedDrawBig = BigInt(
+      sanitizePositiveRenderDistance(partial.voxelDrawDistance, fallback.voxelDrawDistance),
+    );
+  } else {
+    resolvedDrawBig = fallbackDrawBig;
+  }
+  const resolvedDrawNum =
+    resolvedDrawBig > BigInt(MAX_RENDER_DISTANCE_CHUNKS)
+      ? MAX_RENDER_DISTANCE_CHUNKS
+      : Number(resolvedDrawBig);
 
   return {
     preset,
@@ -695,18 +758,20 @@ export function sanitizeGraphicsSettings(
     planarReflectionResolution: sanitizePlanarResolution(
       partial.planarReflectionResolution ?? fallback.planarReflectionResolution,
     ),
-    voxelDrawDistance: Math.round(
-      clampNum(
-        partial.voxelDrawDistance ?? fallback.voxelDrawDistance,
-        2,
-        16,
-        fallback.voxelDrawDistance,
-      ),
+    voxelDrawDistance: resolvedDrawNum,
+    voxelDrawDistanceBig: resolvedDrawBig.toString(),
+    lodSpacing: sanitizeLodSpacing(
+      partial.lodSpacing,
+      fallback.lodSpacing ?? DEFAULT_LOD_SPACING,
     ),
     uncappedChunkLod:
       typeof partial.uncappedChunkLod === 'boolean'
         ? partial.uncappedChunkLod
         : fallback.uncappedChunkLod,
+    planetCurvatureEnabled:
+      typeof partial.planetCurvatureEnabled === 'boolean'
+        ? partial.planetCurvatureEnabled
+        : fallback.planetCurvatureEnabled ?? false,
     waveQuality:
       partial.waveQuality === 'OFF' ||
       partial.waveQuality === 'LOW' ||
@@ -733,10 +798,12 @@ export function loadStoredGraphicsSettings(
     const parsed = JSON.parse(raw);
     if (parsed && typeof parsed === 'object') {
       const preservedCap = sanitizeFrameRateCap(parsed.frameRateCap, 'AUTO');
-      // If user is on a detected low-end GPU (or selected PENTIUM preset), ensure old cached bloom/waves
-      // from previous versions do not force the offscreen FBO post-processing pass!
+      // Ensure built-in PENTIUM and CARTOON presets use the engine-native direct-to-screen config
       if (parsed.preset === 'PENTIUM') {
         return { ...GRAPHICS_PRESETS.PENTIUM, frameRateCap: preservedCap };
+      }
+      if (parsed.preset === 'CARTOON') {
+        return { ...GRAPHICS_PRESETS.CARTOON, frameRateCap: preservedCap };
       }
       if (isLowEndGpu && parsed.preset === 'MEDIUM' && !parsed.userExplicitlySelectedPreset) {
         return { ...GRAPHICS_PRESETS.PENTIUM, frameRateCap: preservedCap };
@@ -834,8 +901,8 @@ export function shouldUseRealisticWater(
 }
 
 /**
- * Computes linear THREE.Fog near/far distances scaled with Voxel Draw Distance (2..16 chunks)
- * so increasing draw distance genuinely pushes out the atmospheric horizon fog instead of capping at 60m.
+ * Computes linear THREE.Fog near/far distances scaled with Voxel Draw Distance (2..512 chunks)
+ * so increasing draw distance genuinely pushes out the atmospheric horizon fog across multi-kilometer views.
  */
 export function computeLinearFogBounds(
   voxelDrawDistance: number,
@@ -846,15 +913,29 @@ export function computeLinearFogBounds(
   if (isMapMode) {
     return { near: 650, far: 1300 };
   }
-  if (!fogEnabled) {
-    return { near: 2000, far: 4000 };
-  }
-  const clampedChunks = Math.max(2, Math.min(16, Math.round(voxelDrawDistance)));
+  const clampedChunks = Math.max(
+    2,
+    Math.min(MAX_RENDER_DISTANCE_CHUNKS, Math.round(voxelDrawDistance)),
+  );
   const radiusMeters = clampedChunks * 16;
+  if (!fogEnabled) {
+    return {
+      near: Math.max(2000, Math.round(radiusMeters * 2.5)),
+      far: Math.max(4000, Math.round(radiusMeters * 5.0)),
+    };
+  }
   if (!isPlaying) {
     return {
       near: Math.max(18, Math.round(radiusMeters * 0.35)),
       far: Math.max(42, Math.round(radiusMeters * 0.72)),
+    };
+  }
+  // At extreme panoramic distances (> 4 km / 256 chunks), blend soft aerial perspective haze
+  // gradually from 45% to 145% of radius so 100 km – 1,000 km continents stay visible as misty silhouettes
+  if (clampedChunks > 256) {
+    return {
+      near: Math.max(28, Math.round(radiusMeters * 0.45)),
+      far: Math.max(60, Math.round(radiusMeters * 1.45)),
     };
   }
   return {

@@ -23,6 +23,7 @@ import {
   getSharedVehicleOutlineMaterial,
   createVehicleBlobShadowMesh,
   updateVehicleBlobShadow,
+  BlobShadowInstancedManager,
   applyMeshMaterialPresetSwap,
   getSmoothedOutlineGeometry,
   attachGpuGerstnerOceanShader,
@@ -30,7 +31,12 @@ import {
   restoreActiveCustomShaderPreset,
   BUILTIN_SHADER_PRESETS,
 } from './potatoShader.ts';
+import { computeCompositeFeatureKey } from './graphicsPipeline.ts';
+import { createDetailedWheelMesh, mergeStaticMeshesInGroup } from './models.ts';
+import { HudTelemetryStore, DEFAULT_LIVE_HUD_TELEMETRY } from './ui/hudTelemetryStore.ts';
 import { greedyMeshBoundedArrays, greedyMeshWaterTopSurfaceOnly } from './physicsMath.ts';
+import { buildAllLodPayloadsForChunk } from './meshWorker.ts';
+import { WebGLState } from '../engine/renderers/webgl/WebGLState.ts';
 import { MAT, WATER_VY } from './constants.ts';
 import * as THREE from 'three';
 
@@ -55,6 +61,7 @@ describe('GraphicsSettings & Presets (15 Features + PENTIUM Potato Mode + CARTOO
     assert.equal(GRAPHICS_PRESETS.CARTOON.usePBR, false);
     assert.equal(GRAPHICS_PRESETS.CARTOON.blobShadows, true);
     assert.equal(GRAPHICS_PRESETS.CARTOON.waveQuality, 'MEDIUM');
+    assert.equal(hasActivePostProcessing(GRAPHICS_PRESETS.CARTOON), false);
     assert.equal(resolveVisualQualityTier(GRAPHICS_PRESETS.CARTOON), 0);
 
     assert.equal(GRAPHICS_PRESETS.LOW.dynamicShadows, false);
@@ -80,7 +87,7 @@ describe('GraphicsSettings & Presets (15 Features + PENTIUM Potato Mode + CARTOO
     assert.equal(resolveVisualQualityTier(GRAPHICS_PRESETS.HIGH), 2);
 
     assert.equal(GRAPHICS_PRESETS.ULTRA.shadowMapSize, 2048);
-    assert.equal(GRAPHICS_PRESETS.ULTRA.resolutionScale, 1.25);
+    assert.equal(GRAPHICS_PRESETS.ULTRA.resolutionScale, 1.2);
     assert.equal(GRAPHICS_PRESETS.ULTRA.dofEnabled, true);
     assert.equal(GRAPHICS_PRESETS.ULTRA.planarReflectionsEnabled, true);
     assert.equal(GRAPHICS_PRESETS.ULTRA.uncappedChunkLod, true);
@@ -293,7 +300,9 @@ describe('GraphicsSettings & Presets (15 Features + PENTIUM Potato Mode + CARTOO
       ssaoIntensity: -5, // should clamp to 0.1
       bloomStrength: 99, // should clamp to 2.5
       particleMultiplier: 0.01, // should clamp to 0.25
-      voxelDrawDistance: 50, // should clamp to 16
+      voxelDrawDistance: 999999, // should clamp to 62500 (1,000 km)
+      lodSpacing: 9.5, // should clamp to 2.5
+      planetCurvatureEnabled: true,
       lensDistortion: 2.0, // should clamp to 0.4
       taaBlendFactor: 0.99, // should clamp to 0.94
       planarReflectionResolution: 2048 as any, // should clamp to 1024
@@ -305,7 +314,9 @@ describe('GraphicsSettings & Presets (15 Features + PENTIUM Potato Mode + CARTOO
     assert.equal(sanitized.ssaoIntensity, 0.1);
     assert.equal(sanitized.bloomStrength, 2.5);
     assert.equal(sanitized.particleMultiplier, 0.25);
-    assert.equal(sanitized.voxelDrawDistance, 16);
+    assert.equal(sanitized.voxelDrawDistance, 62500);
+    assert.equal(sanitized.lodSpacing, 2.5);
+    assert.equal(sanitized.planetCurvatureEnabled, true);
     assert.equal(sanitized.lensDistortion, 0.4);
     assert.equal(sanitized.taaBlendFactor, 0.94);
     assert.equal(sanitized.planarReflectionResolution, 1024);
@@ -508,5 +519,189 @@ describe('GraphicsSettings & Presets (15 Features + PENTIUM Potato Mode + CARTOO
     assert.ok(fakeShader.vertexShader.includes('normal.y > 0.5'));
     assert.ok(fakeShader.fragmentShader.includes('abs(vWaterNormalY) <= 0.5'));
     assert.ok(fakeShader.fragmentShader.includes('bool isUnderwater = cameraPosition.y < vWaterWorldPos.y'));
+  });
+
+  it('specializes composite post-processing shaders per preset via compile-time #defines', () => {
+    const med = computeCompositeFeatureKey(GRAPHICS_PRESETS.MEDIUM, false);
+    const high = computeCompositeFeatureKey(GRAPHICS_PRESETS.HIGH, true);
+    const ultra = computeCompositeFeatureKey(GRAPHICS_PRESETS.ULTRA, true);
+
+    assert.notEqual(med.key, high.key);
+    assert.notEqual(high.key, ultra.key);
+
+    // MEDIUM compiles out SSR, GodRays, DOF, Volumetric Smoke, Lens Distortion, full Bloom, and WorldPos reconstruction
+    assert.equal(med.defines.VISUAL_TIER, 1);
+    assert.equal(med.defines.USE_SSAO, 1);
+    assert.equal(med.defines.USE_CHEAP_BLOOM, 1);
+    assert.equal(med.defines.USE_BLOOM, undefined);
+    assert.equal(med.defines.USE_SSR, undefined);
+    assert.equal(med.defines.USE_GODRAYS, undefined);
+    assert.equal(med.defines.USE_DOF, undefined);
+    assert.equal(med.defines.USE_VOLUMETRIC_SMOKE, undefined);
+    assert.equal(med.defines.NEEDS_WORLD_POS, undefined);
+
+    // HIGH enables SSR, GodRays, Contact Shadows, TAA but strips DOF, Volumetric Smoke, Lens Distortion
+    assert.equal(high.defines.VISUAL_TIER, 2);
+    assert.equal(high.defines.USE_SSR, 1);
+    assert.equal(high.defines.USE_GODRAYS, 1);
+    assert.equal(high.defines.USE_TAA, 1);
+    assert.equal(high.defines.USE_DOF, undefined);
+    assert.equal(high.defines.USE_VOLUMETRIC_SMOKE, undefined);
+    assert.equal(high.defines.NEEDS_WORLD_POS, 1);
+
+    // ULTRA enables full feature stack
+    assert.equal(ultra.defines.VISUAL_TIER, 3);
+    assert.equal(ultra.defines.USE_DOF, 1);
+    assert.equal(ultra.defines.USE_VOLUMETRIC_SMOKE, 1);
+    assert.equal(ultra.defines.USE_LENS_DISTORTION, 1);
+  });
+
+  it('pools vehicle blob shadows into a single InstancedMesh with slot reuse and growth', () => {
+    const mgr = new BlobShadowInstancedManager(2);
+    const s0 = mgr.acquireSlot();
+    const s1 = mgr.acquireSlot();
+    assert.equal(s0, 0);
+    assert.equal(s1, 1);
+    // Growing beyond initial capacity reallocates cleanly
+    const s2 = mgr.acquireSlot();
+    assert.equal(s2, 2);
+    assert.ok(mgr.capacity >= 3);
+
+    mgr.updateSlot(s0, 10, 4, -5, 1.5, 3, 4, 0.5, true);
+    mgr.hideSlot(s1);
+    mgr.commit();
+    assert.equal(mgr.mesh.count, 3);
+
+    mgr.releaseSlot(s1);
+    const reused = mgr.acquireSlot();
+    assert.equal(reused, s1, 'Released shadow slot should be recycled');
+    mgr.dispose();
+  });
+
+  it('merges static sub-meshes on detailed wheels to cut draw calls while preserving steerPivot and rollGroup', () => {
+    const mod: any = {
+      kind: 'WHEEL_STEER',
+      vx: 4,
+      vy: 4,
+      vz: 10,
+      yawIdx: 0,
+      mesh: null,
+      wheelMesh: null,
+      spinMesh: null,
+      lastCompression: 0,
+    };
+    const wheel = createDetailedWheelMesh(mod, false, false);
+    assert.ok(wheel.userData.steerPivot);
+    assert.ok(wheel.userData.rollGroup);
+
+    let meshCount = 0;
+    wheel.traverse((obj) => {
+      if (obj instanceof THREE.Mesh) {
+        meshCount++;
+        assert.ok(obj.geometry.getAttribute('color'), 'Merged wheel meshes should bake vertex colors');
+      }
+    });
+    assert.equal(meshCount, 3, `Expected 3 merged draw calls per wheel (mount, knuckle, tire+rim), got ${meshCount}`);
+
+    // Direct test of mergeStaticMeshesInGroup preserving skipped nodes
+    const group = new THREE.Group();
+    const a = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshStandardMaterial({ color: 0xff0000 }));
+    const b = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshStandardMaterial({ color: 0x00ff00 }));
+    b.position.set(2, 0, 0);
+    const kept = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshStandardMaterial({ color: 0x0000ff }));
+    group.add(a, b, kept);
+    const merged = mergeStaticMeshesInGroup(group, new Set([kept]));
+    assert.ok(merged !== null);
+    assert.equal(group.children.length, 2, 'Two static meshes merge into 1 + 1 skipped mesh');
+    assert.ok(group.children.includes(kept));
+  });
+
+  it('isolates live HUD telemetry in HudTelemetryStore with dirty-checked notifications', () => {
+    const store = new HudTelemetryStore();
+    let notifications = 0;
+    const unsub = store.subscribe(() => {
+      notifications++;
+    });
+
+    // Identical publish emits zero notifications
+    const changed1 = store.publish({ ...DEFAULT_LIVE_HUD_TELEMETRY });
+    assert.equal(changed1, false);
+    assert.equal(notifications, 0);
+
+    // Real change emits exactly 1 notification
+    const changed2 = store.patch({ fps: 120, speedKmh: 84 });
+    assert.equal(changed2, true);
+    assert.equal(notifications, 1);
+    assert.equal(store.getSnapshot().fps, 120);
+    assert.equal(store.getSnapshot().speedKmh, 84);
+
+    // Repeating same values emits zero notifications
+    const changed3 = store.patch({ fps: 120, speedKmh: 84 });
+    assert.equal(changed3, false);
+    assert.equal(notifications, 1);
+
+    unsub();
+    assert.equal(store.subscriberCount, 0);
+  });
+
+  it('keeps WebGLState.bindFramebuffer synchronized across FRAMEBUFFER, READ_FRAMEBUFFER, and DRAW_FRAMEBUFFER', () => {
+    const calls: Array<{ target: number; fb: unknown }> = [];
+    const mockGl: any = {
+      FRAMEBUFFER: 0x8d40,
+      READ_FRAMEBUFFER: 0x8ca8,
+      DRAW_FRAMEBUFFER: 0x8ca9,
+      bindFramebuffer: (target: number, fb: unknown) => {
+        calls.push({ target, fb });
+      },
+    };
+    const state = new WebGLState(mockGl);
+    const fbA = { id: 'A' } as unknown as WebGLFramebuffer;
+    const fbB = { id: 'B' } as unknown as WebGLFramebuffer;
+
+    // Frame 1: bind FBO A via FRAMEBUFFER, then blit (READ = A, DRAW = null)
+    state.bindFramebuffer(mockGl.FRAMEBUFFER, fbA);
+    state.bindFramebuffer(mockGl.READ_FRAMEBUFFER, fbA);
+    state.bindFramebuffer(mockGl.DRAW_FRAMEBUFFER, null);
+
+    // Frame 2: bind FBO B via FRAMEBUFFER (updates both READ and DRAW to B in WebGL2)
+    state.bindFramebuffer(mockGl.FRAMEBUFFER, fbB);
+    calls.length = 0;
+
+    // Blit on Frame 2 must rebind DRAW_FRAMEBUFFER to null (never skip due to stale cache!)
+    const rebound = state.bindFramebuffer(mockGl.DRAW_FRAMEBUFFER, null);
+    assert.equal(rebound, true);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].target, mockGl.DRAW_FRAMEBUFFER);
+    assert.equal(calls[0].fb, null);
+  });
+
+  it('generates procedural top-surface terrain with 66x66 apron and downsampled LOD1/LOD2 off-thread in meshWorker', () => {
+    const res = buildAllLodPayloadsForChunk({
+      type: 'mesh',
+      jobId: 1,
+      cx: 4,
+      cz: 4,
+      minY: 1,
+      maxY: 64,
+      originX: 0,
+      originZ: 0,
+      voxels: new Uint8Array(0),
+      isSurfaceOnly: true,
+      generateSurfaceTerrain: true,
+      worldGenMode: 'DEFAULT_PARK',
+      flatBaseplateMat: MAT.CONCRETE,
+      buildSurfaceLods: true,
+    });
+    assert.equal(res.isSurfaceOnly, true);
+    assert.equal(res.lod12Deferred, false);
+    assert.ok(res.generatedSurfaceHeightMap && res.generatedSurfaceHeightMap.length === 64 * 64);
+    assert.ok(res.generatedSurfaceVoxels && res.generatedSurfaceVoxels.length === 64 * 4 * 64);
+    assert.ok(res.lod0.vertCount > 0 && res.lod0.indexCount > 0);
+    assert.ok(res.lod1.vertCount > 0 && res.lod1.indexCount > 0);
+    assert.ok(res.lod2.vertCount > 0 && res.lod2.indexCount > 0);
+    assert.ok(
+      res.lod2.mergedQuads <= res.lod1.mergedQuads && res.lod1.mergedQuads <= res.lod0.mergedQuads,
+      `Expected progressive surface LOD quad reduction: L0=${res.lod0.mergedQuads}, L1=${res.lod1.mergedQuads}, L2=${res.lod2.mergedQuads}`,
+    );
   });
 });

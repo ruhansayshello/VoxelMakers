@@ -27,6 +27,7 @@ export interface RenderObjectLike {
 export interface ProgramRendererContext extends ProgramRendererLike {
   toneMapping: number;
   outputColorSpace: string;
+  capabilities?: { logarithmicDepthBuffer?: boolean };
 }
 
 export class WebGLPrograms {
@@ -157,6 +158,7 @@ export class WebGLPrograms {
       numHemiLights: isLambert ? lights.numHemiLights : 0,
       numPointLights: isLambert ? lights.numPointLights : 0,
       sizeAttenuation: isPoints ? pointsLike.sizeAttenuation : true,
+      logarithmicDepthBuffer: Boolean(this.renderer.capabilities?.logarithmicDepthBuffer),
       customProgramCacheKey: material.customProgramCacheKey(),
     };
   }
@@ -187,6 +189,7 @@ export class WebGLPrograms {
       parameters.numHemiLights,
       parameters.numPointLights,
       parameters.sizeAttenuation,
+      Boolean(parameters.logarithmicDepthBuffer),
       parameters.customProgramCacheKey,
     ];
 

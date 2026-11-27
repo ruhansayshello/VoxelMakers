@@ -5,6 +5,10 @@ import {
 } from '../../engine/world/VoxelWorld';
 import { MAT, VOXEL_SIZE } from '../constants.ts';
 import { PHYSICS_CONFIG } from './physicsConfig.ts';
+import {
+  unifiedEngineTelemetry,
+  writeInstanceMatrixEulerXYZFast,
+} from '../unifiedVoxelEngine.ts';
 
 export interface DebrisWorldInterface {
   probeGroundBelow: (
@@ -238,11 +242,18 @@ export class VoxelDebrisSystem {
       this.instancedMesh.instanceColor.needsUpdate = true;
     }
 
-    _dummyObj.position.copy(p.position);
-    _dummyObj.quaternion.copy(_tmpQuat);
-    _dummyObj.scale.setScalar(1.0);
-    _dummyObj.updateMatrix();
-    this.instancedMesh.setMatrixAt(idx, _dummyObj.matrix);
+    const instArray = this.instancedMesh.instanceMatrix.array as Float32Array;
+    writeInstanceMatrixEulerXYZFast(
+      instArray,
+      idx,
+      p.position.x,
+      p.position.y,
+      p.position.z,
+      p.rotation.x,
+      p.rotation.y,
+      p.rotation.z,
+      1.0,
+    );
     this.instancedMesh.instanceMatrix.needsUpdate = true;
 
     return p;
@@ -387,6 +398,7 @@ export class VoxelDebrisSystem {
         if (world) {
           if (typeof world.sampleSurfaceHeightFast === 'function') {
             groundY = world.sampleSurfaceHeightFast(p.position.x, p.position.z);
+            unifiedEngineTelemetry.fastHeightmapDebrisProbes++;
           } else {
             const hit = world.probeGroundBelow(
               p.position.x,
@@ -430,11 +442,19 @@ export class VoxelDebrisSystem {
 
         currentActive++;
         this.syncParticleToVoxelWorld(p);
-        _dummyObj.position.copy(p.position);
-        _dummyObj.quaternion.copy(_tmpQuat);
-        _dummyObj.scale.setScalar(Math.max(0.01, p.opacity));
-        _dummyObj.updateMatrix();
-        this.instancedMesh.setMatrixAt(i, _dummyObj.matrix);
+        const instArray = this.instancedMesh.instanceMatrix.array as Float32Array;
+        const s = Math.max(0.01, p.opacity);
+        writeInstanceMatrixEulerXYZFast(
+          instArray,
+          i,
+          p.position.x,
+          p.position.y,
+          p.position.z,
+          p.rotation.x,
+          p.rotation.y,
+          p.rotation.z,
+          s,
+        );
         matrixDirty = true;
       } else {
         // Grounded particle: increment static timer, enter sleep mode at 0.5s, and skip matrix updates until 5.0s fade!
@@ -472,11 +492,19 @@ export class VoxelDebrisSystem {
           this.instancedMesh.setColorAt(i, _tmpColor);
           colorDirty = true;
 
-          _dummyObj.position.copy(p.position);
-          _dummyObj.rotation.copy(p.rotation);
-          _dummyObj.scale.setScalar(Math.max(0.01, p.opacity));
-          _dummyObj.updateMatrix();
-          this.instancedMesh.setMatrixAt(i, _dummyObj.matrix);
+          const instArray = this.instancedMesh.instanceMatrix.array as Float32Array;
+          const s = Math.max(0.01, p.opacity);
+          writeInstanceMatrixEulerXYZFast(
+            instArray,
+            i,
+            p.position.x,
+            p.position.y,
+            p.position.z,
+            p.rotation.x,
+            p.rotation.y,
+            p.rotation.z,
+            s,
+          );
           matrixDirty = true;
         }
 
@@ -508,10 +536,18 @@ export class VoxelDebrisSystem {
     p.grounded = false;
     p.opacity = 0;
     p.position.set(0, -1000, 0);
-    _dummyObj.position.set(0, -1000, 0);
-    _dummyObj.scale.set(0, 0, 0);
-    _dummyObj.updateMatrix();
-    this.instancedMesh.setMatrixAt(index, _dummyObj.matrix);
+    const instArray = this.instancedMesh.instanceMatrix.array as Float32Array;
+    writeInstanceMatrixEulerXYZFast(
+      instArray,
+      index,
+      0,
+      -1000,
+      0,
+      0,
+      0,
+      0,
+      0,
+    );
   }
 
   public clearAll(): void {

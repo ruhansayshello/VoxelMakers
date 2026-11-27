@@ -83,15 +83,22 @@ const _upAxis = new THREE.Vector3(0, 1, 0);
 const _tmpDummy = new THREE.Object3D();
 const _tmpColor = new THREE.Color();
 
-function disposeDroneGroup(group: THREE.Group): void {
+function disposeObjectGroup(group: THREE.Group): void {
+  const disposedMats = new Set<THREE.Material>();
   group.traverse((obj) => {
     const mesh = obj as THREE.Mesh;
     if (mesh.geometry) {
       mesh.geometry.dispose();
     }
     if (Array.isArray(mesh.material)) {
-      mesh.material.forEach((m) => m.dispose());
-    } else if (mesh.material) {
+      for (const m of mesh.material) {
+        if (!disposedMats.has(m)) {
+          disposedMats.add(m);
+          m.dispose();
+        }
+      }
+    } else if (mesh.material && !disposedMats.has(mesh.material)) {
+      disposedMats.add(mesh.material);
       mesh.material.dispose();
     }
   });
@@ -369,6 +376,7 @@ export class WorldArenaSystemsManager {
   public clearArenaTraps(): void {
     for (const t of this.traps) {
       this.scene.remove(t.group);
+      disposeObjectGroup(t.group);
     }
     this.traps.length = 0;
   }
@@ -520,6 +528,7 @@ export class WorldArenaSystemsManager {
   public clearTrackNodes(): void {
     for (const n of this.trackNodes) {
       this.scene.remove(n.group);
+      disposeObjectGroup(n.group);
     }
     this.trackNodes.length = 0;
     this.raceActive = false;
@@ -541,7 +550,7 @@ export class WorldArenaSystemsManager {
       this.droneRespawnTimers.length = 0;
       for (const d of this.drones) {
         this.scene.remove(d.group);
-        disposeDroneGroup(d.group);
+        disposeObjectGroup(d.group);
       }
       this.drones.length = 0;
       return;
@@ -1007,7 +1016,7 @@ export class WorldArenaSystemsManager {
             this.fx.carveWorldCrater(d.pos.x, d.pos.y, d.pos.z, 4, 1, false);
             this.dronesDestroyedCount++;
             this.scene.remove(d.group);
-            disposeDroneGroup(d.group);
+            disposeObjectGroup(d.group);
             this.drones.splice(i, 1);
             // Respawn replacement drone after a short delay
             const respawnOrigin = observerPos.clone();
@@ -1138,6 +1147,8 @@ export class WorldArenaSystemsManager {
     if (this.weatherInstanced.material instanceof THREE.Material) {
       this.weatherInstanced.material.dispose();
     }
+    this.weatherInstanced.dispose();
     this.scene.remove(this.ghostMeshGroup);
+    disposeObjectGroup(this.ghostMeshGroup);
   }
 }

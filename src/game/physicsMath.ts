@@ -2286,6 +2286,7 @@ export function greedyMeshTopSurfaceOnly(
   customColors?: Uint8Array | null,
   useSubarray = false,
   getBoundarySurfVY?: (lx: number, lz: number) => number,
+  voxelSizeY = voxelSizeParam,
 ): GreedyMeshArrays {
   let vertCount = 0;
   let indexCount = 0;
@@ -2492,9 +2493,8 @@ export function greedyMeshTopSurfaceOnly(
   // PASS 1: 2D Greedy Merge of Top Horizontal Faces (+Y, faceIdx = 2)
   for (let lz = 0; lz < dimsZ; lz++) {
     const rowOff = lz * dimsX;
-    const hRowOff = lz << 6;
     for (let lx = 0; lx < dimsX; lx++) {
-      const surfVY = surfaceHeightMap[lx + hRowOff];
+      const surfVY = surfaceHeightMap[lx + rowOff];
       const matCode = getCellCode(lx, surfVY, lz);
       // Pack (surfVY + 1) and matCode if standard material; if customColor, disable merging across different heights
       if ((matCode & 0x40000000) !== 0) {
@@ -2507,11 +2507,12 @@ export function greedyMeshTopSurfaceOnly(
   }
 
   for (let lz = 0; lz < dimsZ; lz++) {
+    const baseRow = lz * dimsX;
     for (let lx = 0; lx < dimsX; ) {
-      const idx = lx + lz * dimsX;
+      const idx = lx + baseRow;
       const key = MASK_2D[idx];
       if (key !== 0) {
-        const surfVY = surfaceHeightMap[lx + (lz << 6)];
+        const surfVY = surfaceHeightMap[idx];
         const isCustom = (key & 0x40000000) !== 0;
         const matCode = isCustom ? key : key & 0xfff;
 
@@ -2519,7 +2520,7 @@ export function greedyMeshTopSurfaceOnly(
         while (
           lx + w < dimsX &&
           MASK_2D[idx + w] === key &&
-          surfaceHeightMap[lx + w + (lz << 6)] === surfVY
+          surfaceHeightMap[idx + w] === surfVY
         ) {
           w++;
         }
@@ -2527,10 +2528,11 @@ export function greedyMeshTopSurfaceOnly(
         let h = 1;
         let done = false;
         while (lz + h < dimsZ) {
+          const checkRow = (lz + h) * dimsX;
           for (let k = 0; k < w; k++) {
             if (
-              MASK_2D[idx + k + h * dimsX] !== key ||
-              surfaceHeightMap[lx + k + ((lz + h) << 6)] !== surfVY
+              MASK_2D[lx + k + checkRow] !== key ||
+              surfaceHeightMap[lx + k + checkRow] !== surfVY
             ) {
               done = true;
               break;
@@ -2540,7 +2542,7 @@ export function greedyMeshTopSurfaceOnly(
           h++;
         }
 
-        const wy = offsetY + (surfVY + 1) * voxelSizeParam;
+        const wy = offsetY + (surfVY + 1) * voxelSizeY;
         const x0 = offsetX + lx * voxelSizeParam;
         const x1 = offsetX + (lx + w) * voxelSizeParam;
         const z0 = offsetZ + lz * voxelSizeParam;
@@ -2573,7 +2575,7 @@ export function greedyMeshTopSurfaceOnly(
   // PASS 2: Exposed Vertical Step Walls (+X, -X, +Z, -Z) ONLY where surfVY > neighborVY
   const sampleSurfVY = (lx: number, lz: number, _fallbackVY: number): number => {
     if (lx >= 0 && lx < dimsX && lz >= 0 && lz < dimsZ) {
-      return surfaceHeightMap[lx + (lz << 6)];
+      return surfaceHeightMap[lx + lz * dimsX];
     }
     if (getBoundarySurfVY) {
       return getBoundarySurfVY(lx, lz);
@@ -2586,13 +2588,13 @@ export function greedyMeshTopSurfaceOnly(
   for (let lx = 0; lx < dimsX; lx++) {
     // +X wall (normal 1, 0, 0, faceIdx = 0)
     for (let lz = 0; lz < dimsZ; ) {
-      const surfVY = surfaceHeightMap[lx + (lz << 6)];
+      const surfVY = surfaceHeightMap[lx + lz * dimsX];
       const nVY = sampleSurfVY(lx + 1, lz, surfVY);
       if (surfVY > nVY) {
         const matCode = getCellCode(lx, surfVY, lz);
         let spanZ = 1;
         while (lz + spanZ < dimsZ) {
-          const nextVY = surfaceHeightMap[lx + ((lz + spanZ) << 6)];
+          const nextVY = surfaceHeightMap[lx + (lz + spanZ) * dimsX];
           const nextNVY = sampleSurfVY(lx + 1, lz + spanZ, nextVY);
           if (
             nextVY !== surfVY ||
@@ -2605,8 +2607,8 @@ export function greedyMeshTopSurfaceOnly(
         }
         rawFaces += (surfVY - nVY) * spanZ;
         const wx = offsetX + (lx + 1) * voxelSizeParam;
-        const y0 = offsetY + (nVY + 1) * voxelSizeParam;
-        const y1 = offsetY + (surfVY + 1) * voxelSizeParam;
+        const y0 = offsetY + (nVY + 1) * voxelSizeY;
+        const y1 = offsetY + (surfVY + 1) * voxelSizeY;
         const z0 = offsetZ + lz * voxelSizeParam;
         const z1 = offsetZ + (lz + spanZ) * voxelSizeParam;
         emitQuad(
@@ -2628,13 +2630,13 @@ export function greedyMeshTopSurfaceOnly(
 
     // -X wall (normal -1, 0, 0, faceIdx = 1)
     for (let lz = 0; lz < dimsZ; ) {
-      const surfVY = surfaceHeightMap[lx + (lz << 6)];
+      const surfVY = surfaceHeightMap[lx + lz * dimsX];
       const nVY = sampleSurfVY(lx - 1, lz, surfVY);
       if (surfVY > nVY) {
         const matCode = getCellCode(lx, surfVY, lz);
         let spanZ = 1;
         while (lz + spanZ < dimsZ) {
-          const nextVY = surfaceHeightMap[lx + ((lz + spanZ) << 6)];
+          const nextVY = surfaceHeightMap[lx + (lz + spanZ) * dimsX];
           const nextNVY = sampleSurfVY(lx - 1, lz + spanZ, nextVY);
           if (
             nextVY !== surfVY ||
@@ -2647,8 +2649,8 @@ export function greedyMeshTopSurfaceOnly(
         }
         rawFaces += (surfVY - nVY) * spanZ;
         const wx = offsetX + lx * voxelSizeParam;
-        const y0 = offsetY + (nVY + 1) * voxelSizeParam;
-        const y1 = offsetY + (surfVY + 1) * voxelSizeParam;
+        const y0 = offsetY + (nVY + 1) * voxelSizeY;
+        const y1 = offsetY + (surfVY + 1) * voxelSizeY;
         const z0 = offsetZ + lz * voxelSizeParam;
         const z1 = offsetZ + (lz + spanZ) * voxelSizeParam;
         emitQuad(
@@ -2671,7 +2673,7 @@ export function greedyMeshTopSurfaceOnly(
 
   // +Z and -Z step walls (merged along X)
   for (let lz = 0; lz < dimsZ; lz++) {
-    const hRowOff = lz << 6;
+    const hRowOff = lz * dimsX;
     // +Z wall (normal 0, 0, 1, faceIdx = 4)
     for (let lx = 0; lx < dimsX; ) {
       const surfVY = surfaceHeightMap[lx + hRowOff];
@@ -2695,8 +2697,8 @@ export function greedyMeshTopSurfaceOnly(
         const wz = offsetZ + (lz + 1) * voxelSizeParam;
         const x0 = offsetX + lx * voxelSizeParam;
         const x1 = offsetX + (lx + spanX) * voxelSizeParam;
-        const y0 = offsetY + (nVY + 1) * voxelSizeParam;
-        const y1 = offsetY + (surfVY + 1) * voxelSizeParam;
+        const y0 = offsetY + (nVY + 1) * voxelSizeY;
+        const y1 = offsetY + (surfVY + 1) * voxelSizeY;
         emitQuad(
           x0, y0, wz,
           x1, y0, wz,
@@ -2737,8 +2739,8 @@ export function greedyMeshTopSurfaceOnly(
         const wz = offsetZ + lz * voxelSizeParam;
         const x0 = offsetX + lx * voxelSizeParam;
         const x1 = offsetX + (lx + spanX) * voxelSizeParam;
-        const y0 = offsetY + (nVY + 1) * voxelSizeParam;
-        const y1 = offsetY + (surfVY + 1) * voxelSizeParam;
+        const y0 = offsetY + (nVY + 1) * voxelSizeY;
+        const y1 = offsetY + (surfVY + 1) * voxelSizeY;
         emitQuad(
           x0, y0, wz,
           x1, y0, wz,
@@ -2798,6 +2800,7 @@ export function greedyMeshWaterTopSurfaceOnly(
   useSubarray = false,
   minWaterScanVY?: number,
   surfaceHeightMap?: Uint16Array | Uint8Array,
+  voxelSizeY = voxelSizeParam,
 ): GreedyMeshArrays {
   let vertCount = 0;
   let indexCount = 0;
@@ -2943,19 +2946,31 @@ export function greedyMeshWaterTopSurfaceOnly(
         const idx = lx + lz * dimsX;
         const cellWaterVY = MASK_2D[idx];
         if (cellWaterVY > 0 && vertCount + 4 < MAX_VERTS) {
+          const isHorizonMegaTile = voxelSizeParam > VOXEL_SIZE + 1e-4;
           const cellWX = offsetX + lx * voxelSizeParam;
           const cellWZ = offsetZ + lz * voxelSizeParam;
           const isPondCore = Math.hypot(cellWX - 65, cellWZ - -85) < 17.5;
+          const isOuterWorldBasin = Math.max(Math.abs(cellWX), Math.abs(cellWZ)) > 128.0;
           const isHoleOrTrenchWater =
-            cellWaterVY < waterVY || ((cellWX > -19.5 || cellWZ > 38.0) && !isPondCore);
+            !isHorizonMegaTile &&
+            (cellWaterVY < waterVY ||
+              ((cellWX > -19.5 || cellWZ > 38.0) && !isPondCore && !isOuterWorldBasin));
           const isShoreSwash =
+            !isHorizonMegaTile &&
             cellWaterVY >= waterVY &&
             ((cellWX > -27.5 && cellWX < -19.5 && cellWZ < 38.0) ||
               (cellWX < -19.5 && Math.abs(cellWZ) < 7.0) ||
               (cellWX < -19.5 && cellWZ > 31.0 && cellWZ < 38.0));
-          const maxWaterSpan = cellWaterVY < waterVY ? 8 : isShoreSwash ? 1 : 2;
+          const maxWaterSpan =
+            isHorizonMegaTile
+              ? 64
+              : cellWaterVY < waterVY
+                ? 8
+                : isShoreSwash
+                  ? 1
+                  : 2;
           const wr = isHoleOrTrenchWater ? 0.60 : 0.04;
-          const wy = offsetY + (cellWaterVY + 1) * voxelSizeParam;
+          const wy = offsetY + (cellWaterVY + 1) * voxelSizeY;
 
           let w = 1;
           while (w < maxWaterSpan && lx + w < dimsX && MASK_2D[idx + w] === cellWaterVY) w++;
@@ -4181,6 +4196,7 @@ export interface PlayerJetpackStepInput {
   groundY: number;
   playerVelY: number;
   spaceHeld: boolean;
+  shiftHeld?: boolean;
   spaceHoldTime: number;
   dt: number;
   longPressThresholdSec?: number;
@@ -4190,6 +4206,7 @@ export interface PlayerJetpackStepResult {
   playerVelY: number;
   spaceHoldTime: number;
   isJetpacking: boolean;
+  isTurboFlight: boolean;
   didJump: boolean;
 }
 
@@ -4198,30 +4215,40 @@ export interface PlayerJetpackStepResult {
  * - Short press while grounded triggers a normal jump (velY = 7.4 m/s).
  * - Holding/long-pressing Space (>= 0.18s) ignites the backpack thruster jetpack,
  *   providing continuous upward thrust that overcomes gravity and climbs up to 11.2 m/s.
+ * - Holding Shift + Space ignites turbo afterburner flight for rapid vertical climb (~34 m/s)
+ *   and fast aerial travel.
  */
 export function stepPlayerJetpackAndJump(
   input: PlayerJetpackStepInput,
 ): PlayerJetpackStepResult {
   const physDt = Math.min(Math.max(0.001, input.dt), 0.05);
-  const threshold = input.longPressThresholdSec ?? 0.18;
+  const shiftHeld = Boolean(input.shiftHeld);
+  const threshold = shiftHeld ? Math.min(0.05, input.longPressThresholdSec ?? 0.18) : (input.longPressThresholdSec ?? 0.18);
   let velY = input.playerVelY;
   let holdTime = input.spaceHoldTime;
   let isJetpacking = false;
+  let isTurboFlight = false;
   let didJump = false;
 
   if (input.spaceHeld) {
     if (holdTime === 0 && input.footY <= input.groundY + 0.18) {
-      velY = 7.4;
+      velY = shiftHeld ? 13.5 : 7.4;
       didJump = true;
     }
     holdTime += physDt;
     if (holdTime >= threshold) {
       isJetpacking = true;
-      velY = Math.min(11.5, Math.max(4.8, velY) + 38.0 * physDt);
+      if (shiftHeld) {
+        isTurboFlight = true;
+        velY = Math.min(34.0, Math.max(12.5, velY) + 95.0 * physDt);
+      } else {
+        velY = Math.min(11.5, Math.max(4.8, velY) + 38.0 * physDt);
+      }
     }
   } else {
     holdTime = 0;
     isJetpacking = false;
+    isTurboFlight = false;
   }
 
   velY = Math.max(-24.0, velY - 19.0 * physDt);
@@ -4230,6 +4257,7 @@ export function stepPlayerJetpackAndJump(
     playerVelY: velY,
     spaceHoldTime: holdTime,
     isJetpacking,
+    isTurboFlight,
     didJump,
   };
 }

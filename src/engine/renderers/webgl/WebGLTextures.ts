@@ -63,12 +63,15 @@ interface TextureProps {
   __webglTexture?: WebGLTexture | null;
   __version?: number;
   __init?: boolean;
+  __isRenderTargetTexture?: boolean;
 }
 
 interface RenderTargetProps {
   __webglFramebuffer?: WebGLFramebuffer | null;
   __webglDepthbuffer?: WebGLRenderbuffer | null;
   __init?: boolean;
+  __width?: number;
+  __height?: number;
 }
 
 function mapWrap(gl: WebGL2RenderingContext, wrap?: number): number {
@@ -120,6 +123,8 @@ export class WebGLTextures implements TextureBinder {
   private activeTextures = new Set<WebGLTexture>();
   private activeFramebuffers = new Set<WebGLFramebuffer>();
   private activeRenderbuffers = new Set<WebGLRenderbuffer>();
+  private canRenderFloat = false;
+  private canRenderHalfFloat = false;
 
   constructor(
     gl: WebGL2RenderingContext,
@@ -133,6 +138,17 @@ export class WebGLTextures implements TextureBinder {
     this.properties = properties;
     this.memory = memory;
     this.maxTextures = maxTextures;
+
+    if (typeof gl.getExtension === 'function') {
+      const extFloat = gl.getExtension('EXT_color_buffer_float');
+      const extHalfFloat = gl.getExtension('EXT_color_buffer_half_float');
+      this.canRenderFloat = Boolean(extFloat);
+      this.canRenderHalfFloat = Boolean(extFloat || extHalfFloat);
+    } else {
+      // Headless/unit-test mock GL contexts without getExtension: preserve requested float formats
+      this.canRenderFloat = true;
+      this.canRenderHalfFloat = true;
+    }
   }
 
   resetTextureUnits(): void {
@@ -157,6 +173,11 @@ export class WebGLTextures implements TextureBinder {
 
     const tex = texture as RenderTextureLike;
     const props = this.properties.get<TextureProps>(tex);
+
+    if (props.__isRenderTargetTexture && props.__webglTexture) {
+      this.state.bindTexture(gl.TEXTURE_2D, props.__webglTexture, gl.TEXTURE0 + slot);
+      return;
+    }
 
     if (tex.version !== undefined && tex.version > 0 && props.__version !== tex.version) {
       this.uploadTexture2D(tex, props, slot);
@@ -183,6 +204,10 @@ export class WebGLTextures implements TextureBinder {
         if (props.__webglTexture) {
           this.activeTextures.add(props.__webglTexture);
           this.memory.textures++;
+        }
+        if (!props.__init && typeof tex.addEventListener === 'function') {
+          props.__init = true;
+          tex.addEventListener('dispose', () => this.deallocateTexture(tex));
         }
       }
       this.state.bindTexture(gl.TEXTURE_3D, props.__webglTexture ?? null, gl.TEXTURE0 + slot);
@@ -272,7 +297,52 @@ export class WebGLTextures implements TextureBinder {
   setupRenderTarget(renderTarget: RenderTargetLike): WebGLFramebuffer | null {
     const gl = this.gl;
     const rtProps = this.properties.get<RenderTargetProps>(renderTarget);
+    const tex = renderTarget.texture;
+    const texProps = this.properties.get<TextureProps>(tex);
+
+    const resolveAttachmentFormat = () => {
+      const fmt = mapFormat(gl, tex.format ?? RGBAFormat);
+      let glType = mapType(gl, tex.type);
+      if (glType === gl.FLOAT && !this.canRenderFloat) {
+        glType = gl.UNSIGNED_BYTE;
+      } else if (glType === gl.HALF_FLOAT && !this.canRenderHalfFloat) {
+        glType = gl.UNSIGNED_BYTE;
+      }
+      const internalFormat =
+        glType === gl.FLOAT ? gl.RGBA32F : glType === gl.HALF_FLOAT ? gl.RGBA16F : fmt.internalFormat;
+      return { fmt, glType, internalFormat };
+    };
+
     if (rtProps.__webglFramebuffer) {
+      if (rtProps.__width !== renderTarget.width || rtProps.__height !== renderTarget.height) {
+        rtProps.__width = renderTarget.width;
+        rtProps.__height = renderTarget.height;
+        const { fmt, glType, internalFormat } = resolveAttachmentFormat();
+        if (texProps.__webglTexture) {
+          this.state.bindTexture(gl.TEXTURE_2D, texProps.__webglTexture);
+          gl.texImage2D(
+            gl.TEXTURE_2D,
+            0,
+            internalFormat,
+            renderTarget.width,
+            renderTarget.height,
+            0,
+            fmt.format,
+            glType,
+            null,
+          );
+        }
+        if (rtProps.__webglDepthbuffer) {
+          gl.bindRenderbuffer(gl.RENDERBUFFER, rtProps.__webglDepthbuffer);
+          gl.renderbufferStorage(
+            gl.RENDERBUFFER,
+            renderTarget.stencilBuffer ? gl.DEPTH24_STENCIL8 : gl.DEPTH_COMPONENT16,
+            renderTarget.width,
+            renderTarget.height,
+          );
+          gl.bindRenderbuffer(gl.RENDERBUFFER, null);
+        }
+      }
       return rtProps.__webglFramebuffer;
     }
 
@@ -281,9 +351,9 @@ export class WebGLTextures implements TextureBinder {
 
     this.activeFramebuffers.add(fb);
     rtProps.__webglFramebuffer = fb;
+    rtProps.__width = renderTarget.width;
+    rtProps.__height = renderTarget.height;
 
-    const tex = renderTarget.texture;
-    const texProps = this.properties.get<TextureProps>(tex);
     if (!texProps.__webglTexture) {
       texProps.__webglTexture = gl.createTexture();
       if (texProps.__webglTexture) {
@@ -291,10 +361,10 @@ export class WebGLTextures implements TextureBinder {
         this.memory.textures++;
       }
     }
+    texProps.__isRenderTargetTexture = true;
+    texProps.__version = tex.version ?? 0;
 
-    const fmt = mapFormat(gl, tex.format ?? RGBAFormat);
-    const glType = mapType(gl, tex.type);
-    const internalFormat = glType === gl.FLOAT ? gl.RGBA32F : glType === gl.HALF_FLOAT ? gl.RGBA16F : fmt.internalFormat;
+    const { fmt, glType, internalFormat } = resolveAttachmentFormat();
 
     this.state.bindTexture(gl.TEXTURE_2D, texProps.__webglTexture ?? null);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, mapWrap(gl, tex.wrapS));
@@ -324,6 +394,10 @@ export class WebGLTextures implements TextureBinder {
         if (depthTexProps.__webglTexture) {
           this.activeTextures.add(depthTexProps.__webglTexture);
           this.memory.textures++;
+        }
+        if (!depthTexProps.__init && typeof depthTex.addEventListener === 'function') {
+          depthTexProps.__init = true;
+          depthTex.addEventListener('dispose', () => this.deallocateTexture(depthTex));
         }
       }
       this.state.bindTexture(gl.TEXTURE_2D, depthTexProps.__webglTexture ?? null);
@@ -430,6 +504,9 @@ export class WebGLTextures implements TextureBinder {
     }
     if (renderTarget.texture) {
       this.deallocateTexture(renderTarget.texture);
+    }
+    if (renderTarget.depthTexture) {
+      this.deallocateTexture(renderTarget.depthTexture);
     }
     this.properties.remove(renderTarget);
   }

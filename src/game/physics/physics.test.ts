@@ -375,6 +375,33 @@ test('Player Wall Collision, Visible Legs & Long-Press Space Jetpack', async () 
   assert.equal(jetState.isJetpacking, true, 'Holding Space >= 0.18s must activate the jetpack');
   assert.ok(jetState.playerVelY > 7.4 && curFootY > 5.5, `Jetpack thrust must climb upward against gravity (velY=${jetState.playerVelY}, y=${curFootY})`);
 
+  // Holding Shift + Space activates turbo flight and climbs much faster (> 30 m/s)
+  let turboState = {
+    playerVelY: 0,
+    spaceHoldTime: 0,
+    isJetpacking: false,
+    isTurboFlight: false,
+    didJump: false,
+  };
+  let turboFootY = 4.0;
+  for (let i = 0; i < 15; i++) {
+    turboState = stepPlayerJetpackAndJump({
+      footY: turboFootY,
+      groundY: 4.0,
+      playerVelY: turboState.playerVelY,
+      spaceHeld: true,
+      shiftHeld: true,
+      spaceHoldTime: turboState.spaceHoldTime,
+      dt: 0.02,
+    });
+    turboFootY += turboState.playerVelY * 0.02;
+  }
+  assert.equal(turboState.isTurboFlight, true, 'Shift + Space must engage turbo flight');
+  assert.ok(
+    turboState.playerVelY > 30 && turboFootY > curFootY + 2.5,
+    `Shift + Space turbo flight must climb significantly faster than normal jetpack (velY=${turboState.playerVelY}, turboY=${turboFootY} vs normalY=${curFootY})`,
+  );
+
   updateProceduralPlayer(
     rig,
     { walkSpeed: 8.8, isAirborne: true, isJetpacking: true },

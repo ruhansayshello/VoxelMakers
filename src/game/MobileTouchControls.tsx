@@ -10,6 +10,11 @@ import {
   type PlaySlotItem,
   type WorldEditToolKind,
 } from './constants';
+import {
+  HULL_STAMP_MODES,
+  type HullMicroShape,
+  type SymmetryAxisMode,
+} from './microHullBlocks';
 import { PREBUILT_OBJECTS } from './worldObjects';
 import { MAP_HAZARD_PRESETS } from './mapHazards';
 import { VOXEL_ENTITY_PRESETS } from './voxelEntities';
@@ -123,14 +128,22 @@ const MOBILE_PROP_MATERIALS: Array<{ mat: number; name: string }> = [
 ];
 
 const PLACEMENT_MODE_SHORT_LABELS: Record<string, string> = {
-  SINGLE: '1×1 SINGLE',
+  SINGLE: '1×1 DOT',
+  BOX_FILL: 'RECT BOX',
   BOX_DRAG: 'RECT BOX',
-  LINE_DRAG: 'LINE DRAG',
+  LINE_DRAG: '1PX LINE',
   BEAM_6: '6-BEAM',
-  WALL_3X3: '3×3 WALL',
-  RAMP_3X3: '5×5 RAMP',
+  PLATE_3X3: '4×4 PLATE',
+  WALL_3X3: '4×4 WALL',
+  PLATE_5X5: '8×8 PANEL',
+  RAMP_3X3: '8×8 PANEL',
+  PAINT: 'CONTINUOUS',
   CONTINUOUS: 'CONTINUOUS',
+  PAINT_TOOL: 'PAINT TOOL',
   PAINT_REPLACE: 'PAINT MODE',
+  FLOOD_PAINT: 'FLOOD PAINT',
+  FACE_EXTRUDE: '1PX EXTRUDE',
+  CHISEL: '1PX CHISEL',
 };
 
 export const MobileTouchControls: React.FC<MobileTouchControlsProps> = ({
@@ -212,10 +225,17 @@ export const MobileTouchControls: React.FC<MobileTouchControlsProps> = ({
     winchActive: false,
     gyroEnabled: true,
     mirrorMode: false,
+    symmetryAxisMode: 'X' as SymmetryAxisMode,
+    xrayMode: false,
+    eyedropperMode: false,
+    hullScalePx: 1,
+    boxDepthPx: 1,
+    hullShape: 'CUBE' as HullMicroShape,
     showForcesOverlay: false,
     isObjectStudioMode: false,
     objectStudioMat: MAT.RAMP_ORANGE as number,
     undoCount: 0,
+    redoCount: 0,
     placementMode: 'SINGLE',
     worldEditTool: 'PLACE_OBJECT' as WorldEditToolKind,
     terraBrushRadius: 8,
@@ -316,6 +336,12 @@ export const MobileTouchControls: React.FC<MobileTouchControlsProps> = ({
             winchActive: Boolean(rig.winchActive),
             gyroEnabled: Boolean(rig.gyroEnabled),
             mirrorMode: Boolean(rig.mirrorMode ?? sim.mirrorMode),
+            symmetryAxisMode: (rig.symmetryAxisMode || 'X') as SymmetryAxisMode,
+            xrayMode: Boolean(rig.xrayMode),
+            eyedropperMode: Boolean(sim.eyedropperMode),
+            hullScalePx: typeof sim.hullScalePx === 'number' ? sim.hullScalePx : 1,
+            boxDepthPx: typeof sim.boxDepthPx === 'number' ? sim.boxDepthPx : 1,
+            hullShape: (sim.hullShape || 'CUBE') as HullMicroShape,
             showForcesOverlay: Boolean(rig.showForcesOverlay),
             isObjectStudioMode: Boolean(sim.isObjectStudioMode),
             objectStudioMat: sim.objectStudioMat || MAT.RAMP_ORANGE,
@@ -324,6 +350,7 @@ export const MobileTouchControls: React.FC<MobileTouchControlsProps> = ({
               : Array.isArray(sim.undoStack)
                 ? sim.undoStack.length
                 : 0,
+            redoCount: Array.isArray(rig.redoStack) ? rig.redoStack.length : 0,
             placementMode: sim.placementMode || 'SINGLE',
             worldEditTool: sim.worldEditTool || 'PLACE_OBJECT',
             terraBrushRadius: sim.terraBrushRadius || 8,
@@ -874,7 +901,7 @@ export const MobileTouchControls: React.FC<MobileTouchControlsProps> = ({
               getWidgetTransformStyle(hudCustom, 'top-bar', undefined, 'top left') ??
               topBarStyle
             }
-            className="flex items-center gap-1.5 pointer-events-auto min-w-0"
+            className="flex items-center gap-1.5 pointer-events-auto shrink-0"
           >
           {rigCapabilities.isObjectStudioMode ? (
             <>
@@ -967,30 +994,44 @@ export const MobileTouchControls: React.FC<MobileTouchControlsProps> = ({
               undefined,
               'top center',
             )}
-            className="flex items-center gap-1 overflow-x-auto no-scrollbar pointer-events-auto bg-[#1a1a1a]/95 border-2 border-[#444444] rounded-[2px] px-1 py-0.5 shadow-lg max-w-[calc(100vw-185px)]"
+            className="flex-1 min-w-0 flex items-center gap-1 overflow-x-auto no-scrollbar pointer-events-auto bg-[#1a1a1a]/95 border-2 border-[#444444] rounded-[2px] px-1 py-0.5 shadow-lg"
           >
             <button
               type="button"
               data-testid="mobile-quick-undo-btn"
               onClick={() => sim?.undoBuildStep?.()}
-              className="px-2 py-1 rounded-[2px] bg-[#dc2626] hover:bg-[#b91c1c] active:bg-[#991b1b] border border-[#444444] text-[#e5e5e5] text-[9.5px] font-display font-extrabold uppercase text-center cursor-pointer select-none leading-tight shrink-0"
+              className="px-1.5 py-1 rounded-[2px] bg-[#dc2626] hover:bg-[#b91c1c] active:bg-[#991b1b] border border-[#444444] text-[#e5e5e5] text-[9px] font-display font-extrabold uppercase text-center cursor-pointer select-none leading-tight shrink-0"
             >
               UNDO
             </button>
             <button
               type="button"
+              data-testid="mobile-quick-redo-btn"
+              onClick={() => sim?.redoBuildStep?.()}
+              className="px-1.5 py-1 rounded-[2px] bg-[#262626] hover:bg-[#333333] active:bg-[#404040] border border-[#444444] text-[#e5e5e5] text-[9px] font-display font-extrabold uppercase text-center cursor-pointer select-none leading-tight shrink-0"
+            >
+              REDO
+            </button>
+            <button
+              type="button"
               data-testid="mobile-quick-sym-btn"
               onClick={() => {
-                sim?.toggleMirrorMode?.();
-                setRigCapabilities((r) => ({ ...r, mirrorMode: !r.mirrorMode }));
+                const nextSym =
+                  sim?.cycleSymmetryAxisMode?.() ??
+                  (rigCapabilities.mirrorMode ? 'OFF' : 'X');
+                setRigCapabilities((r) => ({
+                  ...r,
+                  mirrorMode: nextSym !== 'OFF',
+                  symmetryAxisMode: nextSym,
+                }));
               }}
-              className={`px-2 py-1 rounded-[2px] border border-[#444444] text-[9.5px] font-display font-extrabold uppercase text-center cursor-pointer select-none leading-tight transition shrink-0 ${
+              className={`px-1.5 py-1 rounded-[2px] border border-[#444444] text-[9px] font-display font-extrabold uppercase text-center cursor-pointer select-none leading-tight transition shrink-0 ${
                 rigCapabilities.mirrorMode
                   ? 'bg-[#facc15] text-[#1a1a1a] border-[#e5e5e5]'
                   : 'bg-[#262626] text-[#e5e5e5]'
               }`}
             >
-              SYM
+              SYM:{rigCapabilities.symmetryAxisMode || (rigCapabilities.mirrorMode ? 'X' : 'OFF')}
             </button>
             <button
               type="button"
@@ -1680,8 +1721,8 @@ export const MobileTouchControls: React.FC<MobileTouchControlsProps> = ({
             'bottom left',
           )}
           className={`absolute left-2.5 ${
-            showVirtualJoystick ? 'bottom-48' : 'bottom-16'
-          } flex flex-col gap-2 pointer-events-auto z-30`}
+            showVirtualJoystick ? 'bottom-48' : 'bottom-3'
+          } flex flex-col gap-1.5 pointer-events-auto z-30`}
         >
           <button
             type="button"
@@ -2230,11 +2271,11 @@ export const MobileTouchControls: React.FC<MobileTouchControlsProps> = ({
           />
           <div
             data-testid="mobile-placement-mode-dropdown"
-            className="fixed inset-x-2.5 top-1/2 -translate-y-1/2 mx-auto w-[min(94vw,440px)] max-h-[calc(100dvh-20px)] overflow-y-auto overscroll-contain touch-pan-y bg-[#1a1a1a]/98 border-2 border-[#fbbf24] rounded-[2px] p-2 grid grid-cols-3 gap-1.5 z-[95] shadow-2xl pointer-events-auto"
+            className="fixed inset-x-2.5 top-1/2 -translate-y-1/2 mx-auto w-[min(94vw,440px)] max-h-[calc(100dvh-20px)] overflow-y-auto overscroll-contain touch-pan-y bg-[#1a1a1a]/98 border-2 border-[#fbbf24] rounded-[2px] p-2.5 flex flex-col gap-2 z-[95] shadow-2xl pointer-events-auto"
           >
-            <div className="col-span-3 flex items-center justify-between border-b border-[#383838] pb-1 mb-0.5">
+            <div className="flex items-center justify-between border-b border-[#383838] pb-1">
               <span className="text-[10px] font-display font-extrabold text-[#fbbf24] uppercase tracking-wider">
-                SELECT PLACEMENT BRUSH
+                1PX VOLUME BRUSH · VOXEL STAMP SIZE
               </span>
               <button
                 type="button"
@@ -2244,32 +2285,115 @@ export const MobileTouchControls: React.FC<MobileTouchControlsProps> = ({
                 ✕ CLOSE
               </button>
             </div>
-            {PLACEMENT_MODES.map((pm) => {
-              const isActive = rigCapabilities.placementMode === pm.id;
-              const shortLabel =
-                PLACEMENT_MODE_SHORT_LABELS[pm.id] ||
-                pm.label.replace(/\s*\(.*\)/, '').toUpperCase();
-              return (
-                <button
-                  key={pm.id}
-                  type="button"
-                  data-testid={`mobile-place-mode-${pm.id}`}
-                  onClick={() => {
-                    sim?.setPlacementMode?.(pm.id);
-                    setRigCapabilities((r) => ({ ...r, placementMode: pm.id }));
-                    setPlacementDropdownOpen(false);
-                  }}
-                  className={`w-full px-2 py-2 rounded-[2px] border border-[#444444] text-left text-[10.5px] font-mono-num font-bold uppercase flex items-center justify-between ${
-                    isActive
-                      ? 'bg-[#facc15] text-[#1a1a1a]'
-                      : 'bg-[#262626] text-[#e5e5e5]'
-                  }`}
-                >
-                  <span className="truncate">{shortLabel}</span>
-                  {isActive && <span className="text-[9px] ml-1">ON</span>}
-                </button>
-              );
-            })}
+
+            <div className="grid grid-cols-3 gap-1.5">
+              {PLACEMENT_MODES.map((pm) => {
+                const isActive = rigCapabilities.placementMode === pm.id;
+                const isChisel = pm.id === 'CHISEL';
+                const shortLabel =
+                  PLACEMENT_MODE_SHORT_LABELS[pm.id] ||
+                  pm.label.replace(/\s*\(.*\)/, '').toUpperCase();
+                return (
+                  <button
+                    key={pm.id}
+                    type="button"
+                    data-testid={`mobile-place-mode-${pm.id}`}
+                    onClick={() => {
+                      sim?.setPlacementMode?.(pm.id);
+                      setRigCapabilities((r) => ({ ...r, placementMode: pm.id }));
+                      setPlacementDropdownOpen(false);
+                    }}
+                    className={`w-full px-2 py-2 rounded-[2px] border border-[#444444] text-left text-[10px] font-mono-num font-bold uppercase flex items-center justify-between ${
+                      isActive
+                        ? isChisel
+                          ? 'bg-[#ef4444] text-[#ffffff]'
+                          : 'bg-[#facc15] text-[#1a1a1a]'
+                        : isChisel
+                          ? 'bg-[#262626] text-[#f87171]'
+                          : 'bg-[#262626] text-[#e5e5e5]'
+                    }`}
+                  >
+                    <span className="truncate">{shortLabel}</span>
+                    {isActive && <span className="text-[8.5px] ml-1">ON</span>}
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* Option B: 2-State Voxel Stamp Mode (1px Fine vs. 4px Block 4×4×4 Cluster) + Box/Extrude Depth */}
+            <div className="border-t border-[#333333] pt-1.5 flex flex-col gap-1.5">
+              <div className="flex items-center justify-between">
+                <span className="text-[9.5px] font-display font-extrabold text-[#38bdf8] uppercase">
+                  VOXEL STAMP SIZE
+                </span>
+                <div className="flex items-center gap-1.5">
+                  <span className="text-[9.5px] font-display font-extrabold text-[#fbbf24] uppercase">
+                    DEPTH:
+                  </span>
+                  <button
+                    type="button"
+                    data-testid="mobile-box-depth-dec"
+                    onClick={() => {
+                      sim?.stepBoxDepthPx?.(-1);
+                      setRigCapabilities((r) => ({
+                        ...r,
+                        boxDepthPx: Math.max(1, r.boxDepthPx - 1),
+                      }));
+                    }}
+                    className="px-2 py-0.5 rounded-[2px] bg-[#262626] border border-[#444444] text-[#e5e5e5] text-[10px] font-mono-num font-bold"
+                  >
+                    −
+                  </button>
+                  <span
+                    data-testid="mobile-box-depth-value"
+                    className="px-1.5 py-0.5 rounded-[2px] bg-[#262626] border border-[#444444] text-[#fbbf24] text-[10px] font-mono-num font-bold"
+                  >
+                    {rigCapabilities.boxDepthPx}px
+                  </span>
+                  <button
+                    type="button"
+                    data-testid="mobile-box-depth-inc"
+                    onClick={() => {
+                      sim?.stepBoxDepthPx?.(1);
+                      setRigCapabilities((r) => ({
+                        ...r,
+                        boxDepthPx: Math.min(8, r.boxDepthPx + 1),
+                      }));
+                    }}
+                    className="px-2 py-0.5 rounded-[2px] bg-[#262626] border border-[#444444] text-[#e5e5e5] text-[10px] font-mono-num font-bold"
+                  >
+                    +
+                  </button>
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-1.5">
+                {HULL_STAMP_MODES.map((opt) => {
+                  const isActive =
+                    opt.px === 1
+                      ? rigCapabilities.hullScalePx === 1
+                      : rigCapabilities.hullScalePx >= 4;
+                  return (
+                    <button
+                      key={opt.px}
+                      type="button"
+                      data-testid={`mobile-hull-scale-${opt.px}`}
+                      onClick={() => {
+                        sim?.setHullScalePx?.(opt.px);
+                        setRigCapabilities((r) => ({ ...r, hullScalePx: opt.px }));
+                      }}
+                      className={`py-2 rounded-[2px] border border-[#444444] text-[10px] font-mono-num font-bold uppercase text-center ${
+                        isActive
+                          ? 'bg-[#38bdf8] text-[#1a1a1a]'
+                          : 'bg-[#262626] text-[#e5e5e5]'
+                      }`}
+                    >
+                      {opt.label}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
             {onOpenEcu && (
               <button
                 type="button"
@@ -2278,7 +2402,7 @@ export const MobileTouchControls: React.FC<MobileTouchControlsProps> = ({
                   setPlacementDropdownOpen(false);
                   onOpenEcu();
                 }}
-                className="col-span-3 w-full px-2.5 py-2 rounded-[2px] bg-[#fbbf24] border-2 border-[#444444] text-[#1a1a1a] text-left text-xs font-mono-num font-extrabold uppercase flex items-center justify-between"
+                className="w-full px-2.5 py-2 rounded-[2px] bg-[#fbbf24] border-2 border-[#444444] text-[#1a1a1a] text-left text-xs font-mono-num font-extrabold uppercase flex items-center justify-between"
               >
                 <span>MICRO:BIT ECU LOGIC STUDIO</span>
                 <span>OPEN</span>
@@ -2300,7 +2424,7 @@ export const MobileTouchControls: React.FC<MobileTouchControlsProps> = ({
           >
             <div className="flex items-center justify-between border-b border-[#383838] pb-1">
               <span className="text-[10px] font-display font-extrabold text-[#fbbf24] uppercase tracking-wider">
-                BUILD EDIT &amp; SYMMETRY TOOLS
+                BUILD EDIT, SYMMETRY &amp; X-RAY TOOLS
               </span>
               <button
                 type="button"
@@ -2354,16 +2478,19 @@ export const MobileTouchControls: React.FC<MobileTouchControlsProps> = ({
                 type="button"
                 data-testid="mobile-mirror-btn"
                 onClick={() => {
-                  sim?.toggleMirrorMode?.();
-                  setRigCapabilities((r) => ({ ...r, mirrorMode: !r.mirrorMode }));
+                  if (sim?.cycleSymmetryAxisMode) {
+                    sim.cycleSymmetryAxisMode();
+                  } else {
+                    sim?.toggleMirrorMode?.();
+                  }
                 }}
                 className={`h-10 rounded-[2px] border-2 border-[#444444] font-display font-bold text-xs flex items-center justify-center gap-1 uppercase ${
-                  rigCapabilities.mirrorMode
+                  rigCapabilities.symmetryAxisMode !== 'OFF'
                     ? 'bg-[#facc15] text-[#1a1a1a]'
                     : 'bg-[#262626] text-[#e5e5e5]'
                 }`}
               >
-                <span className="text-[10px]">MIRROR</span>
+                <span className="text-[10px]">SYM: {rigCapabilities.symmetryAxisMode}</span>
               </button>
 
               <button
@@ -2372,7 +2499,58 @@ export const MobileTouchControls: React.FC<MobileTouchControlsProps> = ({
                 onClick={() => sim?.undoBuildStep?.()}
                 className="h-10 rounded-[2px] bg-[#dc2626] border-2 border-[#444444] text-[#e5e5e5] font-display font-bold text-xs flex items-center justify-center gap-1 uppercase"
               >
-                <span className="text-[10px]">UNDO</span>
+                <span className="text-[10px]">UNDO ({rigCapabilities.undoCount})</span>
+              </button>
+
+              <button
+                type="button"
+                data-testid="mobile-redo-btn"
+                onClick={() => sim?.redoBuildStep?.()}
+                className={`h-10 rounded-[2px] border-2 border-[#444444] font-display font-bold text-xs flex items-center justify-center gap-1 uppercase ${
+                  rigCapabilities.redoCount > 0
+                    ? 'bg-[#fbbf24] text-[#1a1a1a]'
+                    : 'bg-[#262626] text-[#737373]'
+                }`}
+              >
+                <span className="text-[10px]">REDO ({rigCapabilities.redoCount})</span>
+              </button>
+            </div>
+
+            <div className="grid grid-cols-3 gap-1.5">
+              <button
+                type="button"
+                data-testid="mobile-xray-btn"
+                onClick={() => {
+                  sim?.toggleXrayMode?.();
+                  setRigCapabilities((r) => ({ ...r, xrayMode: !r.xrayMode }));
+                }}
+                className={`h-10 rounded-[2px] border-2 border-[#444444] font-display font-bold text-xs flex items-center justify-center gap-1 uppercase ${
+                  rigCapabilities.xrayMode
+                    ? 'bg-[#38bdf8] text-[#1a1a1a]'
+                    : 'bg-[#262626] text-[#e5e5e5]'
+                }`}
+              >
+                <span className="text-[10px]">X-RAY {rigCapabilities.xrayMode ? 'ON' : 'OFF'}</span>
+              </button>
+
+              <button
+                type="button"
+                data-testid="mobile-eyedropper-btn"
+                onClick={() => {
+                  if (sim?.sampleHoveredObjectToBrush && sim?.currentHit?.target === 'vehicle') {
+                    sim.sampleHoveredObjectToBrush();
+                  } else {
+                    sim?.toggleEyedropperMode?.();
+                  }
+                  setEditPopupOpen(false);
+                }}
+                className={`h-10 rounded-[2px] border-2 border-[#444444] font-display font-bold text-xs flex items-center justify-center gap-1 uppercase ${
+                  rigCapabilities.eyedropperMode
+                    ? 'bg-[#22c55e] text-[#1a1a1a]'
+                    : 'bg-[#262626] text-[#e5e5e5]'
+                }`}
+              >
+                <span className="text-[10px]">PICK PART</span>
               </button>
 
               <button
@@ -3005,12 +3183,12 @@ export const MobileTouchControls: React.FC<MobileTouchControlsProps> = ({
             hudCustom,
             'mobile-recent-hotbar',
             undefined,
-            'bottom center',
-            true,
+            'bottom left',
+            false,
           )}
-          className="fixed bottom-14 left-1/2 flex items-center gap-1.5 bg-[#1a1a1a]/95 border-2 border-[#444444] rounded-[2px] p-1 pointer-events-auto z-30"
+          className="fixed bottom-12 left-[58px] flex items-center gap-1 bg-[#1a1a1a]/95 border-2 border-[#444444] rounded-[2px] p-0.5 pointer-events-auto z-30"
         >
-          {recentBuildSlots.map((slotNum) => {
+          {recentBuildSlots.slice(0, 3).map((slotNum) => {
             const slotPool = rigCapabilities.isObjectStudioMode
               ? OBJECT_STUDIO_SLOTS
               : BUILD_SLOTS;
@@ -3029,7 +3207,7 @@ export const MobileTouchControls: React.FC<MobileTouchControlsProps> = ({
                   setActiveSlot(item.slot);
                   sim?.selectSlot?.(item.slot);
                 }}
-                className={`relative w-[56px] h-[54px] rounded-[2px] flex flex-col items-center justify-between p-0.5 border-2 overflow-hidden ${
+                className={`relative w-[38px] h-[38px] rounded-[2px] flex flex-col items-center justify-between p-0.5 border overflow-hidden ${
                   isSel
                     ? 'border-[#facc15] bg-[#2a2a2a]'
                     : 'border-[#444444] bg-[#222222]'
@@ -3040,9 +3218,9 @@ export const MobileTouchControls: React.FC<MobileTouchControlsProps> = ({
                     registerPreviewSlot?.(itemKey, node);
                   }}
                   data-preview-slot={itemKey}
-                  className="w-[36px] h-[36px] shrink-0 flex items-center justify-center relative z-10 bg-transparent"
+                  className="w-[24px] h-[24px] shrink-0 flex items-center justify-center relative z-10 bg-transparent"
                 />
-                <span className="text-[7.5px] font-display font-bold uppercase truncate w-full text-center text-[#e5e5e5] leading-none">
+                <span className="text-[6.5px] font-display font-bold uppercase truncate w-full text-center text-[#e5e5e5] leading-none">
                   {item.name.replace(/(Standard|Heavy|Light|Offroad|Go-Kart)\s*/g, '')}
                 </span>
               </button>
@@ -3341,10 +3519,14 @@ export const MobileTouchControls: React.FC<MobileTouchControlsProps> = ({
               ? 'mobile-world-bar'
               : 'mobile-walk-bar',
           undefined,
-          'bottom center',
-          true,
+          isBuildMode ? 'bottom left' : 'bottom center',
+          !isBuildMode,
         )}
-        className="fixed bottom-2 left-1/2 w-fit max-w-[calc(100vw-16px)] flex flex-col items-center pointer-events-none z-30"
+        className={`fixed ${
+          isBuildMode
+            ? 'bottom-2.5 left-[58px] max-w-[172px]'
+            : 'bottom-2 left-1/2 max-w-[calc(100vw-16px)]'
+        } w-fit flex flex-col items-center pointer-events-none z-30`}
       >
         {isBuildMode ? (
           !partsDrawerOpen && (
@@ -3357,16 +3539,16 @@ export const MobileTouchControls: React.FC<MobileTouchControlsProps> = ({
                 closeAllPopups();
                 setPartsDrawerOpen(true);
               }}
-              className="min-h-[38px] px-4 py-1.5 rounded-[2px] bg-[#1a1a1a] border-2 border-[#444444] text-[#e5e5e5] font-display font-extrabold text-xs uppercase flex items-center gap-2 pointer-events-auto"
+              className="min-h-[36px] px-2.5 py-1 rounded-[2px] bg-[#1a1a1a] border-2 border-[#444444] text-[#e5e5e5] font-display font-extrabold text-[11px] uppercase flex items-center gap-1.5 pointer-events-auto"
             >
               <span
-                className="w-3.5 h-3.5 rounded-[2px] border border-[#e5e5e5] shrink-0"
+                className="w-3 h-3 rounded-[2px] border border-[#e5e5e5] shrink-0"
                 style={{ backgroundColor: currentSelectedPart.color }}
               />
-              <span className="truncate max-w-[120px] text-[#fbbf24]">
+              <span className="truncate max-w-[78px] text-[#fbbf24]">
                 {currentSelectedPart.name.replace(/(Standard|Heavy|Light)\s*/g, '')}
               </span>
-              <span>{rigCapabilities.isObjectStudioMode ? 'SHAPES ▾' : 'PARTS ▾'}</span>
+              <span className="whitespace-nowrap">{rigCapabilities.isObjectStudioMode ? 'SHAPES ▾' : 'PARTS ▾'}</span>
             </button>
           )
         ) : isWorldEditMode ? (

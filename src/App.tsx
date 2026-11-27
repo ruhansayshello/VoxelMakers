@@ -56,10 +56,28 @@ import {
 } from './game/worldObjects';
 import { SoundFX } from './game/sound';
 import { ProceduralAudio } from './game/audio';
-import { MicroVoxelWorld, type MicroVoxelChunk } from './game/world';
+import { MicroVoxelWorld, isWaterBasinArea, type MicroVoxelChunk } from './game/world';
 import { TerrainEntity, terrainEntityManager } from './game/physics/terrainEntity';
 import { VoxelFXSystem } from './game/fx';
 import { ModularVehicleRig, type SubAssemblyPrefab } from './game/vehicle';
+import {
+  HULL_SHAPE_OPTIONS,
+  HULL_STAMP_MODES,
+  SYMMETRY_AXIS_OPTIONS,
+  SYMMETRY_CENTER_Z,
+  DEFAULT_HULL_SCALE_PX,
+  MICRO_VOXEL_SIZE,
+  MICRO_VOXEL_SUBDIV,
+  clampHullScalePx,
+  toggleHullStampScalePx,
+  computeScaledAnchorOrigin,
+  computeScaledHullPlacementCoords,
+  computeMicroFaceExtrudeCoords,
+  microBlockCenterMeters,
+  type HullMicroShape,
+  type SymmetryAxisMode,
+} from './game/microHullBlocks';
+import { isMicroVoxelDestructibleKind } from './game/microVoxelBlocks';
 import {
   WorldArenaSystemsManager,
   type ArenaTrapKind,
@@ -102,6 +120,11 @@ import {
 import { packVoxelKey } from './game/physics/collisionPoints';
 import { igniteC4Voxel, updateC4System } from './game/physics/c4System';
 import {
+  classifyEntityPhysicsLodTier,
+  resetUnifiedEngineFrameTelemetry,
+  unifiedEngineTelemetry,
+} from './game/unifiedVoxelEngine';
+import {
   computeSmartVehicleAIControls,
   getEligibleAIRigs,
   type TerrainProber,
@@ -122,6 +145,23 @@ import {
   type TouchModeOverride,
 } from './game/touchControls';
 import {
+  CHUNK_SIZE_METERS_BIGINT,
+  computeDynamicLodPlan,
+  computeOpticalZoomTargetPoint,
+  createBigSectorPosition,
+  formatChunksBigInt,
+  formatHorizonDistanceBigInt,
+  MAX_LOD_SPACING,
+  MAX_RENDER_DISTANCE_CHUNKS,
+  MAX_RENDER_DISTANCE_CHUNKS_BIGINT,
+  MIN_LOD_SPACING,
+  MIN_RENDER_DISTANCE_CHUNKS,
+  parseRenderDistanceInputToChunksBigInt,
+  sanitizePositiveRenderDistanceBigInt,
+  SLIDER_MAX_RENDER_DISTANCE_CHUNKS,
+  type BigSectorPosition,
+} from './game/distantHorizonMath';
+import {
   createInitialFrameGovernorState,
   createDefaultFrameGovernorConfig,
   stepFrameGovernor,
@@ -137,6 +177,7 @@ import {
 } from './game/frameGovernor';
 import {
   GRAPHICS_PRESETS,
+  getVoxelDrawDistanceBigInt,
   loadStoredGraphicsSettings,
   saveStoredGraphicsSettings,
   sanitizeGraphicsSettings,
@@ -162,6 +203,8 @@ import { VoxelGraphicsPipeline } from './game/graphicsPipeline';
 import {
   detectLowEndGpu,
   applyMeshMaterialPresetSwap,
+  BlobShadowInstancedManager,
+  disposeSharedPotatoShaderResources,
   BUILTIN_SHADER_PRESETS,
   loadCustomShaderPresets,
   saveCustomShaderPreset,
@@ -171,6 +214,7 @@ import {
   restoreActiveCustomShaderPreset,
   type CustomShaderPreset,
 } from './game/potatoShader';
+import { disposeSharedModelCaches } from './game/models';
 import {
   voxelizeGlbFile,
   voxelizeGlbSceneWithGpu,
@@ -193,6 +237,17 @@ import {
   updateCharacterAnimation,
   type CharacterEquippedTool,
 } from './game/playerModel';
+import {
+  createPlayerRagdollState,
+  activatePlayerRagdoll,
+  deactivatePlayerRagdoll,
+  stepPlayerRagdoll,
+  applyRagdollToRig,
+  resetRigFromRagdoll,
+  beginRagdollGetUp,
+  stepRagdollGetUp,
+  type PlayerRagdollState,
+} from './game/playerRagdoll';
 import { EcuScratchStudio } from './game/EcuScratchStudio';
 import {
   serializeEcuProgramToJson,
@@ -262,6 +317,50 @@ import {
 } from './game/ui/hudCustomization';
 import { HudLayoutEditorModal } from './game/ui/HudLayoutEditorModal';
 import { FullScreenMap } from './game/ui/fullScreenMap';
+import {
+  publishHudTelemetry,
+  useHudTelemetry,
+  LiveHudField,
+  LiveCockpitHorizonSvg,
+  type LiveHudTelemetry,
+} from './game/ui/hudTelemetryStore';
+
+const selectFpsFrameMs = (t: LiveHudTelemetry) =>
+  `${t.fps} FPS · ${t.frameMs}ms${t.isSlowMoActive ? ` · ${Math.round(t.timeScale * 100)}%` : ''}`;
+const selectFpsOnly = (t: LiveHudTelemetry) => `${t.fps} FPS`;
+const selectRayTarget = (t: LiveHudTelemetry) => t.rayTarget;
+const selectPitchDeg = (t: LiveHudTelemetry) => t.pitchDeg;
+const selectRollDeg = (t: LiveHudTelemetry) => t.rollDeg;
+const selectAltitude = (t: LiveHudTelemetry) => t.altitudeMeters;
+const selectSpeedKmh = (t: LiveHudTelemetry) => t.speedKmh;
+const selectEngineRpm = (t: LiveHudTelemetry) => t.engineRpm;
+const selectHullPct = (t: LiveHudTelemetry) => t.structuralIntegrityPct;
+const selectLodSummary = (t: LiveHudTelemetry) => t.lodSummary;
+const selectTimeScalePct = (t: LiveHudTelemetry) => `${Math.round(t.timeScale * 100)}%`;
+
+const LiveSpeedometerGauge = React.memo(function LiveSpeedometerGauge(
+  props: Omit<React.ComponentProps<typeof SpeedometerGauge>, 'speedKmh'>,
+) {
+  const speedKmh = useHudTelemetry(selectSpeedKmh);
+  return <SpeedometerGauge {...props} speedKmh={speedKmh} />;
+});
+
+const LiveMobileTouchControls = React.memo(function LiveMobileTouchControls(
+  props: Omit<
+    React.ComponentProps<typeof MobileTouchControls>,
+    'speedKmh' | 'integrityPct'
+  >,
+) {
+  const speedKmh = useHudTelemetry(selectSpeedKmh);
+  const integrityPct = useHudTelemetry(selectHullPct);
+  return (
+    <MobileTouchControls
+      {...props}
+      speedKmh={speedKmh}
+      integrityPct={integrityPct}
+    />
+  );
+});
 
 type GameScreenState = 'title' | 'playing' | 'paused';
 type BuildCameraAngle = 'ORBIT_3D' | 'TOP' | 'SIDE' | 'FRONT';
@@ -323,12 +422,23 @@ interface HudSnapshot {
   isSeatedInRig: boolean;
   isPointerLocked: boolean;
   mirrorMode: boolean;
+  symmetryAxisMode: SymmetryAxisMode;
+  xrayMode: boolean;
+  eyedropperMode: boolean;
   showForces: boolean;
   partYawIndex: number;
   partPitchIndex: number;
   partRollIndex: number;
   caveAtmospherePct: number;
   placementMode: BuildPlacementMode;
+  hullScalePx: number;
+  boxDepthPx: number;
+  hullShape: HullMicroShape;
+  ghostSummary: {
+    dimsLabel: string;
+    count: number;
+    massDeltaKg: number;
+  };
   cameraMode: CameraViewMode;
   buildCameraAngle: BuildCameraAngle;
   selectedSlot: number;
@@ -346,6 +456,7 @@ interface HudSnapshot {
   damagedBlockCount: number;
   lodSummary: string;
   undoCount: number;
+  redoCount: number;
   muted: boolean;
   gyroEnabled: boolean;
   headlightsOn: boolean;
@@ -377,6 +488,9 @@ interface HudSnapshot {
   isSlowMoActive: boolean;
   slowMoReason: 'NONE' | 'AUTO_FPS' | 'MANUAL';
   watchdogProtecting: boolean;
+  isZoomed: boolean;
+  zoomMagnification: number;
+  zoomFocusDistMeters: number;
 }
 
 function loadSavedBlueprintsFromStorage(): SerializedVehicleBlueprint[] {
@@ -553,9 +667,13 @@ export default function App() {
   const [dockCollapsed, setDockCollapsed] = useState(false);
   const dockCollapsedRef = useRef(false);
   dockCollapsedRef.current = dockCollapsed;
+  const [inspectorCollapsed, setInspectorCollapsed] = useState(true);
+  const [recentBuildSlotIds, setRecentBuildSlotIds] = useState<number[]>([
+    1, 2, 4, 5, 6, 8,
+  ]);
   const [partSearchQuery, setPartSearchQuery] = useState('');
   const previewRenderer = getSharedBuildPreviewRenderer();
-  const slotElementsRef = useRef<Map<string, HTMLElement>>(new Map());
+  const slotElementsRef = useRef<Map<string, Set<HTMLElement>>>(new Map());
   const [hoveredSlotKey, setHoveredSlotKey] = useState<string | null>(null);
   const hoveredSlotKeyRef = useRef<string | null>(null);
 
@@ -565,7 +683,10 @@ export default function App() {
   }, []);
 
   const [renderDistChunks, setRenderDistChunks] = useState(() =>
-    isMobileDevice() ? 3 : 4,
+    isMobileDevice() ? 3 : 12,
+  );
+  const [customRenderDistInput, setCustomRenderDistInput] = useState(() =>
+    String(isMobileDevice() ? 3 : 12),
   );
   const [resScale, setResScale] = useState(0.65);
   const [wavesQuality, setWavesQuality] = useState<'OFF' | 'LOW' | 'MEDIUM' | 'HIGH'>(
@@ -928,12 +1049,19 @@ export default function App() {
     isSeatedInRig: true,
     isPointerLocked: false,
     mirrorMode: true,
+    symmetryAxisMode: 'X',
+    xrayMode: false,
+    eyedropperMode: false,
     showForces: true,
     partYawIndex: 0,
     partPitchIndex: 0,
     partRollIndex: 0,
     caveAtmospherePct: 0,
     placementMode: 'SINGLE',
+    hullScalePx: DEFAULT_HULL_SCALE_PX,
+    boxDepthPx: 1,
+    hullShape: 'CUBE',
+    ghostSummary: { dimsLabel: '', count: 0, massDeltaKg: 0 },
     cameraMode: 'CHASE',
     buildCameraAngle: 'ORBIT_3D',
     selectedSlot: 1,
@@ -951,6 +1079,7 @@ export default function App() {
     damagedBlockCount: 0,
     lodSummary: 'L0:25 L1:24 L2:32 · 8 CORES',
     undoCount: 0,
+    redoCount: 0,
     muted: false,
     gyroEnabled: false,
     headlightsOn: false,
@@ -969,6 +1098,9 @@ export default function App() {
     isSlowMoActive: false,
     slowMoReason: 'NONE',
     watchdogProtecting: false,
+    isZoomed: false,
+    zoomMagnification: 4,
+    zoomFocusDistMeters: 0,
   });
 
   const dismissedCrashTimestampRef = useRef<number>(0);
@@ -1042,7 +1174,7 @@ export default function App() {
     driveCreationAt: (idx: number) => boolean;
     cycleActiveCreation: () => number;
     setActiveCreation: (idx: number) => void;
-    setRenderDistance: (chunks: number, uncappedLod?: boolean) => void;
+    setRenderDistance: (chunks: number | bigint | string, uncappedLod?: boolean) => void;
     setResolutionScale: (scale: number) => void;
     setWaveQuality: (q: 'OFF' | 'LOW' | 'MEDIUM' | 'HIGH') => void;
     setFov: (fov: number) => void;
@@ -1061,6 +1193,16 @@ export default function App() {
     setAntiFreezeWatchdog: (enabled: boolean) => void;
     baseFov: number;
     baseFogDensity: number;
+    isZoomed: boolean;
+    zoomMagnification: number;
+    zoomFocusDistMeters: number;
+    zoomFocusCX: number;
+    zoomFocusCZ: number;
+    zKeyDownTimeMs: number;
+    toggleZoom: (force?: boolean) => boolean;
+    setZoomMagnification: (mag: number) => void;
+    stepZoomMagnification: (dir: 1 | -1) => void;
+    applyOpticalZoomAndTarget: (dt: number) => void;
     selectionWireframe: THREE.LineSegments;
     selectedObjectWireframe: THREE.LineSegments;
     tacticalMapCam: {
@@ -1098,6 +1240,23 @@ export default function App() {
     isSeatedInRig: boolean;
     selectedSlot: number;
     placementMode: BuildPlacementMode;
+    hullScalePx: number;
+    boxDepthPx: number;
+    hullShape: HullMicroShape;
+    eyedropperMode: boolean;
+    setHullScalePx: (px: number) => void;
+    stepHullScale: (delta: number) => void;
+    toggleHullStampMode: () => void;
+    setBoxDepthPx: (depth: number) => void;
+    stepBoxDepthPx: (delta: number) => void;
+    setHullShape: (shape: HullMicroShape) => void;
+    cycleHullShape: () => void;
+    toggleEyedropperMode: (force?: boolean) => void;
+    sampleHoveredObjectToBrush: () => boolean;
+    toggleXrayMode: (force?: boolean) => boolean;
+    setSymmetryAxisMode: (mode: SymmetryAxisMode) => void;
+    cycleSymmetryAxisMode: () => SymmetryAxisMode;
+    copySelectionToStamp: () => SubAssemblyPrefab | null;
     cameraMode: CameraViewMode;
     buildCameraAngle: BuildCameraAngle;
     isPointerLocked: boolean;
@@ -1105,7 +1264,16 @@ export default function App() {
     buildOrbitPivot: THREE.Vector3;
     buildOrbitDist: number;
     playerVelY: number;
+    playerPeakAirY: number;
     playerKnockbackVel: THREE.Vector3;
+    playerRagdoll: PlayerRagdollState;
+    triggerPlayerRagdoll: (
+      velX: number,
+      velY: number,
+      velZ: number,
+      spinStrength?: number,
+    ) => void;
+    recoverFromRagdoll: (silent?: boolean) => void;
     camYaw: number;
     camPitch: number;
     driveYawOffset: number;
@@ -1121,12 +1289,17 @@ export default function App() {
     isLeftMouseDown: boolean;
     isRightMouseDown: boolean;
     dragStartVoxel: { vx: number; vy: number; vz: number } | null;
+    dragStartMicro: { mx: number; my: number; mz: number } | null;
     lastPaintedKey: string;
     currentHit: {
       target: 'vehicle' | 'world';
       vx: number;
       vy: number;
       vz: number;
+      mx?: number;
+      my?: number;
+      mz?: number;
+      hitIsMicro?: boolean;
       mat: number;
       moduleHit?: {
         kind: ModuleKind;
@@ -1218,6 +1391,7 @@ export default function App() {
     rotatePartYaw: () => void;
     rotatePartAxis: (axis: RotationAxis) => void;
     undoBuildStep: () => boolean;
+    redoBuildStep: () => boolean;
     requestCanvasPointerLock: () => void;
     saveCurrentVehicle: (customName: string) => SerializedVehicleBlueprint;
     loadSavedVehicle: (bp: SerializedVehicleBlueprint) => void;
@@ -1297,6 +1471,11 @@ export default function App() {
     scene.background = new THREE.Color(0x5b9bd5);
     scene.fog = new THREE.Fog(0x5b9bd5, 108, 172);
 
+    // Pooled InstancedMesh manager for ALL vehicle & voxel-entity blob shadows (1 draw call total)
+    const blobShadowManager = new BlobShadowInstancedManager(32);
+    scene.userData.blobShadowManager = blobShadowManager;
+    scene.add(blobShadowManager.mesh);
+
     const camera = new THREE.PerspectiveCamera(
       68,
       window.innerWidth / window.innerHeight,
@@ -1309,13 +1488,23 @@ export default function App() {
       antialias: false,
       powerPreference: 'high-performance',
       precision: 'highp',
+      logarithmicDepthBuffer: true,
       preserveDrawingBuffer: isHeadless,
     });
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.toneMapping = THREE.NoToneMapping;
     renderer.toneMappingExposure = 0.9;
+    const isInIframe = (() => {
+      try {
+        return window.self !== window.top;
+      } catch {
+        return true;
+      }
+    })();
     renderer.setSize(window.innerWidth, window.innerHeight);
-    renderer.setPixelRatio(isHeadless ? 1 : Math.min(window.devicePixelRatio || 1, 1.5));
+    renderer.setPixelRatio(
+      isHeadless ? 1 : Math.min(window.devicePixelRatio || 1, isInIframe ? 1.25 : 1.5),
+    );
     renderer.shadowMap.enabled = !isHeadless;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     container.innerHTML = '';
@@ -1368,17 +1557,22 @@ export default function App() {
       isLowEndGpu,
     );
     setGraphicsState(initialGfx);
-    const initialDrawDist =
+    const initialDrawDistBig =
       isHeadless || isMobileDevice()
         ? isHeadless
-          ? 2
-          : 3
-        : initialGfx.voxelDrawDistance;
+          ? 2n
+          : 3n
+        : getVoxelDrawDistanceBigInt(initialGfx);
+    const initialDrawDist =
+      initialDrawDistBig > BigInt(MAX_RENDER_DISTANCE_CHUNKS)
+        ? MAX_RENDER_DISTANCE_CHUNKS
+        : Number(initialDrawDistBig);
     const world = new MicroVoxelWorld(
       scene,
       isHeadless,
       initialDrawDist,
       initialGfx.usePotatoShader,
+      initialGfx.lodSpacing,
     );
     applyCustomShaderPresetToMaterials(restoreActiveCustomShaderPreset());
     world.setPotatoShaderMode(initialGfx.usePotatoShader);
@@ -1387,12 +1581,30 @@ export default function App() {
     }
     world.setWaveQuality(initialGfx.waveQuality || 'OFF');
     world.fogEnabled = initialGfx.fog;
+    const initCurvatureR = initialGfx.planetCurvatureEnabled ? 1_600_000 : 0;
+    (renderer as unknown as { planetCurvatureRadius: number }).planetCurvatureRadius = initCurvatureR;
+    world.planetCurvatureRadius = initCurvatureR;
     world.gpuOceanWaveUniforms.uRealisticWater.value = shouldUseRealisticWater(initialGfx) ? 1.0 : 0.0;
     world.gpuOceanWaveUniforms.uWorldGenMode.value = worldGenModeToShaderId(world.worldGenMode);
-    world.setRenderDistanceChunks(
-      initialDrawDist,
+    const initialTuning = computeRenderDistanceTuning(
+      initialDrawDistBig,
       isHeadless || isMobileDevice() ? false : initialGfx.uncappedChunkLod,
+      initialGfx.lodSpacing,
     );
+    world.setRenderDistanceChunks(
+      initialTuning.clampedChunksBig,
+      isHeadless || isMobileDevice() ? false : initialGfx.uncappedChunkLod,
+      initialTuning.lodSpacing,
+    );
+    camera.near = initialTuning.cameraNear;
+    camera.far = initialTuning.cameraFar;
+    camera.updateProjectionMatrix();
+    if (world.skyDome) {
+      world.skyDome.scale.setScalar(initialTuning.skyDomeScale);
+      world.skyDome.updateMatrix();
+    }
+    setRenderDistChunks(initialTuning.clampedChunks);
+    setCustomRenderDistInput(initialTuning.clampedChunksBig.toString());
     const fx = new VoxelFXSystem(scene, world);
     fx.userParticleMultiplier = initialGfx.particleMultiplier;
     const graphicsPipeline = new VoxelGraphicsPipeline(
@@ -1715,6 +1927,7 @@ export default function App() {
         this.fx.rig = targetVehicle;
         this.isWalking = false;
         this.isSeatedInRig = true;
+        this.recoverFromRagdoll(true);
         this.playerCharacterMesh.visible = false;
         this.driveYawOffset = 0;
         this.drivePitchOffset = 0.28;
@@ -1795,7 +2008,140 @@ export default function App() {
         this.camPitch = Math.asin(Math.max(-0.85, Math.min(0.85, toRig.y)));
         this.playerCharacterMesh.rotation.set(0, this.camYaw + Math.PI, 0);
         this.playerVelY = 0;
+        this.playerPeakAirY = groundY;
         fx.speedLinesMesh.visible = false;
+        // High-speed bailout (> 65 km/h) launches the micro-voxel pilot into a tumbling ragdoll!
+        if (prevVehicle && prevVehicle.speedKmh > 65 && !this.isBuildMode) {
+          const bailVx = prevVehicle.velocity.x * 0.72 + rigRight.x * 2.8;
+          const bailVy = Math.max(3.6, prevVehicle.velocity.y * 0.5 + 3.8);
+          const bailVz = prevVehicle.velocity.z * 0.72 + rigRight.z * 2.8;
+          this.triggerPlayerRagdoll(bailVx, bailVy, bailVz, 2.2);
+        } else {
+          this.recoverFromRagdoll(true);
+        }
+      },
+      triggerPlayerRagdoll(
+        velX: number,
+        velY: number,
+        velZ: number,
+        spinStrength = 1.8,
+      ): void {
+        if (this.isBuildMode || this.isWorldEditMode || this.isSeatedInRig) {
+          return;
+        }
+        const eyeH = 1.65;
+        const footY = this.camFreePos.y - eyeH;
+        activatePlayerRagdoll(
+          this.playerRagdoll,
+          this.camFreePos.x,
+          footY,
+          this.camFreePos.z,
+          this.camYaw + Math.PI,
+          velX,
+          velY,
+          velZ,
+          spinStrength,
+          1 / 60,
+        );
+        this.isJetpacking = false;
+        this.spaceHoldTime = 0;
+        this.playerVelY = 0;
+        this.playerKnockbackVel.set(0, 0, 0);
+        this.playerCharacterMesh.visible = true;
+        applyRagdollToRig(this.playerCharacterMesh, this.playerRagdoll);
+      },
+      recoverFromRagdoll(silent = false): void {
+        if (this.playerRagdoll.active) {
+          const px = this.playerRagdoll.pos[0];
+          const py = this.playerRagdoll.pos[1];
+          const pz = this.playerRagdoll.pos[2];
+          const g = world.probeGroundBelow(px, py + 1.2, pz, 1.0);
+          const safeGroundY =
+            g.mat === MAT.WATER_VOX ? Math.max(WATER_LEVEL - 0.3, g.y) : g.y;
+          if (!silent && !this.isBuildMode && !this.isWorldEditMode && !this.isSeatedInRig) {
+            beginRagdollGetUp(
+              this.playerRagdoll,
+              this.playerCharacterMesh,
+              px,
+              safeGroundY,
+              pz,
+              this.camYaw + Math.PI,
+              0.55,
+            );
+            this.playerVelY = 0;
+            this.playerKnockbackVel.set(0, 0, 0);
+            return;
+          }
+          deactivatePlayerRagdoll(this.playerRagdoll);
+          resetRigFromRagdoll(this.playerCharacterMesh);
+          this.playerCharacterMesh.position.set(px, safeGroundY, pz);
+          this.playerCharacterMesh.rotation.set(0, this.camYaw + Math.PI, 0);
+        } else if (this.playerRagdoll.isGettingUp) {
+          const fx = this.playerRagdoll.getUpTargetFoot[0];
+          const fy = this.playerRagdoll.getUpTargetFoot[1];
+          const fz = this.playerRagdoll.getUpTargetFoot[2];
+          deactivatePlayerRagdoll(this.playerRagdoll);
+          resetRigFromRagdoll(this.playerCharacterMesh);
+          this.playerCharacterMesh.position.set(fx, fy, fz);
+          this.playerCharacterMesh.rotation.set(0, this.camYaw + Math.PI, 0);
+          if (!silent && !this.isBuildMode && !this.isWorldEditMode && !this.isSeatedInRig) {
+            this.camFreePos.set(fx, fy + 1.65, fz);
+            this.playerVelY = 0;
+            this.playerKnockbackVel.set(0, 0, 0);
+          }
+        } else {
+          resetRigFromRagdoll(this.playerCharacterMesh);
+        }
+      },
+      applyOpticalZoomAndTarget(dt: number): void {
+        const baseFovVal = this.baseFov || 68;
+        let desiredFov = baseFovVal;
+        if (this.isZoomed && !this.isBuildMode) {
+          desiredFov = Math.max(1e-7, baseFovVal / Math.max(1, this.zoomMagnification));
+        } else if (!this.isBuildMode && !this.isWorldEditMode && !this.isWalking && this.isSeatedInRig && this.activeVehicle) {
+          const boostFovAdd = this.activeVehicle.isBoostingNow ? 8 : 0;
+          desiredFov =
+            baseFovVal +
+            Math.min(14, this.activeVehicle.speedKmh * 0.1) +
+            boostFovAdd;
+        }
+        const fovSmooth = 1 - Math.exp(-16 * dt);
+        if (Math.abs(camera.fov - desiredFov) > desiredFov * 1e-4) {
+          camera.fov += (desiredFov - camera.fov) * fovSmooth;
+          camera.updateProjectionMatrix();
+        } else if (camera.fov !== desiredFov) {
+          camera.fov = desiredFov;
+          camera.updateProjectionMatrix();
+        }
+
+        if (this.isZoomed && !this.isBuildMode) {
+          camera.getWorldDirection(_camFwdTmp);
+          const zoomRes = computeOpticalZoomTargetPoint({
+            eyeX: camera.position.x,
+            eyeY: camera.position.y,
+            eyeZ: camera.position.z,
+            dirX: _camFwdTmp.x,
+            dirY: _camFwdTmp.y,
+            dirZ: _camFwdTmp.z,
+            sampleSurfaceY: (wx, wz) => {
+              const surfY = world.sampleSurfaceHeightFast(wx, wz);
+              if (surfY < WATER_LEVEL && isWaterBasinArea(wx, wz, world.worldGenMode)) {
+                return WATER_LEVEL;
+              }
+              return surfY;
+            },
+            maxDistanceMeters: Math.max(520, 140 * Math.max(1, this.zoomMagnification)),
+          });
+          world.zoomFocusWorld = { x: zoomRes.targetX, z: zoomRes.targetZ };
+          this.zoomFocusDistMeters = Math.round(zoomRes.distanceMeters);
+          this.zoomFocusCX = zoomRes.centerCX;
+          this.zoomFocusCZ = zoomRes.centerCZ;
+        } else {
+          if (world.zoomFocusWorld !== null) {
+            world.zoomFocusWorld = null;
+          }
+          this.zoomFocusDistMeters = 0;
+        }
       },
       updateCamera(dt: number, now = performance.now()): void {
         const activeRig = this.getActiveRig();
@@ -1815,6 +2161,11 @@ export default function App() {
         void targetTransform;
 
         if (this.isBuildMode) {
+          if (this.isZoomed) {
+            this.isZoomed = false;
+            world.zoomFocusWorld = null;
+            this.zoomFocusDistMeters = 0;
+          }
           const flySpeed =
             (this.keys['ShiftLeft'] || this.keys['ShiftRight'] ? 16.0 : 8.5) *
             dt;
@@ -1870,11 +2221,6 @@ export default function App() {
             (this.keys['ShiftLeft'] || this.keys['ShiftRight'] ? 28.0 : 14.0) *
             dt;
           camera.rotation.set(this.camPitch, this.camYaw, 0, 'YXZ');
-          const desiredWorldFov = this.baseFov || 68;
-          if (Math.abs(camera.fov - desiredWorldFov) > 0.1) {
-            camera.fov = desiredWorldFov;
-            camera.updateProjectionMatrix();
-          }
           camera.getWorldDirection(_camFwdTmp);
           _camRightTmp.set(
             Math.cos(this.camYaw),
@@ -1909,15 +2255,22 @@ export default function App() {
             this.camFreePos.z,
           );
           camera.rotation.set(this.camPitch, this.camYaw, 0, 'YXZ');
+          this.applyOpticalZoomAndTarget(dt);
           return;
         }
 
         if (this.isWalking || !this.isSeatedInRig || !this.activeVehicle) {
-          const baseWalkSpeed = this.keys['ShiftLeft']
-            ? 11.5
-            : this.isJetpacking
-              ? 8.8
-              : 6.8;
+          const isShiftHeld = Boolean(
+            this.keys['ShiftLeft'] || this.keys['ShiftRight'],
+          );
+          const baseWalkSpeed =
+            this.isJetpacking && isShiftHeld
+              ? 28.0
+              : isShiftHeld
+                ? 11.5
+                : this.isJetpacking
+                  ? 8.8
+                  : 6.8;
           const walkSpeed = baseWalkSpeed * dt;
           _camFwdTmp.set(
             -Math.sin(this.camYaw),
@@ -2022,6 +2375,129 @@ export default function App() {
             return { y: bestY, mat: bestMat, vehicle: bestVeh };
           };
 
+          // Active on-demand 11-node Verlet ragdoll simulation (0ms when inactive)
+          if (this.playerRagdoll.active) {
+            const ragStep = stepPlayerRagdoll(this.playerRagdoll, physDt, {
+              sampleGroundY: (wx, startY, wz) => {
+                const probe = probeGroundAndVehicles(wx, startY, wz, 0.45);
+                return probe.mat === MAT.WATER_VOX
+                  ? Math.max(WATER_LEVEL - 0.3, probe.y)
+                  : probe.y;
+              },
+              isSolid: isSolidFn,
+            });
+            applyRagdollToRig(this.playerCharacterMesh, this.playerRagdoll);
+            this.camFreePos.set(
+              ragStep.pelvisX,
+              ragStep.pelvisY + 0.92,
+              ragStep.pelvisZ,
+            );
+
+            // Allow manual stand-up with Space after 0.5s or automatic recovery once settled
+            const manualRecover =
+              this.playerRagdoll.elapsed >= 0.5 && Boolean(this.keys['Space']);
+            if (ragStep.readyToRecover || manualRecover) {
+              this.recoverFromRagdoll(false);
+            }
+
+            // Keep third-person camera safely tracking the tumbling ragdoll without clipping walls
+            const desiredDist = 4.1;
+            const headAnchorY = ragStep.pelvisY + 0.55;
+            const backDirX = Math.sin(this.camYaw) * Math.cos(this.camPitch);
+            const backDirY = -Math.sin(this.camPitch);
+            const backDirZ = Math.cos(this.camYaw) * Math.cos(this.camPitch);
+            let safeDist = desiredDist;
+            for (let d = 0.3; d <= desiredDist; d += 0.25) {
+              const testX = ragStep.pelvisX + backDirX * d;
+              const testY = headAnchorY + backDirY * d;
+              const testZ = ragStep.pelvisZ + backDirZ * d;
+              if (world.isSolidAtWorld(testX, testY, testZ)) {
+                safeDist = Math.max(0.75, d - 0.35);
+                break;
+              }
+            }
+            const camTargetX = ragStep.pelvisX + backDirX * safeDist;
+            const camTargetY = headAnchorY + backDirY * safeDist;
+            const camTargetZ = ragStep.pelvisZ + backDirZ * safeDist;
+            const camGround = world.probeGroundBelow(
+              camTargetX,
+              camTargetY + 0.6,
+              camTargetZ,
+              0.5,
+            );
+            const liftedCamY =
+              camGround.y <= headAnchorY + 0.4
+                ? Math.max(camGround.y + 0.5, camTargetY)
+                : camTargetY;
+            camera.position.set(
+              camTargetX + shakeX,
+              liftedCamY + shakeY,
+              camTargetZ,
+            );
+            camera.rotation.set(this.camPitch, this.camYaw, 0, 'YXZ');
+            return;
+          }
+
+          // Smooth 2-stage stand-up animation from lying ragdoll pose -> crouch push-up -> standing
+          if (this.playerRagdoll.isGettingUp) {
+            const getUpStep = stepRagdollGetUp(
+              this.playerRagdoll,
+              this.playerCharacterMesh,
+              physDt,
+            );
+            if (getUpStep.completed) {
+              const footX = this.playerRagdoll.getUpTargetFoot[0];
+              const footY = this.playerRagdoll.getUpTargetFoot[1];
+              const footZ = this.playerRagdoll.getUpTargetFoot[2];
+              this.camFreePos.set(footX, footY + eyeH, footZ);
+              this.playerVelY = 0;
+              this.playerKnockbackVel.set(0, 0, 0);
+              SoundFX.snap();
+            } else {
+              this.camFreePos.set(
+                getUpStep.pelvisX,
+                getUpStep.pelvisY + 0.93,
+                getUpStep.pelvisZ,
+              );
+            }
+
+            const desiredDist = 4.1;
+            const headAnchorY = getUpStep.pelvisY + 0.58;
+            const backDirX = Math.sin(this.camYaw) * Math.cos(this.camPitch);
+            const backDirY = -Math.sin(this.camPitch);
+            const backDirZ = Math.cos(this.camYaw) * Math.cos(this.camPitch);
+            let safeDist = desiredDist;
+            for (let d = 0.3; d <= desiredDist; d += 0.25) {
+              const testX = getUpStep.pelvisX + backDirX * d;
+              const testY = headAnchorY + backDirY * d;
+              const testZ = getUpStep.pelvisZ + backDirZ * d;
+              if (world.isSolidAtWorld(testX, testY, testZ)) {
+                safeDist = Math.max(0.75, d - 0.35);
+                break;
+              }
+            }
+            const camTargetX = getUpStep.pelvisX + backDirX * safeDist;
+            const camTargetY = headAnchorY + backDirY * safeDist;
+            const camTargetZ = getUpStep.pelvisZ + backDirZ * safeDist;
+            const camGround = world.probeGroundBelow(
+              camTargetX,
+              camTargetY + 0.6,
+              camTargetZ,
+              0.5,
+            );
+            const liftedCamY =
+              camGround.y <= headAnchorY + 0.4
+                ? Math.max(camGround.y + 0.5, camTargetY)
+                : camTargetY;
+            camera.position.set(
+              camTargetX + shakeX,
+              liftedCamY + shakeY,
+              camTargetZ,
+            );
+            camera.rotation.set(this.camPitch, this.camYaw, 0, 'YXZ');
+            return;
+          }
+
           // Step active Map Hazards against on-foot player (Conveyor Belt push, Launch Catapult fling, Spinning Blade knockback)
           if (this.mapHazards.length > 0) {
             const playerHazardState = {
@@ -2039,6 +2515,19 @@ export default function App() {
               )
             ) {
               this.playerVelY = playerHazardState.velY;
+              const kbHoriz = Math.hypot(
+                this.playerKnockbackVel.x,
+                this.playerKnockbackVel.z,
+              );
+              if (kbHoriz > 14.0 || this.playerVelY > 12.5) {
+                this.triggerPlayerRagdoll(
+                  this.playerKnockbackVel.x,
+                  Math.max(4.0, this.playerVelY),
+                  this.playerKnockbackVel.z,
+                  2.4,
+                );
+                return;
+              }
             }
           }
 
@@ -2181,11 +2670,13 @@ export default function App() {
           }
 
           // Short press Space = jump; Long press Space (>= 0.18s) = working backpack jetpack thrust!
+          // Holding Shift + Space ignites turbo afterburner flight for fast vertical climb (~34 m/s) & travel!
           const jetStep = stepPlayerJetpackAndJump({
             footY,
             groundY,
             playerVelY: this.playerVelY,
             spaceHeld: Boolean(this.keys['Space']),
+            shiftHeld: isShiftHeld,
             spaceHoldTime: this.spaceHoldTime,
             dt: physDt,
           });
@@ -2242,9 +2733,40 @@ export default function App() {
 
           this.camFreePos.y = nextCamY;
 
+          // Track highest airborne foot elevation so only genuinely high drops (>= 9m) trigger ragdoll
+          const currentFootY = this.camFreePos.y - eyeH;
+          if (this.isJetpacking || gCenter.mat === MAT.WATER_VOX) {
+            this.playerPeakAirY = currentFootY;
+          } else if (currentFootY > groundY + 0.18) {
+            if (currentFootY > this.playerPeakAirY) {
+              this.playerPeakAirY = currentFootY;
+            }
+          } else if (currentFootY >= groundY - 0.05) {
+            this.playerPeakAirY = groundY;
+          }
+
           if (this.camFreePos.y < groundY + eyeH) {
+            const landingSpeed = -this.playerVelY;
+            const fallDropMeters = Math.max(0, this.playerPeakAirY - groundY);
             this.camFreePos.y = groundY + eyeH;
             this.playerVelY = 0;
+            this.playerPeakAirY = groundY;
+            // Only high falls (>= 9.0m drop and > 21.5 m/s impact) trigger pilot ragdoll!
+            if (
+              fallDropMeters >= 9.0 &&
+              landingSpeed > 21.5 &&
+              !this.isJetpacking &&
+              gCenter.mat !== MAT.WATER_VOX
+            ) {
+              SoundFX.clank();
+              this.triggerPlayerRagdoll(
+                (moveVec.x / Math.max(0.008, physDt)) * 0.65,
+                Math.min(4.2, landingSpeed * 0.18),
+                (moveVec.z / Math.max(0.008, physDt)) * 0.65,
+                2.0,
+              );
+              return;
+            }
           }
 
           // Emit twin backpack jetpack thruster exhaust particles & thruster audio when jetpacking
@@ -2382,6 +2904,7 @@ export default function App() {
             );
             camera.rotation.set(this.camPitch, this.camYaw, 0, 'YXZ');
           }
+          this.applyOpticalZoomAndTarget(dt);
           return;
         }
 
@@ -2419,15 +2942,6 @@ export default function App() {
             targetVeh.quaternion,
             Math.min(1, dampFactor * 1.35),
           );
-        }
-
-        const boostFovAdd = targetVeh.isBoostingNow ? 8 : 0;
-        const baseDriveFov = this.baseFov || 68;
-        const targetFov =
-          baseDriveFov + Math.min(14, targetVeh.speedKmh * 0.1) + boostFovAdd;
-        if (Math.abs(camera.fov - targetFov) > 0.1) {
-          camera.fov += (targetFov - camera.fov) * dampFactor;
-          camera.updateProjectionMatrix();
         }
 
         if (this.cameraMode === 'FIRST_PERSON') {
@@ -2527,6 +3041,8 @@ export default function App() {
           );
           camera.lookAt(cameraLookAtTarget);
         }
+
+        this.applyOpticalZoomAndTarget(dt);
 
         // Update 3D High-Speed Aerodynamic Wind Streaks on activeVehicle!
         fx.updateSpeedLines(
@@ -3125,14 +3641,18 @@ export default function App() {
         setGraphicsState(next);
 
         // Sync 15 graphics features to world, fx, camera, and WebGL pipeline
+        const nextDrawBig = getVoxelDrawDistanceBigInt(next);
         const tuning = computeRenderDistanceTuning(
-          next.voxelDrawDistance,
+          nextDrawBig,
           next.uncappedChunkLod,
+          next.lodSpacing,
         );
         world.setRenderDistanceChunks(
-          tuning.clampedChunks,
+          tuning.clampedChunksBig,
           next.uncappedChunkLod,
+          tuning.lodSpacing,
         );
+        camera.near = tuning.cameraNear;
         camera.far = tuning.cameraFar;
         camera.updateProjectionMatrix();
         if (world.skyDome) {
@@ -3141,6 +3661,9 @@ export default function App() {
         }
         this.baseFogDensity = next.fog ? tuning.baseFogDensity : 0;
         world.fogEnabled = next.fog;
+        const nextCurvatureR = next.planetCurvatureEnabled ? 1_600_000 : 0;
+        (renderer as unknown as { planetCurvatureRadius: number }).planetCurvatureRadius = nextCurvatureR;
+        world.planetCurvatureRadius = nextCurvatureR;
         world.gpuOceanWaveUniforms.uRealisticWater.value = shouldUseRealisticWater(next) ? 1.0 : 0.0;
         fx.userParticleMultiplier = next.particleMultiplier;
         world.setWaveQuality(next.waveQuality);
@@ -3184,6 +3707,7 @@ export default function App() {
 
         setWavesQuality(next.waveQuality);
         setRenderDistChunks(tuning.clampedChunks);
+        setCustomRenderDistInput(tuning.clampedChunksBig.toString());
         setResScale(next.resolutionScale);
         setShadowsEnabled(next.blobShadows);
         syncHudNow();
@@ -3193,18 +3717,33 @@ export default function App() {
         if (!presetConfig) return;
         this.updateGraphicsSettings({
           ...presetConfig,
+          voxelDrawDistanceBig: String(presetConfig.voxelDrawDistance),
           frameRateCap: this.graphicsSettings.frameRateCap,
           preset: presetId,
         });
         SoundFX.snap();
       },
-      setRenderDistance(chunks: number, uncappedLod?: boolean) {
+      setRenderDistance(chunks: number | bigint | string, uncappedLod?: boolean) {
+        const clampedBig = sanitizePositiveRenderDistanceBigInt(
+          chunks,
+          getVoxelDrawDistanceBigInt(this.graphicsSettings),
+        );
+        const clampedNum =
+          clampedBig > BigInt(MAX_RENDER_DISTANCE_CHUNKS)
+            ? MAX_RENDER_DISTANCE_CHUNKS
+            : Number(clampedBig);
         this.updateGraphicsSettings({
-          voxelDrawDistance: chunks,
+          voxelDrawDistance: clampedNum,
+          voxelDrawDistanceBig: clampedBig.toString(),
           uncappedChunkLod:
             typeof uncappedLod === 'boolean'
               ? uncappedLod
               : this.graphicsSettings.uncappedChunkLod,
+        });
+      },
+      setLodSpacing(spacing: number) {
+        this.updateGraphicsSettings({
+          lodSpacing: spacing,
         });
       },
       setResolutionScale(scale: number) {
@@ -3260,6 +3799,12 @@ export default function App() {
         syncHudNow();
       },
       baseFov: 68,
+      isZoomed: false,
+      zoomMagnification: 4 as number,
+      zoomFocusDistMeters: 0,
+      zoomFocusCX: 0,
+      zoomFocusCZ: 0,
+      zKeyDownTimeMs: 0,
       baseFogDensity: 0.0028,
       selectionWireframe,
       selectedObjectWireframe,
@@ -3281,6 +3826,10 @@ export default function App() {
       isSeatedInRig: true,
       selectedSlot: 1,
       placementMode: 'SINGLE' as BuildPlacementMode,
+      hullScalePx: DEFAULT_HULL_SCALE_PX,
+      boxDepthPx: 1,
+      hullShape: 'CUBE' as HullMicroShape,
+      eyedropperMode: false,
       cameraMode: 'CHASE' as CameraViewMode,
       buildCameraAngle: 'ORBIT_3D' as BuildCameraAngle,
       isPointerLocked: false,
@@ -3288,7 +3837,9 @@ export default function App() {
       buildOrbitPivot: new THREE.Vector3(0, 5.2, -4),
       buildOrbitDist: 6.4,
       playerVelY: 0,
+      playerPeakAirY: 3.85,
       playerKnockbackVel: new THREE.Vector3(),
+      playerRagdoll: createPlayerRagdollState(),
       spaceHoldTime: 0,
       isJetpacking: false,
       jetpackSoundTimer: 0,
@@ -3311,12 +3862,17 @@ export default function App() {
       isLeftMouseDown: false,
       isRightMouseDown: false,
       dragStartVoxel: null as { vx: number; vy: number; vz: number } | null,
+      dragStartMicro: null as { mx: number; my: number; mz: number } | null,
       lastPaintedKey: '',
       currentHit: null as {
         target: 'vehicle' | 'world';
         vx: number;
         vy: number;
         vz: number;
+        mx?: number;
+        my?: number;
+        mz?: number;
+        hitIsMicro?: boolean;
         mat: number;
         moduleHit?: {
           kind: ModuleKind;
@@ -3381,12 +3937,15 @@ export default function App() {
       zoomTacticalMap(factor: number) {
         this.tacticalMapCam.targetAltitude = Math.max(
           16,
-          Math.min(320, this.tacticalMapCam.targetAltitude * factor),
+          Math.min(1_000_000_000, this.tacticalMapCam.targetAltitude * factor),
         );
       },
 
       setTacticalMapAltitude(alt: number) {
-        this.tacticalMapCam.targetAltitude = Math.max(16, Math.min(320, alt));
+        this.tacticalMapCam.targetAltitude = Math.max(
+          16,
+          Math.min(1_000_000_000, alt),
+        );
       },
 
       setTacticalMapTopDown(topDown: boolean) {
@@ -3410,9 +3969,10 @@ export default function App() {
       },
 
       updateTacticalMapCamera(dt: number) {
-        const requiredFar = Math.max(2400, this.tacticalMapCam.altitude * 10);
-        if (camera.far < requiredFar) {
+        const requiredFar = Math.max(4800, this.tacticalMapCam.altitude * 14);
+        if (Math.abs(camera.far - requiredFar) > requiredFar * 0.05) {
           camera.far = requiredFar;
+          camera.near = Math.max(0.5, Math.min(50, this.tacticalMapCam.altitude * 0.002));
           camera.updateProjectionMatrix();
         }
         const speed =
@@ -3810,6 +4370,8 @@ export default function App() {
         const activeRig = this.getActiveRig();
         this.isBuildMode = nextBuild;
         if (nextBuild) {
+          this.recoverFromRagdoll(true);
+          this.playerCharacterMesh.visible = false;
           this.isWorldEditMode = false;
         } else {
           this.selectedBuildObjects = [];
@@ -3901,6 +4463,8 @@ export default function App() {
           this.isWorldEditMode = false;
           this.isBuildMode = true;
           this.isSeatedInRig = false;
+          this.recoverFromRagdoll(true);
+          this.playerCharacterMesh.visible = false;
           this.selectedSlot = 1;
           this.dragStartVoxel = null;
           if (document.pointerLockElement) {
@@ -4154,6 +4718,8 @@ export default function App() {
 
         if (nextWorldEdit) {
           this.isBuildMode = false;
+          this.recoverFromRagdoll(true);
+          this.playerCharacterMesh.visible = false;
           curRig.setHoverBuildMode(false);
           if (document.pointerLockElement) {
             document.exitPointerLock?.();
@@ -4220,8 +4786,13 @@ export default function App() {
         world.regenerateWorld(mode, flatMat, heightmap);
         const curRig = this.getActiveRig();
         curRig.summonTo(0, -2.0, 0);
-        this.resetArenaVoxelEntities();
-        this.resetArenaMapHazards();
+        if (mode === 'DEFAULT_PARK' && heightmap === null) {
+          this.resetArenaVoxelEntities();
+          this.resetArenaMapHazards();
+        } else {
+          this.clearVoxelEntities();
+          this.clearMapHazards();
+        }
         this.multiplayer?.broadcastWorldMapSync(
           heightmap ? `Custom Heightmap (${mode})` : `Biome: ${mode}`,
         );
@@ -4355,11 +4926,206 @@ export default function App() {
         syncHudNow();
       },
 
+      toggleZoom(force?: boolean): boolean {
+        if (this.isBuildMode) {
+          this.isZoomed = false;
+          world.zoomFocusWorld = null;
+          this.zoomFocusDistMeters = 0;
+          syncHudNow();
+          return false;
+        }
+        const next = typeof force === 'boolean' ? force : !this.isZoomed;
+        this.isZoomed = next;
+        if (!next) {
+          world.zoomFocusWorld = null;
+          this.zoomFocusDistMeters = 0;
+        } else {
+          this.applyOpticalZoomAndTarget(0.016);
+        }
+        SoundFX.snap();
+        syncHudNow();
+        return next;
+      },
+
+      setZoomMagnification(mag: number): void {
+        const sanitized = Math.max(1.25, Number(mag) || 4);
+        this.zoomMagnification = sanitized;
+        if (!this.isZoomed && !this.isBuildMode) {
+          this.isZoomed = true;
+        }
+        if (this.isZoomed) {
+          this.applyOpticalZoomAndTarget(0.016);
+        }
+        SoundFX.snap();
+        syncHudNow();
+      },
+
+      stepZoomMagnification(dir: 1 | -1): void {
+        const nextMag =
+          dir > 0
+            ? this.zoomMagnification * 2
+            : Math.max(1.25, this.zoomMagnification / 2);
+        const rounded =
+          nextMag >= 2 ? Math.round(nextMag) : Number(nextMag.toFixed(2));
+        if (rounded !== this.zoomMagnification) {
+          this.zoomMagnification = rounded;
+          if (this.isZoomed) {
+            this.applyOpticalZoomAndTarget(0.016);
+          }
+          SoundFX.snap();
+          syncHudNow();
+        }
+      },
+
       setPlacementMode(mode: BuildPlacementMode) {
         SoundFX.snap();
         this.placementMode = mode;
         this.dragStartVoxel = null;
+        this.dragStartMicro = null;
+        updateRaycastTarget();
         syncHudNow();
+      },
+
+      setHullScalePx(px: number) {
+        const clamped = clampHullScalePx(px);
+        if (this.hullScalePx === clamped) return;
+        SoundFX.snap();
+        this.hullScalePx = clamped;
+        this.dragStartVoxel = null;
+        this.dragStartMicro = null;
+        updateRaycastTarget();
+        syncHudNow();
+      },
+
+      stepHullScale(_delta: number) {
+        this.setHullScalePx(toggleHullStampScalePx(this.hullScalePx));
+      },
+
+      toggleHullStampMode() {
+        this.setHullScalePx(toggleHullStampScalePx(this.hullScalePx));
+      },
+
+      setBoxDepthPx(depth: number) {
+        const clamped = Math.max(1, Math.min(8, Math.round(depth || 1)));
+        if (this.boxDepthPx === clamped) return;
+        SoundFX.snap();
+        this.boxDepthPx = clamped;
+        updateRaycastTarget();
+        syncHudNow();
+      },
+
+      stepBoxDepthPx(delta: number) {
+        this.setBoxDepthPx(this.boxDepthPx + (delta < 0 ? -1 : 1));
+      },
+
+      setHullShape(_shape: HullMicroShape) {
+        // Pure 1px cube car hull voxels (no sculpted wedge/shape variants)
+        this.hullShape = 'CUBE';
+        updateRaycastTarget();
+        syncHudNow();
+      },
+
+      cycleHullShape() {
+        const idx = HULL_SHAPE_OPTIONS.findIndex((s) => s.id === this.hullShape);
+        const next = HULL_SHAPE_OPTIONS[(idx + 1) % HULL_SHAPE_OPTIONS.length].id;
+        this.setHullShape(next);
+      },
+
+      toggleEyedropperMode(force?: boolean) {
+        const next = force !== undefined ? force : !this.eyedropperMode;
+        this.eyedropperMode = next;
+        SoundFX.snap();
+        syncHudNow();
+      },
+
+      sampleHoveredObjectToBrush(): boolean {
+        updateRaycastTarget();
+        const hit = this.currentHit;
+        const curRig = this.getActiveRig();
+        if (!hit || hit.target !== 'vehicle') {
+          if (this.selectedBuildObject) {
+            this.pickSelectedObjectToBrush();
+            this.eyedropperMode = false;
+            syncHudNow();
+            return true;
+          }
+          return false;
+        }
+        if (hit.moduleHit) {
+          const slotMeta = BUILD_SLOTS.find((s) => s.kind === hit.moduleHit?.kind);
+          if (slotMeta) {
+            this.selectSlot(slotMeta.slot);
+          }
+          curRig.partYawIndex = hit.moduleHit.yawIdx || 0;
+          curRig.partPitchIndex = hit.moduleHit.pitchIdx || 0;
+          curRig.partRollIndex = hit.moduleHit.rollIdx || 0;
+          if (hit.moduleHit.config) {
+            curRig.setKindDefaultConfig(hit.moduleHit.kind, hit.moduleHit.config);
+          }
+        } else {
+          const cleanMat = hit.mat & 63;
+          const slotMeta = BUILD_SLOTS.find(
+            (s) => s.type === 'voxel' && s.mat === cleanMat,
+          );
+          if (slotMeta) {
+            this.selectSlot(slotMeta.slot);
+          }
+          if (hit.hitIsMicro && this.hullScalePx === 4) {
+            this.hullScalePx = 1;
+          } else if (!hit.hitIsMicro && this.hullScalePx < 4) {
+            this.hullScalePx = 4;
+          }
+        }
+        this.eyedropperMode = false;
+        if (this.placementMode === 'CHISEL') {
+          this.placementMode = 'SINGLE';
+        }
+        SoundFX.snap();
+        updateRaycastTarget();
+        syncHudNow();
+        return true;
+      },
+
+      toggleXrayMode(force?: boolean): boolean {
+        const curRig = this.getActiveRig();
+        const next = curRig.setXrayMode(force);
+        SoundFX.snap();
+        updateRaycastTarget();
+        syncHudNow();
+        return next;
+      },
+
+      setSymmetryAxisMode(mode: SymmetryAxisMode) {
+        const curRig = this.getActiveRig();
+        curRig.setSymmetryAxisMode(mode);
+        SoundFX.snap();
+        updateRaycastTarget();
+        syncHudNow();
+      },
+
+      cycleSymmetryAxisMode(): SymmetryAxisMode {
+        const curRig = this.getActiveRig();
+        const next = curRig.cycleSymmetryAxisMode();
+        SoundFX.snap();
+        updateRaycastTarget();
+        syncHudNow();
+        return next;
+      },
+
+      copySelectionToStamp(): SubAssemblyPrefab | null {
+        const curRig = this.getActiveRig();
+        if (this.selectedBuildObjects.length === 0) return null;
+        const prefab = curRig.exportSubAssemblyPrefab(
+          `Clip (${this.selectedBuildObjects.length})`,
+          this.selectedBuildObjects,
+        );
+        if (prefab) {
+          setSavedSubAssemblies((prev) => [prefab, ...prev.slice(0, 7)]);
+          setActiveStampPrefab(prefab);
+          SoundFX.snap();
+          syncHudNow();
+        }
+        return prefab;
       },
 
       cyclePlacementMode() {
@@ -4464,6 +5230,10 @@ export default function App() {
       selectSlot(slot: number) {
         SoundFX.snap();
         this.selectedSlot = slot;
+        setRecentBuildSlotIds((prev) => {
+          const next = [slot, ...prev.filter((s) => s !== slot)];
+          return next.slice(0, 6);
+        });
         syncHudNow();
       },
 
@@ -4494,11 +5264,7 @@ export default function App() {
       },
 
       toggleMirrorMode() {
-        const curRig = this.getActiveRig();
-        curRig.mirrorMode = !curRig.mirrorMode;
-        curRig.symmetryPlane.visible = this.isBuildMode && curRig.mirrorMode;
-        SoundFX.snap();
-        syncHudNow();
+        this.cycleSymmetryAxisMode();
       },
 
       toggleForcesOverlay() {
@@ -4531,6 +5297,22 @@ export default function App() {
         const ok = curRig.undoBuildStep();
         if (ok) {
           SoundFX.remove();
+          if (!this.isObjectStudioMode) {
+            saveLastBuildAutoSave(
+              curRig.exportBlueprint(curRig.customBlueprintName || 'Auto-Saved Rig'),
+            );
+          }
+          updateRaycastTarget();
+          syncHudNow();
+        }
+        return ok;
+      },
+
+      redoBuildStep(): boolean {
+        const curRig = this.getActiveRig();
+        const ok = curRig.redoBuildStep();
+        if (ok) {
+          SoundFX.snap();
           if (!this.isObjectStudioMode) {
             saveLastBuildAutoSave(
               curRig.exportBlueprint(curRig.customBlueprintName || 'Auto-Saved Rig'),
@@ -4786,6 +5568,36 @@ export default function App() {
         teleportStateRef.current = nextTp;
         setTeleportState(nextTp);
       }
+      // Blast shockwave launches on-foot player into a micro-voxel ragdoll
+      if (!sim.isBuildMode && !sim.isWorldEditMode && !sim.isSeatedInRig) {
+        const px = sim.playerRagdoll.active
+          ? sim.playerRagdoll.pos[0]
+          : sim.camFreePos.x;
+        const py = sim.playerRagdoll.active
+          ? sim.playerRagdoll.pos[1]
+          : sim.camFreePos.y - 0.9;
+        const pz = sim.playerRagdoll.active
+          ? sim.playerRagdoll.pos[2]
+          : sim.camFreePos.z;
+        const dx = px - wx;
+        const dy = py - wy;
+        const dz = pz - wz;
+        const blastRange = radiusVoxels * VOXEL_SIZE + 5.2;
+        const dist = Math.hypot(dx, dy, dz);
+        if (dist < blastRange) {
+          const falloff = Math.max(0.25, 1.0 - dist / blastRange);
+          const horiz = Math.hypot(dx, dz);
+          const nx = horiz > 0.05 ? dx / horiz : Math.sin(sim.camYaw);
+          const nz = horiz > 0.05 ? dz / horiz : Math.cos(sim.camYaw);
+          const launchSpeed = (8.5 + radiusVoxels * 1.15) * falloff;
+          sim.triggerPlayerRagdoll(
+            nx * launchSpeed,
+            Math.max(5.0, (6.5 + radiusVoxels * 0.75) * falloff),
+            nz * launchSpeed,
+            2.6 * falloff,
+          );
+        }
+      }
     };
 
     simRef.current = sim;
@@ -4853,6 +5665,7 @@ export default function App() {
     };
 
     let currentCaveAtmosphere = 0;
+    let lastStructuralHudKey = '';
 
     function syncHudNow() {
       const _tHud0 = performance.now();
@@ -4861,136 +5674,216 @@ export default function App() {
       const spanH = ((curRig.maxVY - curRig.minVY + 1) * VOXEL_SIZE).toFixed(1);
       const spanL = ((curRig.maxVZ - curRig.minVZ + 1) * VOXEL_SIZE).toFixed(1);
 
-      const creationsList = sim.creations.map((c, idx) => ({
-        name: c.customBlueprintName || PRESET_NAMES[c.presetIndex] || `Creation #${idx + 1}`,
-        massKg: Math.round(c.totalMass),
-        blocks: c.voxelCount + c.modules.length,
-        powerCores: c.powerCores,
-        distMeters: Math.round(
-          c.position.distanceTo(sim.isSeatedInRig ? curRig.position : sim.camFreePos),
-        ),
-        isSeated: idx === sim.activeCreationIndex && sim.isSeatedInRig,
-      }));
-
       const enterableSeatCandidate = !sim.isSeatedInRig
         ? sim.findClosestEnterableSeat(sim.camFreePos, 2.5)
         : null;
 
       const isOnFootHud = sim.isWalking || !sim.isSeatedInRig;
       const footAltMeters = Math.max(0, sim.camFreePos.y - 1.65 - WATER_LEVEL);
+      const statusLabel = isOnFootHud
+        ? sim.isJetpacking
+          ? 'JETPACK THRUST'
+          : 'ON FOOT'
+        : curRig.statusLabel;
+      const altitudeMeters = `${(isOnFootHud ? footAltMeters : curRig.altitudeMeters).toFixed(1)}m`;
+      const caveAtmospherePct = Math.round(currentCaveAtmosphere * 100);
+      const maxAirtimeSec = sim.maxAirtimeSec.toFixed(1);
+      const currentAirtimeSec = sim.currentAirtimeSec.toFixed(1);
+      const timeScale = sim.lastGovernorStep ? sim.lastGovernorStep.timeScale : 1.0;
+      const isSlowMoActive = sim.lastGovernorStep
+        ? sim.lastGovernorStep.isSlowMoActive
+        : sim.frameGovernorConfig.manualSlowMoActive;
+      const slowMoReason = sim.lastGovernorStep
+        ? sim.lastGovernorStep.slowMoReason
+        : sim.frameGovernorConfig.manualSlowMoActive
+          ? 'MANUAL'
+          : 'NONE';
+      const watchdogProtecting = Boolean(
+        sim.lastGovernorStep?.watchdog.isProtecting,
+      );
 
-      setHud({
+      // Push high-frequency telemetry directly to isolated external store (zero root App re-render!)
+      publishHudTelemetry({
         fps: currentFps,
         frameMs: currentFrameMs,
         rayTarget: currentRayLabel,
-        presetName:
-          curRig.customBlueprintName ||
-          PRESET_NAMES[curRig.presetIndex] ||
-          PRESET_NAMES[0],
-        presetIndex: curRig.presetIndex,
-        massKg: Math.round(curRig.totalMass),
-        buoyancyRatio: `${(curRig.totalBuoyancy / curRig.totalMass).toFixed(1)}x`,
-        voxelCount: curRig.voxelCount,
-        moduleCount: curRig.modules.length,
-        powerCores: curRig.powerCores,
-        dimensionsMeters: `${spanW}m × ${spanH}m × ${spanL}m`,
-        statusLabel: isOnFootHud
-          ? sim.isJetpacking
-            ? 'JETPACK THRUST'
-            : 'ON FOOT'
-          : curRig.statusLabel,
+        statusLabel,
         speedKmh: curRig.speedKmh,
         engineRpm: curRig.engineRpm,
-        altitudeMeters: `${(isOnFootHud ? footAltMeters : curRig.altitudeMeters).toFixed(1)}m`,
+        altitudeMeters,
         pitchDeg: curRig.pitchDeg,
         rollDeg: curRig.rollDeg,
-        isBuildMode: sim.isBuildMode,
-        isObjectStudioMode: sim.isObjectStudioMode,
-        isWorldEditMode: sim.isWorldEditMode,
-        worldEditTool: sim.worldEditTool,
-        worldGenMode: world.worldGenMode,
-        selectedObjectId: sim.selectedObjectId,
-        selectedVoxelEntityId: sim.selectedVoxelEntityId,
-        voxelEntitiesCount: sim.voxelEntities.length,
-        selectedMapHazardId: sim.selectedMapHazardId,
-        mapHazardsCount: sim.mapHazards.length,
-        terraBrushRadius: sim.terraBrushRadius,
-        terraPaintMat: sim.terraPaintMat,
-        isSeatedInRig: sim.isSeatedInRig,
-        isPointerLocked: sim.isPointerLocked,
-        mirrorMode: curRig.mirrorMode,
-        showForces: curRig.showForces,
-        partYawIndex: curRig.partYawIndex,
-        partPitchIndex: curRig.partPitchIndex,
-        partRollIndex: curRig.partRollIndex,
-        propPhysicsMode: sim.propPhysicsMode,
-        caveAtmospherePct: Math.round(currentCaveAtmosphere * 100),
-        placementMode: sim.placementMode,
-        cameraMode: sim.cameraMode,
-        buildCameraAngle: sim.buildCameraAngle,
-        selectedSlot: sim.selectedSlot,
-        nearVehiclePrompt:
-          !sim.isBuildMode &&
-          !sim.isWorldEditMode &&
-          !sim.isSeatedInRig &&
-          enterableSeatCandidate !== null,
+        caveAtmospherePct,
         voxelsDestroyed: fx.voxelsDestroyedCount,
-        detachedIslands: curRig.detachedIslandsCount,
-        pistonExtended: curRig.pistonExtended,
-        winchActive: curRig.winchActive,
-        pistonCount: curRig.pistonCount,
-        winchCount: curRig.winchCount,
-        gyroCount: curRig.gyroCount,
-        thrusterCount: curRig.thrusterCount,
-        cannonCount: curRig.cannonCount,
         structuralIntegrityPct: curRig.structuralIntegrityPct,
         damagedBlockCount: curRig.damagedBlockCount,
         lodSummary: world.lodSummary,
-        undoCount: curRig.undoStack.length,
-        muted: SoundFX.muted,
-        gyroEnabled: curRig.gyroCount > 0 && curRig.gyroEnabled,
-        headlightsOn: curRig.headlightsOn,
-        hasIntactSeat: curRig.hasIntactSeat(),
-        creationsCount: sim.creations.length,
-        activeCreationIdx: sim.activeCreationIndex,
-        creationsList,
-        hoveredModule:
-          sim.currentHit &&
-          sim.currentHit.target === 'vehicle' &&
-          'moduleHit' in sim.currentHit &&
-          sim.currentHit.moduleHit
-            ? {
-                kind: sim.currentHit.moduleHit.kind,
-                vx: sim.currentHit.moduleHit.vx,
-                vy: sim.currentHit.moduleHit.vy,
-                vz: sim.currentHit.moduleHit.vz,
-                config: sim.currentHit.moduleHit.config,
-              }
-            : null,
-        selectedBuildObject: sim.selectedBuildObject
-          ? { ...sim.selectedBuildObject }
-          : null,
-        selectedBuildObjects: sim.selectedBuildObjects.map((o) => ({
-          ...o,
-          config: o.config ? { ...o.config } : undefined,
-        })),
         speedTrapMaxKmh: sim.speedTrapMaxKmh,
         speedTrapLastKmh: sim.speedTrapLastKmh,
-        maxAirtimeSec: sim.maxAirtimeSec.toFixed(1),
-        currentAirtimeSec: sim.currentAirtimeSec.toFixed(1),
-        timeScale: sim.lastGovernorStep ? sim.lastGovernorStep.timeScale : 1.0,
-        isSlowMoActive: sim.lastGovernorStep
-          ? sim.lastGovernorStep.isSlowMoActive
-          : sim.frameGovernorConfig.manualSlowMoActive,
-        slowMoReason: sim.lastGovernorStep
-          ? sim.lastGovernorStep.slowMoReason
-          : sim.frameGovernorConfig.manualSlowMoActive
-            ? 'MANUAL'
-            : 'NONE',
-        watchdogProtecting: Boolean(
-          sim.lastGovernorStep?.watchdog.isProtecting,
-        ),
+        maxAirtimeSec,
+        currentAirtimeSec,
+        timeScale,
+        isSlowMoActive,
+        slowMoReason,
+        watchdogProtecting,
       });
+
+      // Only trigger a root React `setHud` reconciliation when structural UI state actually changed
+      const presetName =
+        curRig.customBlueprintName ||
+        PRESET_NAMES[curRig.presetIndex] ||
+        PRESET_NAMES[0];
+      const massKg = Math.round(curRig.totalMass);
+      const buoyancyRatio = `${(curRig.totalBuoyancy / curRig.totalMass).toFixed(1)}x`;
+      const dimensionsMeters = `${spanW}m × ${spanH}m × ${spanL}m`;
+      const nearVehiclePrompt =
+        !sim.isBuildMode &&
+        !sim.isWorldEditMode &&
+        !sim.isSeatedInRig &&
+        enterableSeatCandidate !== null;
+      const gyroEnabled = curRig.gyroCount > 0 && curRig.gyroEnabled;
+      const hasIntactSeat = curRig.hasIntactSeat();
+      const hoveredModHit =
+        sim.currentHit &&
+        sim.currentHit.target === 'vehicle' &&
+        'moduleHit' in sim.currentHit &&
+        sim.currentHit.moduleHit
+          ? sim.currentHit.moduleHit
+          : null;
+      const hoveredKey = hoveredModHit
+        ? `${hoveredModHit.kind}:${hoveredModHit.vx},${hoveredModHit.vy},${hoveredModHit.vz}`
+        : '';
+      const selObj = sim.selectedBuildObject;
+      const selObjKey = selObj
+        ? `${selObj.kind}:${selObj.vx},${selObj.vy},${selObj.vz}`
+        : '';
+      const selObjs = sim.selectedBuildObjects;
+      const selObjsKey =
+        selObjs.length > 0
+          ? `${selObjs.length}:${selObjs[0].vx},${selObjs[0].vy},${selObjs[0].vz}:${selObjs[selObjs.length - 1].vx},${selObjs[selObjs.length - 1].vy},${selObjs[selObjs.length - 1].vz}`
+          : '0';
+
+      const structuralKey =
+        `${presetName}|${curRig.presetIndex}|${massKg}|${buoyancyRatio}|${curRig.voxelCount}|${curRig.modules.length}|${curRig.powerCores}|${dimensionsMeters}|` +
+        `${sim.isBuildMode ? 1 : 0}${sim.isObjectStudioMode ? 1 : 0}${sim.isWorldEditMode ? 1 : 0}${sim.isSeatedInRig ? 1 : 0}${sim.isPointerLocked ? 1 : 0}${curRig.mirrorMode ? 1 : 0}${curRig.symmetryAxisMode}${curRig.xrayMode ? 1 : 0}${sim.eyedropperMode ? 1 : 0}${curRig.showForces ? 1 : 0}|` +
+        `${sim.worldEditTool}|${world.worldGenMode}|${sim.selectedObjectId}|${sim.selectedVoxelEntityId}|${sim.voxelEntities.length}|${sim.selectedMapHazardId}|${sim.mapHazards.length}|${sim.terraBrushRadius}|${sim.terraPaintMat}|` +
+        `${curRig.partYawIndex},${curRig.partPitchIndex},${curRig.partRollIndex}|${sim.propPhysicsMode}|${sim.placementMode}|${sim.hullScalePx}|${sim.boxDepthPx}|${curRig.lastGhostSummary.dimsLabel}:${curRig.lastGhostSummary.count}|${sim.cameraMode}|${sim.buildCameraAngle}|${sim.selectedSlot}|${nearVehiclePrompt ? 1 : 0}|` +
+        `${curRig.detachedIslandsCount}|${curRig.pistonExtended ? 1 : 0}${curRig.winchActive ? 1 : 0}|${curRig.pistonCount},${curRig.winchCount},${curRig.gyroCount},${curRig.thrusterCount},${curRig.cannonCount}|` +
+        `${curRig.undoStack.length},${curRig.redoStack.length}|${SoundFX.muted ? 1 : 0}${gyroEnabled ? 1 : 0}${curRig.headlightsOn ? 1 : 0}${hasIntactSeat ? 1 : 0}|${sim.creations.length},${sim.activeCreationIndex}|` +
+        `${hoveredKey}|${selObjKey}|${selObjsKey}|${isSlowMoActive ? 1 : 0}:${slowMoReason}:${watchdogProtecting ? 1 : 0}|${sim.isZoomed ? 1 : 0}:${sim.zoomMagnification}:${Math.round(sim.zoomFocusDistMeters / 4)}`;
+
+      if (structuralKey !== lastStructuralHudKey) {
+        lastStructuralHudKey = structuralKey;
+        const creationsList = sim.creations.map((c, idx) => ({
+          name: c.customBlueprintName || PRESET_NAMES[c.presetIndex] || `Creation #${idx + 1}`,
+          massKg: Math.round(c.totalMass),
+          blocks: c.voxelCount + c.modules.length,
+          powerCores: c.powerCores,
+          distMeters: Math.round(
+            c.position.distanceTo(sim.isSeatedInRig ? curRig.position : sim.camFreePos),
+          ),
+          isSeated: idx === sim.activeCreationIndex && sim.isSeatedInRig,
+        }));
+
+        setHud({
+          fps: currentFps,
+          frameMs: currentFrameMs,
+          rayTarget: currentRayLabel,
+          presetName,
+          presetIndex: curRig.presetIndex,
+          massKg,
+          buoyancyRatio,
+          voxelCount: curRig.voxelCount,
+          moduleCount: curRig.modules.length,
+          powerCores: curRig.powerCores,
+          dimensionsMeters,
+          statusLabel,
+          speedKmh: curRig.speedKmh,
+          engineRpm: curRig.engineRpm,
+          altitudeMeters,
+          pitchDeg: curRig.pitchDeg,
+          rollDeg: curRig.rollDeg,
+          isBuildMode: sim.isBuildMode,
+          isObjectStudioMode: sim.isObjectStudioMode,
+          isWorldEditMode: sim.isWorldEditMode,
+          worldEditTool: sim.worldEditTool,
+          worldGenMode: world.worldGenMode,
+          selectedObjectId: sim.selectedObjectId,
+          selectedVoxelEntityId: sim.selectedVoxelEntityId,
+          voxelEntitiesCount: sim.voxelEntities.length,
+          selectedMapHazardId: sim.selectedMapHazardId,
+          mapHazardsCount: sim.mapHazards.length,
+          terraBrushRadius: sim.terraBrushRadius,
+          terraPaintMat: sim.terraPaintMat,
+          isSeatedInRig: sim.isSeatedInRig,
+          isPointerLocked: sim.isPointerLocked,
+          mirrorMode: curRig.mirrorMode,
+          symmetryAxisMode: curRig.symmetryAxisMode,
+          xrayMode: curRig.xrayMode,
+          eyedropperMode: sim.eyedropperMode,
+          showForces: curRig.showForces,
+          partYawIndex: curRig.partYawIndex,
+          partPitchIndex: curRig.partPitchIndex,
+          partRollIndex: curRig.partRollIndex,
+          propPhysicsMode: sim.propPhysicsMode,
+          caveAtmospherePct,
+          placementMode: sim.placementMode,
+          hullScalePx: sim.hullScalePx,
+          boxDepthPx: sim.boxDepthPx,
+          hullShape: sim.hullShape,
+          ghostSummary: { ...curRig.lastGhostSummary },
+          cameraMode: sim.cameraMode,
+          buildCameraAngle: sim.buildCameraAngle,
+          selectedSlot: sim.selectedSlot,
+          nearVehiclePrompt,
+          voxelsDestroyed: fx.voxelsDestroyedCount,
+          detachedIslands: curRig.detachedIslandsCount,
+          pistonExtended: curRig.pistonExtended,
+          winchActive: curRig.winchActive,
+          pistonCount: curRig.pistonCount,
+          winchCount: curRig.winchCount,
+          gyroCount: curRig.gyroCount,
+          thrusterCount: curRig.thrusterCount,
+          cannonCount: curRig.cannonCount,
+          structuralIntegrityPct: curRig.structuralIntegrityPct,
+          damagedBlockCount: curRig.damagedBlockCount,
+          lodSummary: world.lodSummary,
+          undoCount: curRig.undoStack.length,
+          redoCount: curRig.redoStack.length,
+          muted: SoundFX.muted,
+          gyroEnabled,
+          headlightsOn: curRig.headlightsOn,
+          hasIntactSeat,
+          creationsCount: sim.creations.length,
+          activeCreationIdx: sim.activeCreationIndex,
+          creationsList,
+          hoveredModule: hoveredModHit
+            ? {
+                kind: hoveredModHit.kind,
+                vx: hoveredModHit.vx,
+                vy: hoveredModHit.vy,
+                vz: hoveredModHit.vz,
+                config: hoveredModHit.config,
+              }
+            : null,
+          selectedBuildObject: selObj ? { ...selObj } : null,
+          selectedBuildObjects: selObjs.map((o) => ({
+            ...o,
+            config: o.config ? { ...o.config } : undefined,
+          })),
+          speedTrapMaxKmh: sim.speedTrapMaxKmh,
+          speedTrapLastKmh: sim.speedTrapLastKmh,
+          maxAirtimeSec,
+          currentAirtimeSec,
+          timeScale,
+          isSlowMoActive,
+          slowMoReason,
+          watchdogProtecting,
+          isZoomed: sim.isZoomed,
+          zoomMagnification: sim.zoomMagnification,
+          zoomFocusDistMeters: sim.zoomFocusDistMeters,
+        });
+      }
       if (
         worldArenaSystems.lastCrashReport &&
         worldArenaSystems.lastCrashReport.timestampMs !==
@@ -5035,6 +5928,8 @@ export default function App() {
         lodMidChunks: world.lodMidChunks,
         lodFarChunks: world.lodFarChunks,
         voxelCount: curRig.voxelCount,
+        microVoxelCount: curRig.microHull.size,
+        hullScalePx: sim.hullScalePx,
         moduleCount: curRig.modules.length,
         structuralIntegrityPct: curRig.structuralIntegrityPct,
         damagedBlockCount: curRig.damagedBlockCount,
@@ -5152,15 +6047,41 @@ export default function App() {
           (sim.placementMode === 'BOX_FILL' ||
             sim.placementMode === 'LINE_DRAG') &&
           sim.dragStartVoxel !== null;
-        const vHit = isAreaDrag
+        const slotItem = activeSlots[sim.selectedSlot - 1] || activeSlots[0];
+        const useMicroRay =
+          sim.hullScalePx !== 4 ||
+          sim.hullShape !== 'CUBE' ||
+          curRig.microHull.size > 0 ||
+          curRig.xrayMode;
+        const rawHit = isAreaDrag
           ? curRig.raycastBuildOrDragPlane(
               rayOrigin,
               rayDir,
               sim.dragStartVoxel,
               { x: 0, y: 0, z: 0 },
             )
-          : curRig.raycastVehicle(rayOrigin, rayDir, 65);
-        const slotItem = activeSlots[sim.selectedSlot - 1] || activeSlots[0];
+          : useMicroRay
+            ? curRig.raycastVehicleMicro(rayOrigin, rayDir, 65)
+            : curRig.raycastVehicle(rayOrigin, rayDir, 65);
+        const vHit = rawHit
+          ? {
+              ...rawHit,
+              mx:
+                'mx' in rawHit && typeof rawHit.mx === 'number'
+                  ? rawHit.mx
+                  : rawHit.vx * MICRO_VOXEL_SUBDIV,
+              my:
+                'my' in rawHit && typeof rawHit.my === 'number'
+                  ? rawHit.my
+                  : rawHit.vy * MICRO_VOXEL_SUBDIV,
+              mz:
+                'mz' in rawHit && typeof rawHit.mz === 'number'
+                  ? rawHit.mz
+                  : rawHit.vz * MICRO_VOXEL_SUBDIV,
+              hitIsMicro:
+                'hitIsMicro' in rawHit ? Boolean(rawHit.hitIsMicro) : false,
+            }
+          : null;
         if (sim.selectedBuildObjects.length > 0) {
           const validSelections = sim.selectedBuildObjects.filter((sel) => {
             if (sel.kind === 'module') {
@@ -5182,13 +6103,32 @@ export default function App() {
 
         if (vHit) {
           sim.currentHit = vHit;
-          const wp = curRig.localVoxelToWorld(vHit.vx, vHit.vy, vHit.vz);
-          selectionWireframe.scale.set(
-            VOXEL_SIZE + 0.02,
-            VOXEL_SIZE + 0.02,
-            VOXEL_SIZE + 0.02,
-          );
-          selectionWireframe.position.copy(wp);
+          const isScaledHull =
+            !vHit.moduleHit &&
+            (vHit.hitIsMicro || sim.hullScalePx !== 4 || sim.hullShape !== 'CUBE');
+          if (isScaledHull) {
+            const boxSizePx = vHit.hitIsMicro ? Math.min(sim.hullScalePx, 4) : sim.hullScalePx;
+            const snapO = computeScaledAnchorOrigin(
+              { mx: vHit.mx, my: vHit.my, mz: vHit.mz, normal: vHit.normal },
+              boxSizePx,
+              true,
+            );
+            const lc = microBlockCenterMeters(snapO.mx, snapO.my, snapO.mz, boxSizePx);
+            const wp = new THREE.Vector3(lc.x, lc.y, lc.z)
+              .applyQuaternion(curRig.quaternion)
+              .add(curRig.position);
+            const edgeM = boxSizePx * MICRO_VOXEL_SIZE + 0.012;
+            selectionWireframe.scale.set(edgeM, edgeM, edgeM);
+            selectionWireframe.position.copy(wp);
+          } else {
+            const wp = curRig.localVoxelToWorld(vHit.vx, vHit.vy, vHit.vz);
+            selectionWireframe.scale.set(
+              VOXEL_SIZE + 0.02,
+              VOXEL_SIZE + 0.02,
+              VOXEL_SIZE + 0.02,
+            );
+            selectionWireframe.position.copy(wp);
+          }
           selectionWireframe.quaternion.copy(curRig.quaternion);
           selectionWireframe.visible = true;
           curRig.updateBuildGhost(
@@ -5196,8 +6136,30 @@ export default function App() {
             slotItem,
             sim.placementMode,
             sim.dragStartVoxel,
+            sim.hullScalePx,
+            sim.dragStartMicro,
+            'CUBE',
+            sim.boxDepthPx,
           );
+          if (sim.eyedropperMode) {
+            if (vHit.moduleHit) {
+              return `Eyedropper: Sample Module ${vHit.moduleHit.kind}`;
+            }
+            return `Eyedropper: Sample ${MAT_INFO[vHit.mat]?.name || 'Block'} (${vHit.hitIsMicro ? '1px' : '4px'})`;
+          }
           if (sim.dragStartVoxel && sim.placementMode === 'BOX_FILL') {
+            if (sim.dragStartMicro) {
+              const s = sim.hullScalePx;
+              const anchor = computeScaledAnchorOrigin(
+                { mx: vHit.mx, my: vHit.my, mz: vHit.mz, normal: vHit.normal },
+                s,
+                false,
+              );
+              const sx = Math.abs(Math.round((anchor.mx - sim.dragStartMicro.mx) / s)) + 1;
+              const sy = Math.abs(Math.round((anchor.my - sim.dragStartMicro.my) / s)) + 1;
+              const sz = Math.abs(Math.round((anchor.mz - sim.dragStartMicro.mz) / s)) + 1;
+              return `Box Fill (${s}px · Depth ${sim.boxDepthPx}px): ${sx}×${sy}×${sz}`;
+            }
             const tx = vHit.vx + vHit.normal.x;
             const ty = vHit.vy + vHit.normal.y;
             const tz = vHit.vz + vHit.normal.z;
@@ -5206,13 +6168,27 @@ export default function App() {
             const sz = Math.abs(tz - sim.dragStartVoxel.vz) + 1;
             return `Box Fill: ${sx}×${sy}×${sz} (${sx * sy * sz} blocks)`;
           }
-          return vHit.moduleHit
-            ? `Module: ${vHit.moduleHit.kind} (R-Click Select)`
-            : `Block (${vHit.vx}, ${vHit.vy}, ${vHit.vz}) (R-Click Select)`;
+          if (vHit.moduleHit) {
+            return `Module: ${vHit.moduleHit.kind} (R-Click Select · Alt-Click Pick)`;
+          }
+          if (sim.placementMode === 'CHISEL') {
+            return `Chisel (${sim.hullScalePx === 1 ? '1px Fine' : '4px Block'}) · L-Click Carve · R-Click Select`;
+          }
+          const stampModeLabel = sim.hullScalePx === 1 ? '1px Fine' : '4px Block (4×4×4)';
+          return `Hull ${stampModeLabel} · L-Click Place · R-Click Carve`;
         } else {
           sim.currentHit = null;
           selectionWireframe.visible = false;
-          curRig.updateBuildGhost(null, slotItem, sim.placementMode, null);
+          curRig.updateBuildGhost(
+            null,
+            slotItem,
+            sim.placementMode,
+            null,
+            sim.hullScalePx,
+            null,
+            'CUBE',
+            sim.boxDepthPx,
+          );
           return sim.isObjectStudioMode
             ? 'Aim at Pedestal to Sculpt Object'
             : 'Hover Vehicle · L-Click Place · R-Click Select';
@@ -5455,12 +6431,85 @@ export default function App() {
         }
         return;
       }
+      if (isLeftClick && sim.eyedropperMode) {
+        sim.sampleHoveredObjectToBrush();
+        return;
+      }
       const curRig = sim.getActiveRig();
       const activeSlots = sim.isObjectStudioMode
         ? OBJECT_STUDIO_SLOTS
         : BUILD_SLOTS;
       const item = activeSlots[sim.selectedSlot - 1];
       if (!item) return;
+
+      // Dedicated CHISEL / CARVE mode on Left-Click OR Right-Click when sculpting with scaled/1px hull blocks
+      if (
+        (isLeftClick && sim.placementMode === 'CHISEL') ||
+        (!isLeftClick &&
+          !shiftKey &&
+          !sim.currentHit.moduleHit &&
+          (sim.hullScalePx !== 4 || sim.currentHit.hitIsMicro))
+      ) {
+        const hitMicro = {
+          mx:
+            typeof sim.currentHit.mx === 'number'
+              ? sim.currentHit.mx
+              : sim.currentHit.vx * MICRO_VOXEL_SUBDIV,
+          my:
+            typeof sim.currentHit.my === 'number'
+              ? sim.currentHit.my
+              : sim.currentHit.vy * MICRO_VOXEL_SUBDIV,
+          mz:
+            typeof sim.currentHit.mz === 'number'
+              ? sim.currentHit.mz
+              : sim.currentHit.vz * MICRO_VOXEL_SUBDIV,
+          normal: sim.currentHit.normal,
+        };
+        const eraseCoords = computeScaledHullPlacementCoords(
+          sim.placementMode === 'PLATE_3X3' ||
+            sim.placementMode === 'PLATE_5X5' ||
+            sim.placementMode === 'BOX_FILL' ||
+            sim.placementMode === 'LINE_DRAG'
+            ? sim.placementMode
+            : 'CHISEL',
+          hitMicro,
+          sim.dragStartMicro,
+          sim.hullScalePx,
+          curRig.symmetryAxisMode,
+          true,
+          curRig.partYawIndex,
+          curRig.partPitchIndex,
+          curRig.partRollIndex,
+          sim.boxDepthPx,
+        );
+        if (recordUndo) {
+          curRig.pushUndoSnapshot();
+        }
+        let erasedTotal = 0;
+        for (const pt of eraseCoords) {
+          erasedTotal += curRig.eraseScaledHullBlock(pt.mx, pt.my, pt.mz, pt.sizePx);
+        }
+        if (erasedTotal > 0) {
+          if (curRig.voxelMap.size === 0 && curRig.microHull.size === 0 && curRig.modules.length === 0) {
+            curRig.setVoxel(12, 6, 18, MAT.ALLOY_BLUE);
+          }
+          const oldInfo = MAT_INFO[sim.currentHit.mat & 63];
+          const wp =
+            sim.currentHit.worldPos ||
+            curRig.localVoxelToWorld(sim.currentHit.vx, sim.currentHit.vy, sim.currentHit.vz);
+          fx.spawnEditPopOut(wp.x, wp.y, wp.z, oldInfo?.color ?? 0x94a3b8);
+          SoundFX.remove();
+          curRig.rebuildVehicleGeometry();
+          if (!sim.isObjectStudioMode) {
+            saveLastBuildAutoSave(
+              curRig.exportBlueprint(curRig.customBlueprintName || 'Auto-Saved Rig'),
+            );
+          }
+          updateRaycastTarget();
+          syncHudNow();
+        }
+        return;
+      }
 
       if (!isLeftClick) {
         const hitObj = extractHitSelectableObject(sim.currentHit);
@@ -5548,33 +6597,48 @@ export default function App() {
         updateRaycastTarget();
         syncHudNow();
       } else if (sim.placementMode === 'FACE_EXTRUDE') {
+        const hitMicro = {
+          mx:
+            typeof sim.currentHit.mx === 'number'
+              ? sim.currentHit.mx
+              : sim.currentHit.vx * MICRO_VOXEL_SUBDIV,
+          my:
+            typeof sim.currentHit.my === 'number'
+              ? sim.currentHit.my
+              : sim.currentHit.vy * MICRO_VOXEL_SUBDIV,
+          mz:
+            typeof sim.currentHit.mz === 'number'
+              ? sim.currentHit.mz
+              : sim.currentHit.vz * MICRO_VOXEL_SUBDIV,
+          normal: sim.currentHit.normal,
+        };
         const extrudeMat =
           (item.type === 'voxel' && item.mat) ||
-          curRig.getVoxel(
-            sim.currentHit.vx,
-            sim.currentHit.vy,
-            sim.currentHit.vz,
-          ) ||
+          curRig.getMicroOrCoarseMat(hitMicro.mx, hitMicro.my, hitMicro.mz) ||
           MAT.ALLOY_BLUE;
-        const coords = computeFaceExtrudeCoords(
-          sim.currentHit,
-          (vx: number, vy: number, vz: number) => curRig.getVoxel(vx, vy, vz),
-          curRig.mirrorMode,
+        const depthLayers =
+          sim.hullScalePx === 4 ? sim.boxDepthPx * MICRO_VOXEL_SUBDIV : sim.boxDepthPx;
+        const microCoords = computeMicroFaceExtrudeCoords(
+          hitMicro,
+          (mx, my, mz) => curRig.getMicroOrCoarseMat(mx, my, mz),
+          curRig.symmetryAxisMode,
+          depthLayers,
+          256,
         );
-        if (coords.length === 0) return;
+        if (microCoords.length === 0) return;
         if (recordUndo) {
           curRig.pushUndoSnapshot();
         }
-        const spawnNowSec = performance.now() * 0.001;
-        for (const pt of coords) {
-          curRig.setVoxel(pt.vx, pt.vy, pt.vz, extrudeMat);
-          curRig.markVoxelSpawnTime(pt.vx, pt.vy, pt.vz, spawnNowSec);
+        for (const pt of microCoords) {
+          curRig.placeScaledHullBlock(pt.mx, pt.my, pt.mz, pt.sizePx, extrudeMat);
         }
-        const wp = curRig.localVoxelToWorld(
-          sim.currentHit.vx + sim.currentHit.normal.x,
-          sim.currentHit.vy + sim.currentHit.normal.y,
-          sim.currentHit.vz + sim.currentHit.normal.z,
-        );
+        const wp =
+          sim.currentHit.worldPos ||
+          curRig.localVoxelToWorld(
+            sim.currentHit.vx + sim.currentHit.normal.x,
+            sim.currentHit.vy + sim.currentHit.normal.y,
+            sim.currentHit.vz + sim.currentHit.normal.z,
+          );
         SoundFX.snap();
         fx.spawnWeldSparks(wp.x, wp.y, wp.z);
         curRig.rebuildVehicleGeometry();
@@ -5586,8 +6650,58 @@ export default function App() {
         updateRaycastTarget();
         syncHudNow();
       } else if (sim.placementMode === 'PAINT_TOOL') {
-        // Paint Tool: Change the material/color of existing blocks without deleting them!
+        // Paint Tool: Change the material/color of existing blocks without deleting them (scale-aware)!
         const paintMat = resolvePaintSlotMaterial(sim.selectedSlot);
+        if (sim.hullScalePx !== 4 || sim.currentHit.hitIsMicro || curRig.symmetryAxisMode === 'Z' || curRig.symmetryAxisMode === 'XZ') {
+          const hitMicro = {
+            mx:
+              typeof sim.currentHit.mx === 'number'
+                ? sim.currentHit.mx
+                : sim.currentHit.vx * MICRO_VOXEL_SUBDIV,
+            my:
+              typeof sim.currentHit.my === 'number'
+                ? sim.currentHit.my
+                : sim.currentHit.vy * MICRO_VOXEL_SUBDIV,
+            mz:
+              typeof sim.currentHit.mz === 'number'
+                ? sim.currentHit.mz
+                : sim.currentHit.vz * MICRO_VOXEL_SUBDIV,
+            normal: sim.currentHit.normal,
+          };
+          const scaledTargets = computeScaledHullPlacementCoords(
+            'PAINT_TOOL',
+            hitMicro,
+            null,
+            sim.hullScalePx,
+            curRig.symmetryAxisMode,
+            false,
+            curRig.partYawIndex,
+            curRig.partPitchIndex,
+            curRig.partRollIndex,
+          );
+          if (recordUndo) {
+            curRig.pushUndoSnapshot();
+          }
+          let painted = 0;
+          for (const pt of scaledTargets) {
+            painted += curRig.paintScaledHullBlock(pt.mx, pt.my, pt.mz, pt.sizePx, paintMat);
+          }
+          if (painted === 0) return;
+          const wp =
+            sim.currentHit.worldPos ||
+            curRig.localVoxelToWorld(sim.currentHit.vx, sim.currentHit.vy, sim.currentHit.vz);
+          SoundFX.snap();
+          fx.spawnWeldSparks(wp.x, wp.y, wp.z);
+          curRig.rebuildVehicleGeometry();
+          if (!sim.isObjectStudioMode) {
+            saveLastBuildAutoSave(
+              curRig.exportBlueprint(curRig.customBlueprintName || 'Auto-Saved Rig'),
+            );
+          }
+          updateRaycastTarget();
+          syncHudNow();
+          return;
+        }
         const coords = computePlacementVoxelCoords(
           'PAINT_TOOL',
           sim.currentHit,
@@ -5633,23 +6747,69 @@ export default function App() {
         const nx = sim.currentHit.vx + sim.currentHit.normal.x;
         const ny = sim.currentHit.vy + sim.currentHit.normal.y;
         const nz = sim.currentHit.vz + sim.currentHit.normal.z;
-        const weldWorldPos = curRig.localVoxelToWorld(nx, ny, nz);
+        const weldWorldPos =
+          sim.currentHit.worldPos || curRig.localVoxelToWorld(nx, ny, nz);
 
         if (item.type === 'voxel' && item.mat) {
-          const coords = computePlacementVoxelCoords(
-            sim.placementMode,
-            sim.currentHit,
-            sim.dragStartVoxel,
-            curRig.mirrorMode,
-            false,
-            curRig.partYawIndex,
-            curRig.partPitchIndex,
-            curRig.partRollIndex,
-          );
-          const spawnNowSec = performance.now() * 0.001;
-          for (const pt of coords) {
-            curRig.setVoxel(pt.vx, pt.vy, pt.vz, item.mat);
-            curRig.markVoxelSpawnTime(pt.vx, pt.vy, pt.vz, spawnNowSec);
+          if (
+            sim.hullScalePx !== 4 ||
+            sim.boxDepthPx > 1 ||
+            sim.currentHit.hitIsMicro ||
+            curRig.symmetryAxisMode === 'Z' ||
+            curRig.symmetryAxisMode === 'XZ'
+          ) {
+            const hitMicro = {
+              mx:
+                typeof sim.currentHit.mx === 'number'
+                  ? sim.currentHit.mx
+                  : sim.currentHit.vx * MICRO_VOXEL_SUBDIV,
+              my:
+                typeof sim.currentHit.my === 'number'
+                  ? sim.currentHit.my
+                  : sim.currentHit.vy * MICRO_VOXEL_SUBDIV,
+              mz:
+                typeof sim.currentHit.mz === 'number'
+                  ? sim.currentHit.mz
+                  : sim.currentHit.vz * MICRO_VOXEL_SUBDIV,
+              normal: sim.currentHit.normal,
+            };
+            const scaledCoords = computeScaledHullPlacementCoords(
+              sim.placementMode,
+              hitMicro,
+              sim.dragStartMicro,
+              sim.hullScalePx,
+              curRig.symmetryAxisMode,
+              false,
+              curRig.partYawIndex,
+              curRig.partPitchIndex,
+              curRig.partRollIndex,
+              sim.boxDepthPx,
+            );
+            for (const pt of scaledCoords) {
+              curRig.placeScaledHullBlock(
+                pt.mx,
+                pt.my,
+                pt.mz,
+                pt.sizePx,
+                item.mat,
+              );
+            }
+          } else {
+            const coords = computePlacementVoxelCoords(
+              sim.placementMode,
+              sim.currentHit,
+              sim.dragStartVoxel,
+              curRig.mirrorMode,
+              false,
+              curRig.partYawIndex,
+              curRig.partPitchIndex,
+              curRig.partRollIndex,
+            );
+            const spawnNowSec = performance.now() * 0.001;
+            for (const pt of coords) {
+              curRig.setVoxel(pt.vx, pt.vy, pt.vz, item.mat);
+              curRig.markVoxelSpawnTime(pt.vx, pt.vy, pt.vz, spawnNowSec);
+            }
           }
           SoundFX.snap();
           fx.spawnWeldSparks(weldWorldPos.x, weldWorldPos.y, weldWorldPos.z);
@@ -5681,7 +6841,10 @@ export default function App() {
             item.kind === 'SEAT_DIVING' ||
             item.kind === 'SEAT_SPACE' ||
             item.kind === 'SEAT_SHIP_WHEEL';
-          if (curRig.mirrorMode && !isCenterSeat) {
+          const symAxis = curRig.symmetryAxisMode;
+          const mirrorX = symAxis === 'X' || symAxis === 'XZ';
+          const mirrorZ = symAxis === 'Z' || symAxis === 'XZ';
+          if (mirrorX && !isCenterSeat) {
             const mx = SYMMETRY_CENTER_X * 2 - 1 - nx;
             if (mx !== nx) {
               const mirrorYaw = (4 - (curRig.partYawIndex & 3)) & 3;
@@ -5695,6 +6858,36 @@ export default function App() {
                 undefined,
                 curRig.partPitchIndex,
                 mirrorRoll,
+              );
+              if (mirrorZ) {
+                const mz = SYMMETRY_CENTER_Z * 2 - 1 - nz;
+                if (mz !== nz) {
+                  curRig.addModule(
+                    item.kind,
+                    mx,
+                    ny,
+                    mz,
+                    mirrorYaw,
+                    undefined,
+                    curRig.partPitchIndex,
+                    mirrorRoll,
+                  );
+                }
+              }
+            }
+          }
+          if (mirrorZ && !isCenterSeat) {
+            const mz = SYMMETRY_CENTER_Z * 2 - 1 - nz;
+            if (mz !== nz) {
+              curRig.addModule(
+                item.kind,
+                nx,
+                ny,
+                mz,
+                curRig.partYawIndex,
+                undefined,
+                curRig.partPitchIndex,
+                curRig.partRollIndex,
               );
             }
           }
@@ -5985,6 +7178,23 @@ export default function App() {
                 ),
               );
             } else {
+              // Directly chip hit 1px micro-voxel modules (engine/wheel/weapon/etc.) before radial cratering
+              if (sim.currentHit.moduleHit) {
+                const activeMod = closestVeh.getModuleAt(
+                  sim.currentHit.moduleHit.vx,
+                  sim.currentHit.moduleHit.vy,
+                  sim.currentHit.moduleHit.vz,
+                );
+                if (activeMod && isMicroVoxelDestructibleKind(activeMod.kind)) {
+                  closestVeh.applyMicroVoxelModuleDamage(
+                    activeMod,
+                    (sim.currentHit.vx + 0.5) * VOXEL_SIZE,
+                    (sim.currentHit.vy + 0.5) * VOXEL_SIZE,
+                    (sim.currentHit.vz + 0.5) * VOXEL_SIZE,
+                    0.34,
+                  );
+                }
+              }
               closestVeh.carveVehicleCrater(hitPos.x, hitPos.y, hitPos.z, 4, 8.5);
               fx.carveWorldCrater(hitPos.x, hitPos.y, hitPos.z, 3, 0, false);
             }
@@ -6382,17 +7592,20 @@ export default function App() {
           return;
         }
         sim.lastMouseMoveTime = performance.now();
-        sim.camYaw -= moveX * 0.0028;
+        const zoomSens = sim.isZoomed
+          ? Math.max(1e-8, camera.fov / (sim.baseFov || 68))
+          : 1.0;
+        sim.camYaw -= moveX * 0.0028 * zoomSens;
         sim.camPitch = Math.max(
           -1.45,
-          Math.min(1.45, sim.camPitch - moveY * 0.0028),
+          Math.min(1.45, sim.camPitch - moveY * 0.0028 * zoomSens),
         );
 
         if (sim.isSeatedInRig && !sim.isBuildMode && !sim.isWorldEditMode) {
-          sim.driveYawOffset -= moveX * 0.0028;
+          sim.driveYawOffset -= moveX * 0.0028 * zoomSens;
           sim.drivePitchOffset = Math.max(
             -0.2,
-            Math.min(1.25, sim.drivePitchOffset + moveY * 0.0024),
+            Math.min(1.25, sim.drivePitchOffset + moveY * 0.0024 * zoomSens),
           );
         }
 
@@ -6470,21 +7683,51 @@ export default function App() {
         updateRaycastTarget();
       }
 
-      // Continuous Weld or Paint Tool Mode: weld or recolor blocks as you sweep the mouse while holding LMB!
+      // Continuous Weld, Paint Tool, or Chisel Mode: weld, recolor, or carve blocks as you sweep the mouse while holding LMB!
       if (
         sim.isBuildMode &&
-        (sim.placementMode === 'PAINT' || sim.placementMode === 'PAINT_TOOL') &&
+        (sim.placementMode === 'PAINT' ||
+          sim.placementMode === 'PAINT_TOOL' ||
+          sim.placementMode === 'CHISEL') &&
         sim.isLeftMouseDown &&
         !sim.isOrbitDragging
       ) {
         updateRaycastTarget();
         if (sim.currentHit) {
-          const isPaint = sim.placementMode === 'PAINT_TOOL';
-          const paintKey = isPaint
-            ? `${sim.currentHit.vx},${sim.currentHit.vy},${sim.currentHit.vz}`
-            : `${sim.currentHit.vx + sim.currentHit.normal.x},${
-                sim.currentHit.vy + sim.currentHit.normal.y
-              },${sim.currentHit.vz + sim.currentHit.normal.z}`;
+          const isInPlaceTarget =
+            sim.placementMode === 'PAINT_TOOL' || sim.placementMode === 'CHISEL';
+          const isMicroKey =
+            sim.hullScalePx !== 4 ||
+            sim.currentHit.hitIsMicro ||
+            sim.placementMode === 'CHISEL';
+          const paintKey = isMicroKey
+            ? (() => {
+                const origin = computeScaledAnchorOrigin(
+                  {
+                    mx:
+                      typeof sim.currentHit.mx === 'number'
+                        ? sim.currentHit.mx
+                        : sim.currentHit.vx * MICRO_VOXEL_SUBDIV,
+                    my:
+                      typeof sim.currentHit.my === 'number'
+                        ? sim.currentHit.my
+                        : sim.currentHit.vy * MICRO_VOXEL_SUBDIV,
+                    mz:
+                      typeof sim.currentHit.mz === 'number'
+                        ? sim.currentHit.mz
+                        : sim.currentHit.vz * MICRO_VOXEL_SUBDIV,
+                    normal: sim.currentHit.normal,
+                  },
+                  sim.hullScalePx,
+                  isInPlaceTarget,
+                );
+                return `m:${sim.hullScalePx}:${origin.mx},${origin.my},${origin.mz}`;
+              })()
+            : isInPlaceTarget
+              ? `${sim.currentHit.vx},${sim.currentHit.vy},${sim.currentHit.vz}`
+              : `${sim.currentHit.vx + sim.currentHit.normal.x},${
+                  sim.currentHit.vy + sim.currentHit.normal.y
+                },${sim.currentHit.vz + sim.currentHit.normal.z}`;
           if (paintKey !== sim.lastPaintedKey) {
             sim.lastPaintedKey = paintKey;
             applyBuildAction(true, false);
@@ -6550,8 +7793,15 @@ export default function App() {
         }
 
         if (e.button === 0) {
-          sim.isLeftMouseDown = true;
           updateRaycastTarget();
+
+          // Alt + Left-Click OR Eyedropper mode: immediately sample hovered part/material/rotation/scale!
+          if ((e.altKey || sim.eyedropperMode) && sim.currentHit && sim.currentHit.target === 'vehicle') {
+            sim.sampleHoveredObjectToBrush();
+            return;
+          }
+
+          sim.isLeftMouseDown = true;
 
           // 1. If clicking on empty space where blocks do not occupy, OR if holding Shift:
           //    Start a 2D Marquee Box Selection drag from Point A to Point B (or Shift-Click select on release)!
@@ -6584,16 +7834,39 @@ export default function App() {
               vy: sim.currentHit.vy + sim.currentHit.normal.y,
               vz: sim.currentHit.vz + sim.currentHit.normal.z,
             };
+            sim.dragStartMicro = computeScaledAnchorOrigin(
+              {
+                mx:
+                  typeof sim.currentHit.mx === 'number'
+                    ? sim.currentHit.mx
+                    : sim.currentHit.vx * MICRO_VOXEL_SUBDIV,
+                my:
+                  typeof sim.currentHit.my === 'number'
+                    ? sim.currentHit.my
+                    : sim.currentHit.vy * MICRO_VOXEL_SUBDIV,
+                mz:
+                  typeof sim.currentHit.mz === 'number'
+                    ? sim.currentHit.mz
+                    : sim.currentHit.vz * MICRO_VOXEL_SUBDIV,
+                normal: sim.currentHit.normal,
+              },
+              sim.hullScalePx,
+              false,
+            );
             updateRaycastTarget();
             return;
           }
           if (sim.currentHit) {
-            const isPaint = sim.placementMode === 'PAINT_TOOL';
-            sim.lastPaintedKey = isPaint
-              ? `${sim.currentHit.vx},${sim.currentHit.vy},${sim.currentHit.vz}`
-              : `${sim.currentHit.vx + sim.currentHit.normal.x},${
-                  sim.currentHit.vy + sim.currentHit.normal.y
-                },${sim.currentHit.vz + sim.currentHit.normal.z}`;
+            const isInPlace =
+              sim.placementMode === 'PAINT_TOOL' || sim.placementMode === 'CHISEL';
+            sim.lastPaintedKey =
+              sim.hullScalePx !== 4 || sim.currentHit.hitIsMicro || sim.placementMode === 'CHISEL'
+                ? `m:${sim.hullScalePx}:${sim.currentHit.mx ?? sim.currentHit.vx * 4},${sim.currentHit.my ?? sim.currentHit.vy * 4},${sim.currentHit.mz ?? sim.currentHit.vz * 4}`
+                : isInPlace
+                  ? `${sim.currentHit.vx},${sim.currentHit.vy},${sim.currentHit.vz}`
+                  : `${sim.currentHit.vx + sim.currentHit.normal.x},${
+                      sim.currentHit.vy + sim.currentHit.normal.y
+                    },${sim.currentHit.vz + sim.currentHit.normal.z}`;
           }
           applyBuildAction(true, true);
         }
@@ -6672,6 +7945,7 @@ export default function App() {
           ) {
             applyBuildAction(true);
             sim.dragStartVoxel = null;
+            sim.dragStartMicro = null;
             updateRaycastTarget();
           }
         }
@@ -6707,6 +7981,18 @@ export default function App() {
           targetEl.tagName === 'INPUT' ||
           targetEl.tagName === 'TEXTAREA')
       ) {
+        return;
+      }
+
+      if (sim.isBuildMode && e.altKey) {
+        e.preventDefault();
+        sim.stepHullScale(e.deltaY < 0 ? 1 : -1);
+        return;
+      }
+
+      if (sim.isZoomed && !sim.isBuildMode) {
+        e.preventDefault();
+        sim.stepZoomMagnification(e.deltaY < 0 ? 1 : -1);
         return;
       }
 
@@ -6790,6 +8076,15 @@ export default function App() {
           setShowFastTravelMap(false);
           return;
         }
+        if (sim.isBuildMode && activeStampPrefabRef.current) {
+          setActiveStampPrefab(null);
+          SoundFX.snap();
+          return;
+        }
+        if (sim.isBuildMode && sim.eyedropperMode) {
+          sim.toggleEyedropperMode(false);
+          return;
+        }
         if (sim.isBuildMode && sim.selectedBuildObjects.length > 0) {
           sim.selectBuildObjectAt(null);
           return;
@@ -6809,6 +8104,25 @@ export default function App() {
         e.preventDefault();
         sim.deleteSelectedObject();
         return;
+      }
+
+      // Build Mode Clipboard & Undo/Redo shortcuts (Ctrl+C, Ctrl+D, Ctrl+Y, Shift+Z)
+      if (sim.isBuildMode) {
+        if ((e.ctrlKey || e.metaKey) && e.code === 'KeyC' && sim.selectedBuildObjects.length > 0) {
+          e.preventDefault();
+          sim.copySelectionToStamp();
+          return;
+        }
+        if ((e.ctrlKey || e.metaKey) && e.code === 'KeyD' && sim.selectedBuildObjects.length > 0) {
+          e.preventDefault();
+          sim.duplicateSelectedObject();
+          return;
+        }
+        if ((e.ctrlKey || e.metaKey) && e.code === 'KeyY') {
+          e.preventDefault();
+          sim.redoBuildStep();
+          return;
+        }
       }
 
       // Desktop Build Mode: Move / Nudge selected part or multi-selected items with Arrow Keys (X/Z) and U/J, [/], PgUp/PgDn, or Shift+Up/Down (Y Up/Down)!
@@ -6861,6 +8175,28 @@ export default function App() {
         }
       }
 
+      // Toggle Option B (1PX FINE vs 4PX BLOCK) via [ and ] in Build Mode, or Alt+[ / Alt+] to step Box/Extrude Depth (1..8px)
+      if (sim.isBuildMode && sim.selectedBuildObjects.length === 0) {
+        if (e.code === 'BracketLeft') {
+          e.preventDefault();
+          if (e.altKey) {
+            sim.stepBoxDepthPx(-1);
+          } else {
+            sim.toggleHullStampMode();
+          }
+          return;
+        }
+        if (e.code === 'BracketRight') {
+          e.preventDefault();
+          if (e.altKey) {
+            sim.stepBoxDepthPx(1);
+          } else {
+            sim.toggleHullStampMode();
+          }
+          return;
+        }
+      }
+
       const wasHeld = Boolean(sim.keys[e.code]);
       sim.keys[e.code] = true;
 
@@ -6887,9 +8223,40 @@ export default function App() {
         }
       }
 
-      if (e.code === 'KeyZ' && sim.isBuildMode) {
+      if (e.code === 'KeyZ') {
+        if (sim.isBuildMode) {
+          e.preventDefault();
+          if (e.shiftKey) {
+            sim.redoBuildStep();
+          } else {
+            sim.undoBuildStep();
+          }
+          return;
+        } else {
+          e.preventDefault();
+          sim.zKeyDownTimeMs = performance.now();
+          sim.toggleZoom();
+          return;
+        }
+      }
+      if (e.code === 'KeyI' && sim.isBuildMode) {
         e.preventDefault();
-        sim.undoBuildStep();
+        if (sim.currentHit && sim.currentHit.target === 'vehicle') {
+          sim.sampleHoveredObjectToBrush();
+        } else {
+          sim.toggleEyedropperMode();
+        }
+        return;
+      }
+      if (e.code === 'KeyX' && sim.isBuildMode) {
+        e.preventDefault();
+        sim.toggleXrayMode();
+        return;
+      }
+      if (e.code === 'Tab' && sim.isBuildMode) {
+        e.preventDefault();
+        setDockCollapsed((c) => !c);
+        SoundFX.snap();
         return;
       }
       if (e.code === 'KeyB') sim.toggleHoverBuildMode();
@@ -6913,26 +8280,25 @@ export default function App() {
           camera.getWorldDirection(dir);
           curRig.toggleWinch(camera.position, dir);
           syncHudNow();
+        } else if (!sim.isBuildMode && !sim.isWorldEditMode && !sim.isSeatedInRig) {
+          // On-foot [G] toggles manual ragdoll flop / stand-up
+          if (sim.playerRagdoll.active && sim.playerRagdoll.elapsed > 0.35) {
+            sim.recoverFromRagdoll(false);
+          } else if (!sim.playerRagdoll.active && !sim.playerRagdoll.isGettingUp) {
+            const fwdX = -Math.sin(sim.camYaw);
+            const fwdZ = -Math.cos(sim.camYaw);
+            sim.triggerPlayerRagdoll(fwdX * 5.2, 4.4, fwdZ * 5.2, 2.2);
+            SoundFX.clank();
+          }
         }
       }
       if (e.code === 'KeyY') {
-        const curRig = sim.getActiveRig();
         if (sim.isBuildMode || sim.isWorldEditMode) {
           if (sim.isBuildMode && sim.selectedBuildObjects.length > 0) {
             sim.rotateSelectedObject('roll');
           } else {
             sim.rotatePartAxis('roll');
           }
-        } else if (curRig.gyroCount > 0) {
-          curRig.toggleGyro();
-          syncHudNow();
-        }
-      }
-      if (e.code === 'KeyX' && !sim.isBuildMode) {
-        const curRig = sim.getActiveRig();
-        if (curRig.pistonCount > 0) {
-          curRig.togglePistons();
-          syncHudNow();
         }
       }
       if (e.code === 'KeyT') {
@@ -6942,14 +8308,41 @@ export default function App() {
           } else {
             sim.rotatePartAxis('pitch');
           }
-        } else {
-          const curRig = sim.getActiveRig();
-          if (curRig.winchCount > 0 || curRig.winchActive) {
-            const dir = new THREE.Vector3();
-            camera.getWorldDirection(dir);
-            curRig.toggleWinch(camera.position, dir);
-            syncHudNow();
-          }
+        }
+      }
+      // Dispatch custom or default keydown triggers for seated vehicle one-shot modules (Winch, Smoke/Flares, Magnet)
+      if (!sim.isBuildMode && !sim.isWorldEditMode && sim.isSeatedInRig) {
+        const curRig = sim.getActiveRig();
+        const matchesModPosKey = (kind: string, defaultCode: string) =>
+          curRig.modules.some(
+            (m) =>
+              m.kind === kind &&
+              !m.config?.disabled &&
+              (m.config?.posKey || defaultCode) === e.code,
+          );
+        const matchesModNegKey = (kind: string, defaultCode: string) =>
+          curRig.modules.some(
+            (m) =>
+              m.kind === kind &&
+              !m.config?.disabled &&
+              (m.config?.negKey || defaultCode) === e.code,
+          );
+        if (matchesModPosKey('GRAPPLING_WINCH', 'KeyT')) {
+          const dir = new THREE.Vector3();
+          camera.getWorldDirection(dir);
+          curRig.toggleWinch(camera.position, dir);
+          syncHudNow();
+        }
+        if (matchesModPosKey('MAGNET_COUPLER', 'KeyK')) {
+          curRig.toggleMagnetCoupler('ATTRACT');
+          syncHudNow();
+        } else if (matchesModNegKey('MAGNET_COUPLER', 'KeyL')) {
+          curRig.toggleMagnetCoupler('REPEL');
+          syncHudNow();
+        }
+        if (matchesModPosKey('SMOKE_FLARE', 'KeyI')) {
+          curRig.deploySmokeAndFlares();
+          syncHudNow();
         }
       }
       if (e.code === 'KeyF') {
@@ -6962,11 +8355,28 @@ export default function App() {
         if (sim.isBuildMode || sim.isWorldEditMode) {
           sim.focusBuildCamera();
         } else {
-          e.preventDefault();
-          if (document.pointerLockElement) document.exitPointerLock?.();
-          SoundFX.snap();
-          sim.initTacticalMapCam();
-          setShowFastTravelMap(true);
+          const curRig = sim.getActiveRig();
+          const vehicleUsesKeyF =
+            !sim.isWalking &&
+            sim.isSeatedInRig &&
+            curRig.modules.some((m) => {
+              if (m.config?.disabled) return false;
+              const isWeapon =
+                m.kind === 'PLASMA_CANNON' ||
+                m.kind === 'WEAPON_MINIGUN' ||
+                m.kind === 'WEAPON_ROCKET' ||
+                m.kind === 'WEAPON_BOMB_BAY';
+              const pKey = m.config?.posKey || (isWeapon ? 'KeyF' : '');
+              const nKey = m.config?.negKey || '';
+              return pKey === 'KeyF' || nKey === 'KeyF';
+            });
+          if (!vehicleUsesKeyF) {
+            e.preventDefault();
+            if (document.pointerLockElement) document.exitPointerLock?.();
+            SoundFX.snap();
+            sim.initTacticalMapCam();
+            setShowFastTravelMap(true);
+          }
         }
       }
       if (e.code === 'KeyC') sim.cycleCameraMode();
@@ -6983,7 +8393,7 @@ export default function App() {
       }
       if (e.code === 'KeyM') {
         if (sim.isBuildMode) {
-          sim.toggleMirrorMode();
+          sim.cycleSymmetryAxisMode();
         } else {
           if (document.pointerLockElement) document.exitPointerLock?.();
           setShowMultiplayerModal((v) => !v);
@@ -7013,34 +8423,8 @@ export default function App() {
           setRHoldProgress(0.01);
         }
       }
-      if (e.code === 'KeyH' && !sim.isBuildMode) {
-        sim.getActiveRig().toggleHeadlights();
-        SoundFX.snap();
-        syncHudNow();
-      }
-      if (!sim.isBuildMode && !sim.isWorldEditMode && sim.isSeatedInRig) {
-        const curRig = sim.getActiveRig();
-        if (e.code === 'KeyK' && curRig.magnetCouplerCount > 0) {
-          curRig.toggleMagnetCoupler('ATTRACT');
-          syncHudNow();
-        }
-        if (e.code === 'KeyL' && curRig.magnetCouplerCount > 0) {
-          curRig.toggleMagnetCoupler('REPEL');
-          syncHudNow();
-        }
-        if (e.code === 'KeyU' && curRig.parachuteCount > 0) {
-          curRig.toggleParachuteAirbrake();
-          syncHudNow();
-        }
-        if (e.code === 'KeyJ' && curRig.outriggerCount > 0) {
-          curRig.toggleOutriggerJacks();
-          syncHudNow();
-        }
-        if (e.code === 'KeyI' && curRig.smokeFlareCount > 0) {
-          curRig.deploySmokeAndFlares();
-          syncHudNow();
-        }
-      }
+      // Continuous & custom-bound modules (HEADLIGHT, GYRO, PISTON, PARACHUTE_AIRBRAKE, OUTRIGGER_JACK)
+      // are evaluated per-module in vehicle.updatePhysics via evalModSignal() so custom keybinds and toggleMode work seamlessly.
       if (e.code === 'KeyP') sim.selectPreset(sim.getActiveRig().presetIndex + 1);
       if (e.code === 'F3') {
         e.preventDefault();
@@ -7058,6 +8442,16 @@ export default function App() {
 
     const onKeyUp = (e: KeyboardEvent) => {
       sim.keys[e.code] = false;
+      if (e.code === 'KeyZ' && !sim.isBuildMode) {
+        if (
+          sim.isZoomed &&
+          sim.zKeyDownTimeMs > 0 &&
+          performance.now() - sim.zKeyDownTimeMs > 280
+        ) {
+          sim.toggleZoom(false);
+        }
+        sim.zKeyDownTimeMs = 0;
+      }
       if (e.code === 'KeyR') {
         if (rHoldStartTimeRef.current !== null) {
           const elapsed = performance.now() - rHoldStartTimeRef.current;
@@ -7113,7 +8507,11 @@ export default function App() {
     let frames = 0;
     const vehicleBroadphase = new SpatialHashBroadphase();
     const FIXED_DT = PHYSICS_FIXED_DT; // 1 / 60 (60 Hz single-frame physics via VoxelWorld.step)
-    const frameDeltasMs: number[] = [];
+    const FRAME_DELTA_WINDOW = 60;
+    const frameDeltasRing = new Float32Array(FRAME_DELTA_WINDOW);
+    let frameDeltasIdx = 0;
+    let frameDeltasCount = 0;
+    let frameDeltasSum = 0;
     let currentFps = 60;
     let currentFrameMs = '16.6';
     let currentRayLabel = 'Driving Rig';
@@ -7245,13 +8643,18 @@ export default function App() {
       const rawDt = deltaMs / 1000;
       lastTime = now;
 
-      // Rolling-average FPS display over 60-frame window
-      frameDeltasMs.push(deltaMs);
-      if (frameDeltasMs.length > 60) {
-        frameDeltasMs.shift();
+      // O(1) circular ring-buffer rolling-average FPS over 60-frame window (zero array shifting / allocation)
+      if (frameDeltasCount < FRAME_DELTA_WINDOW) {
+        frameDeltasRing[frameDeltasIdx] = deltaMs;
+        frameDeltasSum += deltaMs;
+        frameDeltasCount++;
+      } else {
+        frameDeltasSum -= frameDeltasRing[frameDeltasIdx];
+        frameDeltasRing[frameDeltasIdx] = deltaMs;
+        frameDeltasSum += deltaMs;
       }
-      const avgMs =
-        frameDeltasMs.reduce((sum, d) => sum + d, 0) / frameDeltasMs.length;
+      frameDeltasIdx = (frameDeltasIdx + 1) % FRAME_DELTA_WINDOW;
+      const avgMs = frameDeltasSum / Math.max(1, frameDeltasCount);
       currentFps = Math.max(1, Math.min(240, Math.round(1000 / Math.max(0.001, avgMs))));
       currentFrameMs = avgMs.toFixed(1);
 
@@ -7262,13 +8665,6 @@ export default function App() {
       );
       sim.lastGovernorStep = govStep;
       const dt = govStep.visualDt;
-
-      if (fpsBadgeRef.current) {
-        const slowTag = govStep.isSlowMoActive
-          ? ` · ${Math.round(govStep.timeScale * 100)}%`
-          : '';
-        fpsBadgeRef.current.textContent = `${currentFps} FPS · ${currentFrameMs}ms${slowTag}`;
-      }
       frames++;
 
       const curRig = sim.getActiveRig();
@@ -7327,6 +8723,8 @@ export default function App() {
           govStep.watchdog.chunkBudgetMs,
           govStep.watchdog.maxSyncChunkRebuilds,
         );
+        (renderer as unknown as { cameraBigSector: BigSectorPosition }).cameraBigSector =
+          createBigSectorPosition(camera.position.x, camera.position.y, camera.position.z);
         renderer.render(scene, camera);
         return;
       }
@@ -7334,6 +8732,8 @@ export default function App() {
       if (sim.gameState === 'paused') {
         ProceduralAudio.silenceContinuous();
         clearPreviewOverlay();
+        (renderer as unknown as { cameraBigSector: BigSectorPosition }).cameraBigSector =
+          createBigSectorPosition(camera.position.x, camera.position.y, camera.position.z);
         renderer.render(scene, camera);
         return;
       }
@@ -7356,6 +8756,9 @@ export default function App() {
           sim.drivePitchOffset = Math.max(-0.15, sim.drivePitchOffset - 1.1 * dt);
         }
         sim.updateCamera(dt, now);
+        blobShadowManager.commit();
+        (renderer as unknown as { cameraBigSector: BigSectorPosition }).cameraBigSector =
+          createBigSectorPosition(camera.position.x, camera.position.y, camera.position.z);
         graphicsPipeline.render(
           sim.graphicsSettings,
           now * 0.001,
@@ -7746,13 +9149,27 @@ export default function App() {
       }
 
       const _tPhys0 = performance.now();
+      const isLowEndPhysicsCap =
+        sim.graphicsSettings.usePotatoShader ||
+        sim.graphicsSettings.preset === 'PENTIUM';
       const physicsStepsThisFrame = world.voxelWorld.step(rawDt, {
         timeScale: effectiveTimeScale,
-        maxSubsteps: PHYSICS_CONFIG.maxStepsPerFrame,
+        maxSubsteps: isLowEndPhysicsCap
+          ? rawDt > 0.032
+            ? 1
+            : Math.min(2, PHYSICS_CONFIG.maxStepsPerFrame)
+          : PHYSICS_CONFIG.maxStepsPerFrame,
         drainEvents: true,
         onFixedStep: (stepDt) => {
+          resetUnifiedEngineFrameTelemetry();
           const prevRigX = curRig.position.x;
           const prevRigZ = curRig.position.z;
+          const observerWorldX = sim.isWalking ? sim.camFreePos.x : curRig.position.x;
+          const observerWorldZ = sim.isWalking ? sim.camFreePos.z : curRig.position.z;
+          const zoomFocusPt = sim.isZoomed ? world.zoomFocusWorld : null;
+          const physTickCounter =
+            (((sim as unknown as { _physLodTick?: number })._physLodTick =
+              ((sim as unknown as { _physLodTick?: number })._physLodTick ?? 0) + 1));
           const activeFlarePos =
             fx.activeFlares.length > 0
               ? fx.activeFlares[fx.activeFlares.length - 1].pos
@@ -7769,6 +9186,49 @@ export default function App() {
               !sim.isBuildMode &&
               sim.isSeatedInRig &&
               !c.isRemoteControlled;
+
+            const vehLodDecision = classifyEntityPhysicsLodTier({
+              entityX: c.position.x,
+              entityZ: c.position.z,
+              playerX: observerWorldX,
+              playerZ: observerWorldZ,
+              isActivePlayerEntity: isCurrentActive || isLocalDriver || c.isRemoteControlled,
+              hasUrgentPhysicsActivity:
+                c.ignitedC4Voxels.size > 0 ||
+                c.fallingOffVoxels.size > 0 ||
+                c.pendingPhysicsHullRebuild,
+              isOpticalZoomActive: sim.isZoomed,
+              zoomFocusX: zoomFocusPt ? zoomFocusPt.x : null,
+              zoomFocusZ: zoomFocusPt ? zoomFocusPt.z : null,
+            });
+
+            if (vehLodDecision.tier === 'FULL_60HZ_LOD0') {
+              unifiedEngineTelemetry.lod0PhysicsEntities++;
+              if (vehLodDecision.promotedByOpticalZoom) {
+                unifiedEngineTelemetry.lodZoomPromotedEntities++;
+              }
+            } else {
+              unifiedEngineTelemetry.lodThrottledPhysicsEntities++;
+              if (
+                vehLodDecision.frameStride === 0 &&
+                !c.aiConfig.enabled &&
+                c.networkId !== 'ai-patrol-convoy-1' &&
+                c.velocity.lengthSq() < 0.05
+              ) {
+                continue;
+              }
+              if (
+                vehLodDecision.frameStride > 1 &&
+                (physTickCounter + i) % vehLodDecision.frameStride !== 0
+              ) {
+                continue;
+              }
+            }
+            const effectiveVehStepDt =
+              vehLodDecision.frameStride > 1
+                ? Math.min(0.05, stepDt * vehLodDecision.frameStride)
+                : stepDt;
+
             let rigKeys = isLocalDriver ? sim.keys : emptyKeys;
             let rigActiveInput = isLocalDriver;
             let isAiPiloted = false;
@@ -7777,7 +9237,7 @@ export default function App() {
             if (!isLocalDriver && c.aiConfig.enabled && !c.inBuildMode && !c.isRemoteControlled) {
               const aiDecision = computeSmartVehicleAIControls(
                 c,
-                stepDt,
+                effectiveVehStepDt,
                 allStepPhysicsRigs,
                 sim.isSeatedInRig ? curRig : !curRig.aiConfig.enabled ? curRig : null,
                 aiTerrainProber,
@@ -7802,7 +9262,7 @@ export default function App() {
                   aiDecision.aimTargetWorld.y,
                   aiDecision.aimTargetWorld.z,
                 );
-                c.aimTurretsAt(_aiAimTargetTmp, stepDt, true);
+                c.aimTurretsAt(_aiAimTargetTmp, effectiveVehStepDt, true);
               }
               if (aiDecision.fireWeapons) {
                 c.fireCannons();
@@ -7850,7 +9310,7 @@ export default function App() {
             }
             const _tVehPhys0 = performance.now();
             c.updatePhysics(
-              stepDt,
+              effectiveVehStepDt,
               rigKeys,
               rigActiveInput,
               isAiPiloted,
@@ -7894,18 +9354,58 @@ export default function App() {
               eIdx--;
               continue;
             }
+            const hasUrgentEntActivity =
+              ent.fallingOffVoxels.size > 0 ||
+              ent.ignitedC4Voxels.size > 0 ||
+              ent.pendingPhysicsHullRebuild;
             if (
               ent.rigidBody.isSleeping &&
-              ent.fallingOffVoxels.size === 0 &&
-              ent.ignitedC4Voxels.size === 0 &&
-              !ent.pendingPhysicsHullRebuild &&
+              !hasUrgentEntActivity &&
               ent.velocity.lengthSq() <= 0.001 &&
               ent.angularVelocity.lengthSq() <= 0.001
             ) {
               continue;
             }
+
+            const entLodDecision = classifyEntityPhysicsLodTier({
+              entityX: ent.position.x,
+              entityZ: ent.position.z,
+              playerX: observerWorldX,
+              playerZ: observerWorldZ,
+              isActivePlayerEntity: false,
+              hasUrgentPhysicsActivity: hasUrgentEntActivity,
+              isOpticalZoomActive: sim.isZoomed,
+              zoomFocusX: zoomFocusPt ? zoomFocusPt.x : null,
+              zoomFocusZ: zoomFocusPt ? zoomFocusPt.z : null,
+            });
+
+            if (entLodDecision.tier === 'FULL_60HZ_LOD0') {
+              unifiedEngineTelemetry.lod0PhysicsEntities++;
+              if (entLodDecision.promotedByOpticalZoom) {
+                unifiedEngineTelemetry.lodZoomPromotedEntities++;
+              }
+            } else {
+              unifiedEngineTelemetry.lodThrottledPhysicsEntities++;
+              if (
+                entLodDecision.frameStride === 0 &&
+                ent.velocity.lengthSq() < 0.25
+              ) {
+                continue;
+              }
+              if (
+                entLodDecision.frameStride > 1 &&
+                (physTickCounter + eIdx) % entLodDecision.frameStride !== 0
+              ) {
+                continue;
+              }
+            }
+            const effectiveEntStepDt =
+              entLodDecision.frameStride > 1
+                ? Math.min(0.05, stepDt * entLodDecision.frameStride)
+                : stepDt;
+
             const _tEntPhys0 = performance.now();
-            ent.updatePhysics(stepDt, emptyKeys, false);
+            ent.updatePhysics(effectiveEntStepDt, emptyKeys, false);
             perfProfiler.recordVehiclePhysics(performance.now() - _tEntPhys0);
           }
 
@@ -8312,8 +9812,9 @@ export default function App() {
           Math.max(currentCaveAtmosphere, underwaterDepthFactor * 0.58);
       }
 
-      const focusPos =
-        !sim.isWalking && sim.isSeatedInRig && sim.activeVehicle
+      const focusPos = showFastTravelMapRef.current
+        ? camera.position
+        : !sim.isWalking && sim.isSeatedInRig && sim.activeVehicle
           ? sim.activeVehicle.position
           : camera.position;
 
@@ -8390,6 +9891,9 @@ export default function App() {
       }
 
       (renderer as any).currentTime = world.voxelWorld.getTime();
+      (renderer as unknown as { cameraBigSector: BigSectorPosition }).cameraBigSector =
+        createBigSectorPosition(camera.position.x, camera.position.y, camera.position.z);
+      blobShadowManager.commit();
       const _tRender0 = performance.now();
       graphicsPipeline.render(
         sim.graphicsSettings,
@@ -8417,8 +9921,24 @@ export default function App() {
         dirtyChunks: world.voxelWorld.countDirtyChunks(),
       });
 
+      // Hide distant sleeping voxel entities on Pentium / Potato mode to cut draw calls
+      if (isLowEndPhysicsCap && sim.voxelEntities.length > 0) {
+        const cullDistSq = Math.pow(
+          Math.max(38, sim.graphicsSettings.voxelDrawDistance * 16 * 0.85),
+          2,
+        );
+        for (let i = 0; i < sim.voxelEntities.length; i++) {
+          const ent = sim.voxelEntities[i];
+          const dx = ent.position.x - focusPos.x;
+          const dz = ent.position.z - focusPos.z;
+          const farSleeping =
+            dx * dx + dz * dz > cullDistSq && ent.rigidBody.isSleeping;
+          ent.rootGroup.visible = !farSleeping;
+        }
+      }
+
       perfOverlayAccumSec += rawDt;
-      if (perfOverlayAccumSec >= 0.25) {
+      if (perfOverlayAccumSec >= 0.35) {
         perfOverlayAccumSec = 0;
         if (perfOverlayRef.current) {
           perfOverlayRef.current.textContent = perfProfiler.formatOverlayText();
@@ -8440,6 +9960,7 @@ export default function App() {
           hardwareTierReason: sim.hardwareTierInfo.reason,
           frameRateCap: sim.graphicsSettings.frameRateCap,
           effectiveTargetFps: sim.getEffectiveTargetFps(),
+          unifiedEngineTelemetry: { ...unifiedEngineTelemetry },
         };
       }
 
@@ -8462,7 +9983,11 @@ export default function App() {
               powerPreference: 'low-power',
             });
             pR.setSize(window.innerWidth, window.innerHeight);
-            pR.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
+            pR.setPixelRatio(
+              isHeadless
+                ? 1
+                : Math.min(window.devicePixelRatio || 1, isInIframe ? 1.0 : 1.25),
+            );
             previewOverlayRenderer = pR;
           } catch {
             // fallback if context creation fails
@@ -8475,15 +10000,19 @@ export default function App() {
         );
         const selectedKey = activeSlotObj ? previewRenderer.getItemKey(activeSlotObj) : null;
 
-        slotElementsRef.current.forEach((el, key) => {
-          if (el && el.isConnected) {
+        slotElementsRef.current.forEach((elSet, key) => {
+          elSet.forEach((el) => {
+            if (!el || !el.isConnected) {
+              elSet.delete(el);
+              return;
+            }
             pooledPreviewTargets.push({
               el,
               itemKey: key,
               isHovered: hoveredSlotKeyRef.current === key,
               isSelected: selectedKey === key,
             });
-          }
+          });
         });
 
         const overlayR: THREE.WebGLRenderer | null = previewOverlayRenderer;
@@ -8604,6 +10133,11 @@ export default function App() {
       });
       previewRenderer.dispose();
       graphicsPipeline.dispose();
+      scene.remove(blobShadowManager.mesh);
+      blobShadowManager.dispose();
+      delete scene.userData.blobShadowManager;
+      disposeSharedModelCaches();
+      disposeSharedPotatoShaderResources();
       (previewOverlayRenderer as THREE.WebGLRenderer | null)?.dispose();
       renderer.dispose();
     };
@@ -8998,6 +10532,8 @@ export default function App() {
         voxelRGB,
       );
       const bestSpawn = activeSim.world.findBestGlbSpawnPosition();
+      activeSim.clearVoxelEntities();
+      activeSim.clearMapHazards();
       activeSim.creations.forEach((cr, idx) => {
         cr.position.set(bestSpawn.x + idx * 6.0, bestSpawn.y, bestSpawn.z);
         cr.velocity.set(0, 0, 0);
@@ -9376,22 +10912,22 @@ export default function App() {
     teleportStateRef.current = res.state;
     setTeleportState(res.state);
 
-    if (res.error) {
-      SoundFX.clank();
-      return;
-    }
-    if (res.teleportedImmediately && res.targetNode) {
+    const targetNode =
+      res.targetNode ||
+      teleportStateRef.current.nodes.find((n) => n.id === nodeId) ||
+      null;
+    if (targetNode) {
       executeImmediateVehicleTeleport(
-        res.targetNode.x,
-        res.targetNode.y,
-        res.targetNode.z,
+        targetNode.x,
+        targetNode.y,
+        targetNode.z,
       );
       setShowFastTravelMap(false);
       return;
     }
-    if (res.state.activeSpinup) {
-      setShowFastTravelMap(false);
-      SoundFX.hover();
+    if (res.error) {
+      SoundFX.clank();
+      return;
     }
   };
 
@@ -10123,7 +11659,7 @@ export default function App() {
                       data-testid="fps-counter"
                       className="text-[10px] font-mono-num font-bold text-[#facc15] bg-[#1a1a1a] border-2 border-[#444444] px-1.5 py-0.5 rounded-[2px] min-w-[92px] text-center inline-block tabular-nums"
                     >
-                      {hud.fps} FPS · {hud.frameMs}ms
+                      <LiveHudField select={selectFpsFrameMs} />
                     </span>
                   </div>
 
@@ -10295,72 +11831,114 @@ export default function App() {
                     <button
                       type="button"
                       tabIndex={-1}
+                      data-testid="toggle-symmetry-btn"
+                      title="Cycle Multi-Axis Symmetry: Left-Right (X) · 4-Way Quad (X+Z) · Front-Back (Z) · Off [M]"
                       onClick={(e) => {
                         e.currentTarget.blur();
-                        simRef.current?.toggleMirrorMode();
+                        simRef.current?.cycleSymmetryAxisMode();
                       }}
                       className={`px-1.5 py-1 rounded-[2px] text-[10px] font-display font-bold uppercase cursor-pointer whitespace-nowrap border-2 ${
-                        hud.mirrorMode
+                        hud.symmetryAxisMode !== 'OFF'
                           ? 'bg-[#facc15] text-[#1a1a1a] border-[#e5e5e5]'
                           : 'bg-[#6b7280] text-[#e5e5e5] border-[#444444]'
                       }`}
                     >
-                      SYM:{hud.mirrorMode ? 'ON' : 'OFF'} [M]
+                      SYM:{hud.symmetryAxisMode} [M]
                     </button>
 
                     <button
                       type="button"
                       tabIndex={-1}
-                      data-testid="rotate-yaw-btn"
-                      title="Rotate Y (Yaw) 90° [R]"
+                      data-testid="toggle-xray-btn"
+                      title="Toggle X-Ray Hull Cutaway — makes outer hull walls translucent and lets raycasts pass through upper walls to place/select internal engines & seats [X]"
                       onClick={(e) => {
                         e.currentTarget.blur();
-                        if (selectedCount > 0) {
-                          simRef.current?.rotateSelectedObject('yaw');
-                        } else {
-                          simRef.current?.rotatePartAxis('yaw');
-                        }
+                        simRef.current?.toggleXrayMode();
                       }}
-                      className="px-1.5 py-1 bg-[#6b7280] hover:bg-[#4b5563] text-[#e5e5e5] border-2 border-[#444444] rounded-[2px] text-[10px] font-display font-bold uppercase cursor-pointer whitespace-nowrap"
+                      className={`px-1.5 py-1 rounded-[2px] text-[10px] font-display font-bold uppercase cursor-pointer whitespace-nowrap border-2 ${
+                        hud.xrayMode
+                          ? 'bg-[#38bdf8] text-[#1a1a1a] border-[#e5e5e5]'
+                          : 'bg-[#262626] text-[#a3a3a3] border-[#444444] hover:text-[#e5e5e5]'
+                      }`}
                     >
-                      ROT Y:{DIR_NAMES[hud.partYawIndex]} [R]
+                      X-RAY:{hud.xrayMode ? 'ON' : 'OFF'} [X]
                     </button>
 
                     <button
                       type="button"
                       tabIndex={-1}
-                      data-testid="rotate-pitch-btn"
-                      title="Rotate X (Pitch) 90° [T]"
+                      data-testid="toggle-eyedropper-btn"
+                      title="Eyedropper / Pipette — click any block or module on the vehicle to sample its material, 3D rotation, and scale [I or Alt+Click]"
                       onClick={(e) => {
                         e.currentTarget.blur();
-                        if (selectedCount > 0) {
-                          simRef.current?.rotateSelectedObject('pitch');
-                        } else {
-                          simRef.current?.rotatePartAxis('pitch');
-                        }
+                        simRef.current?.toggleEyedropperMode();
                       }}
-                      className="px-1.5 py-1 bg-[#6b7280] hover:bg-[#4b5563] text-[#e5e5e5] border-2 border-[#444444] rounded-[2px] text-[10px] font-display font-bold uppercase cursor-pointer whitespace-nowrap"
+                      className={`px-1.5 py-1 rounded-[2px] text-[10px] font-display font-bold uppercase cursor-pointer whitespace-nowrap border-2 ${
+                        hud.eyedropperMode
+                          ? 'bg-[#22c55e] text-[#1a1a1a] border-[#e5e5e5]'
+                          : 'bg-[#262626] text-[#a3a3a3] border-[#444444] hover:text-[#e5e5e5]'
+                      }`}
                     >
-                      ROT X:{AXIS_ROT_NAMES[hud.partPitchIndex]} [T]
+                      PICK [I]
                     </button>
 
-                    <button
-                      type="button"
-                      tabIndex={-1}
-                      data-testid="rotate-roll-btn"
-                      title="Rotate Z (Roll) 90° [Y]"
-                      onClick={(e) => {
-                        e.currentTarget.blur();
-                        if (selectedCount > 0) {
-                          simRef.current?.rotateSelectedObject('roll');
-                        } else {
-                          simRef.current?.rotatePartAxis('roll');
-                        }
-                      }}
-                      className="px-1.5 py-1 bg-[#6b7280] hover:bg-[#4b5563] text-[#e5e5e5] border-2 border-[#444444] rounded-[2px] text-[10px] font-display font-bold uppercase cursor-pointer whitespace-nowrap"
-                    >
-                      ROT Z:{AXIS_ROT_NAMES[hud.partRollIndex]} [Y]
-                    </button>
+                    {(selectedBuildSlotItem.type === 'module' || selectedCount > 0) && (
+                      <>
+                        <button
+                          type="button"
+                          tabIndex={-1}
+                          data-testid="rotate-yaw-btn"
+                          title="Rotate Y (Yaw) 90° [R]"
+                          onClick={(e) => {
+                            e.currentTarget.blur();
+                            if (selectedCount > 0) {
+                              simRef.current?.rotateSelectedObject('yaw');
+                            } else {
+                              simRef.current?.rotatePartAxis('yaw');
+                            }
+                          }}
+                          className="px-1.5 py-1 bg-[#6b7280] hover:bg-[#4b5563] text-[#e5e5e5] border-2 border-[#444444] rounded-[2px] text-[10px] font-display font-bold uppercase cursor-pointer whitespace-nowrap"
+                        >
+                          ROT Y:{DIR_NAMES[hud.partYawIndex]} [R]
+                        </button>
+
+                        <button
+                          type="button"
+                          tabIndex={-1}
+                          data-testid="rotate-pitch-btn"
+                          title="Rotate X (Pitch) 90° [T]"
+                          onClick={(e) => {
+                            e.currentTarget.blur();
+                            if (selectedCount > 0) {
+                              simRef.current?.rotateSelectedObject('pitch');
+                            } else {
+                              simRef.current?.rotatePartAxis('pitch');
+                            }
+                          }}
+                          className="px-1.5 py-1 bg-[#6b7280] hover:bg-[#4b5563] text-[#e5e5e5] border-2 border-[#444444] rounded-[2px] text-[10px] font-display font-bold uppercase cursor-pointer whitespace-nowrap"
+                        >
+                          ROT X:{AXIS_ROT_NAMES[hud.partPitchIndex]} [T]
+                        </button>
+
+                        <button
+                          type="button"
+                          tabIndex={-1}
+                          data-testid="rotate-roll-btn"
+                          title="Rotate Z (Roll) 90° [Y]"
+                          onClick={(e) => {
+                            e.currentTarget.blur();
+                            if (selectedCount > 0) {
+                              simRef.current?.rotateSelectedObject('roll');
+                            } else {
+                              simRef.current?.rotatePartAxis('roll');
+                            }
+                          }}
+                          className="px-1.5 py-1 bg-[#6b7280] hover:bg-[#4b5563] text-[#e5e5e5] border-2 border-[#444444] rounded-[2px] text-[10px] font-display font-bold uppercase cursor-pointer whitespace-nowrap"
+                        >
+                          ROT Z:{AXIS_ROT_NAMES[hud.partRollIndex]} [Y]
+                        </button>
+                      </>
+                    )}
 
                     <button
                       type="button"
@@ -10378,6 +11956,25 @@ export default function App() {
                       }`}
                     >
                       UNDO({hud.undoCount}) [Z]
+                    </button>
+
+                    <button
+                      type="button"
+                      tabIndex={-1}
+                      data-testid="redo-build-btn"
+                      disabled={hud.redoCount === 0}
+                      title="Redo Build Step [Shift+Z or Ctrl+Y]"
+                      onClick={(e) => {
+                        e.currentTarget.blur();
+                        simRef.current?.redoBuildStep();
+                      }}
+                      className={`px-1.5 py-1 rounded-[2px] text-[10px] font-display font-bold uppercase transition whitespace-nowrap border-2 ${
+                        hud.redoCount > 0
+                          ? 'bg-[#fbbf24] hover:bg-[#facc15] text-[#1a1a1a] border-[#444444] cursor-pointer'
+                          : 'bg-[#262626] text-[#737373] border-[#444444] cursor-not-allowed'
+                      }`}
+                    >
+                      REDO({hud.redoCount}) [⇧Z]
                     </button>
 
                     <button
@@ -10681,7 +12278,18 @@ export default function App() {
 
               {/* MIDDLE WORKSPACE: Left-Side Categorized Block Selector + Right-Side Selected Object & Keybind Inspector */}
               <div className="flex-1 min-h-0 flex items-stretch justify-between gap-3 my-1.5 overflow-hidden pointer-events-none">
-                {/* LEFT SIDE: Industrial Blueprint Categorized Block Selector */}
+                {/* LEFT SIDE: Collapsible Industrial Blueprint Categorized Block Selector */}
+                {dockCollapsed && getWidgetState(hudCustom, 'build-left-catalog').visible ? (
+                  <button
+                    type="button"
+                    data-testid="expand-left-catalog-btn"
+                    onClick={() => setDockCollapsed(false)}
+                    className="relative z-20 self-start bg-[#1a1a1a]/95 hover:bg-[#262626] border-2 border-[#fbbf24] text-[#fbbf24] px-2.5 py-1.5 rounded-[2px] font-display font-extrabold text-[10px] uppercase pointer-events-auto cursor-pointer shadow-lg flex items-center gap-1.5"
+                    title="Expand Part Catalog [Tab]"
+                  >
+                    <span>▶ CATALOG ({activeStudioOrBuildSlots.length}) [TAB]</span>
+                  </button>
+                ) : null}
                 {!dockCollapsed && getWidgetState(hudCustom, 'build-left-catalog').visible && (
                   <div
                     data-testid="left-block-catalog"
@@ -10690,29 +12298,79 @@ export default function App() {
                     data-ui-scroll="true"
                     style={getWidgetTransformStyle(hudCustom, 'build-left-catalog', undefined, 'top left')}
                     onWheel={(e) => e.stopPropagation()}
-                    className="relative z-20 w-[335px] sm:w-[350px] h-full max-h-full min-h-0 flex flex-col bg-[#1a1a1a] border-2 border-[#444444] rounded-[2px] p-2.5 pointer-events-auto overflow-hidden"
+                    className="relative z-20 w-[320px] sm:w-[340px] h-full max-h-full min-h-0 flex flex-col bg-[#1a1a1a] border-2 border-[#444444] rounded-[2px] p-2 pointer-events-auto overflow-hidden"
                   >
-                    {/* Header + Quick Search */}
-                    <div className="flex items-center justify-between gap-1.5 bg-[#222222] border-2 border-[#444444] rounded-[2px] px-2 py-1.5 mb-2 shrink-0">
-                      <span className="bg-[#fbbf24] text-[#1a1a1a] font-display font-extrabold text-[10px] px-2 py-0.5 rounded-[2px] uppercase shrink-0">
+                    {/* Header + Quick Search + Collapse Button */}
+                    <div className="flex items-center justify-between gap-1.5 bg-[#222222] border-2 border-[#444444] rounded-[2px] px-2 py-1 mb-1.5 shrink-0">
+                      <span className="bg-[#fbbf24] text-[#1a1a1a] font-display font-extrabold text-[10px] px-1.5 py-0.5 rounded-[2px] uppercase shrink-0">
                         {hud.isObjectStudioMode
-                          ? 'STUDIO VOXELS'
-                          : `PART CATALOG (${activeStudioOrBuildSlots.length})`}
+                          ? 'STUDIO'
+                          : `PARTS (${activeStudioOrBuildSlots.length})`}
                       </span>
                       {!hud.isObjectStudioMode && (
                         <input
                           type="text"
                           value={partSearchQuery}
                           onChange={(e) => setPartSearchQuery(e.target.value)}
-                          placeholder={`SEARCH ${BUILD_SLOTS.length} PARTS, PAINTS & COSMETICS...`}
+                          placeholder={`SEARCH ${BUILD_SLOTS.length} PARTS...`}
                           className="flex-1 min-w-0 bg-[#141414] border-2 border-[#444444] focus:border-[#facc15] rounded-[2px] px-2 py-0.5 text-[10px] font-mono-num text-[#e5e5e5] focus:outline-none"
                         />
                       )}
+                      <button
+                        type="button"
+                        data-testid="collapse-left-catalog-btn"
+                        title="Collapse Part Catalog to maximize 3D viewport [Tab]"
+                        onClick={() => setDockCollapsed(true)}
+                        className="px-1.5 py-0.5 bg-[#262626] hover:bg-[#3a3a3a] text-[#a3a3a3] hover:text-[#e5e5e5] border border-[#444444] rounded-[2px] text-[9px] font-display font-bold uppercase cursor-pointer shrink-0"
+                      >
+                        ◀ [TAB]
+                      </button>
                     </div>
+
+                    {/* Recent Parts Quick-Pick Strip (6 Slots) */}
+                    {!hud.isObjectStudioMode && recentBuildSlotIds.length > 0 && (
+                      <div
+                        data-testid="recent-parts-strip"
+                        className="flex items-center gap-1 pb-1.5 mb-1.5 border-b border-[#333333] shrink-0 overflow-x-auto"
+                      >
+                        <span className="text-[8.5px] font-display font-bold uppercase text-[#a3a3a3] shrink-0 mr-0.5">
+                          RECENT:
+                        </span>
+                        {recentBuildSlotIds.slice(0, 6).map((rSlotId) => {
+                          const rItem = BUILD_SLOTS[rSlotId - 1];
+                          if (!rItem) return null;
+                          const isCurrent = hud.selectedSlot === rItem.slot;
+                          return (
+                            <button
+                              key={rItem.slot}
+                              type="button"
+                              tabIndex={-1}
+                              data-testid={`recent-slot-${rItem.slot}`}
+                              title={`Quick Equip: ${rItem.name}`}
+                              onClick={(e) => {
+                                e.currentTarget.blur();
+                                sim?.selectSlot(rItem.slot);
+                              }}
+                              className={`flex items-center gap-1 px-1.5 py-0.5 rounded-[2px] text-[8.5px] font-display font-bold uppercase cursor-pointer border truncate max-w-[82px] shrink-0 ${
+                                isCurrent
+                                  ? 'bg-[#facc15] text-[#1a1a1a] border-[#e5e5e5]'
+                                  : 'bg-[#262626] text-[#e5e5e5] border-[#444444] hover:border-[#fbbf24]'
+                              }`}
+                            >
+                              <span
+                                className="w-2 h-2 rounded-[1px] shrink-0"
+                                style={{ backgroundColor: rItem.color }}
+                              />
+                              <span className="truncate">{rItem.name}</span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
 
                     {/* Industrial Category Filter Tabs */}
                     {!hud.isObjectStudioMode && (
-                      <div className="grid grid-cols-5 gap-1 pb-2 mb-2 border-b-2 border-[#444444] shrink-0">
+                      <div className="grid grid-cols-5 gap-1 pb-1.5 mb-1.5 border-b-2 border-[#444444] shrink-0">
                         {BUILD_CATEGORY_META.map((cat) => {
                           const isActive = buildCategory === cat.id;
                           return (
@@ -10797,9 +12455,12 @@ export default function App() {
                               <div
                                 ref={(node) => {
                                   if (node) {
-                                    slotElementsRef.current.set(itemKey, node);
-                                  } else {
-                                    slotElementsRef.current.delete(itemKey);
+                                    let set = slotElementsRef.current.get(itemKey);
+                                    if (!set) {
+                                      set = new Set();
+                                      slotElementsRef.current.set(itemKey, set);
+                                    }
+                                    set.add(node);
                                   }
                                 }}
                                 data-preview-slot={itemKey}
@@ -10823,8 +12484,24 @@ export default function App() {
                   </div>
                 )}
 
-                {/* RIGHT SIDE: Smart Build Mode Inspector (Multi-Select Batch Keybinds, Click-to-Bind & Rig Keybind Map) */}
-                {!hud.isObjectStudioMode && getWidgetState(hudCustom, 'build-right-inspector').visible && (
+                {/* RIGHT SIDE: Collapsible Smart Build Mode Inspector (Auto-expands on selection; collapses to slim pill when idle) */}
+                {!hud.isObjectStudioMode &&
+                  getWidgetState(hudCustom, 'build-right-inspector').visible &&
+                  selectedCount === 0 &&
+                  inspectorCollapsed && (
+                    <button
+                      type="button"
+                      data-testid="expand-right-inspector-btn"
+                      onClick={() => setInspectorCollapsed(false)}
+                      className="relative z-20 self-start ml-auto bg-[#1a1a1a]/95 hover:bg-[#262626] border-2 border-[#fbbf24] text-[#fbbf24] px-2.5 py-1.5 rounded-[2px] font-display font-extrabold text-[10px] uppercase pointer-events-auto cursor-pointer shadow-lg flex items-center gap-1.5"
+                      title="Expand Rig Keybind Inspector, ECU & Skins Panel"
+                    >
+                      <span>◀ INSPECTOR &amp; SKINS ({hud.moduleCount})</span>
+                    </button>
+                  )}
+                {!hud.isObjectStudioMode &&
+                  getWidgetState(hudCustom, 'build-right-inspector').visible &&
+                  (selectedCount > 0 || !inspectorCollapsed) && (
                     <div
                       data-testid="module-config-panel"
                       data-hud-widget="build-right-inspector"
@@ -10832,7 +12509,7 @@ export default function App() {
                       data-ui-scroll="true"
                       style={getWidgetTransformStyle(hudCustom, 'build-right-inspector', undefined, 'top right')}
                       onWheel={(e) => e.stopPropagation()}
-                      className={`relative z-20 w-[290px] sm:w-[320px] max-h-full min-h-0 overflow-y-auto bg-[#1a1a1a] border-2 ${
+                      className={`relative z-20 w-[290px] sm:w-[310px] max-h-full min-h-0 overflow-y-auto bg-[#1a1a1a] border-2 ${
                         selectedCount > 0
                           ? 'border-[#facc15]'
                           : 'border-[#444444]'
@@ -10927,7 +12604,7 @@ export default function App() {
                               </div>
                             )}
 
-                          {/* Action Buttons: Delete, Duplicate, Select All Same, Copy to Brush */}
+                          {/* Action Buttons: Delete, Duplicate, Copy Stamp, Select All Same, Copy to Brush */}
                           <div className="grid grid-cols-2 gap-1.5 pt-0.5">
                             <button
                               type="button"
@@ -10943,7 +12620,15 @@ export default function App() {
                               onClick={() => sim?.duplicateSelectedObject()}
                               className="px-2 py-1 bg-[#fbbf24] hover:bg-[#facc15] text-[#1a1a1a] border-2 border-[#444444] font-display font-extrabold uppercase text-[10px] rounded-[2px] cursor-pointer flex items-center justify-center gap-1"
                             >
-                              + DUPLICATE{selectedCount > 1 ? ` (${selectedCount})` : ''}
+                              + DUPLICATE [⌃D]
+                            </button>
+                            <button
+                              type="button"
+                              data-testid="selected-copy-stamp-btn"
+                              onClick={() => sim?.copySelectionToStamp()}
+                              className="col-span-2 px-2 py-1 bg-[#22c55e] hover:bg-[#16a34a] text-[#090d16] border-2 border-[#444444] font-display font-extrabold uppercase text-[10px] rounded-[2px] cursor-pointer flex items-center justify-center gap-1"
+                            >
+                              COPY AS STAMP PREFAB ({selectedCount}) [CTRL+C]
                             </button>
                             <button
                               type="button"
@@ -11071,8 +12756,8 @@ export default function App() {
                         </div>
                       ) : (
                         <div className="flex flex-col gap-1 border-b-2 border-[#444444] bg-[#222222] -mx-3 -mt-3 px-3 pt-2.5 pb-2">
-                          <div className="flex items-center justify-between">
-                            <div>
+                          <div className="flex items-center justify-between gap-1">
+                            <div className="min-w-0">
                               <span className="bg-[#fbbf24] text-[#1a1a1a] font-display font-extrabold text-[9px] px-1.5 py-0.5 rounded-[2px] uppercase inline-block mb-0.5">
                                 {activeConfigSlotMeta
                                   ? 'PART TUNING & KEYBINDS'
@@ -11083,21 +12768,32 @@ export default function App() {
                                   'CLICK ANY INSTALLED PART GROUP BELOW'}
                               </div>
                             </div>
-                            {activeConfigSlotMeta && (
+                            <div className="flex items-center gap-1 shrink-0">
+                              {activeConfigSlotMeta && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    if (activeConfigSlotMeta?.defaultConfig) {
+                                      handleUpdateModuleConfig({
+                                        ...activeConfigSlotMeta.defaultConfig,
+                                      });
+                                    }
+                                  }}
+                                  className="px-1.5 py-0.5 bg-[#6b7280] hover:bg-[#4b5563] text-[#e5e5e5] border-2 border-[#444444] rounded-[2px] text-[9px] font-display font-bold uppercase cursor-pointer"
+                                >
+                                  RESET
+                                </button>
+                              )}
                               <button
                                 type="button"
-                                onClick={() => {
-                                  if (activeConfigSlotMeta?.defaultConfig) {
-                                    handleUpdateModuleConfig({
-                                      ...activeConfigSlotMeta.defaultConfig,
-                                    });
-                                  }
-                                }}
-                                className="px-2 py-0.5 bg-[#6b7280] hover:bg-[#4b5563] text-[#e5e5e5] border-2 border-[#444444] rounded-[2px] text-[9px] font-display font-bold uppercase cursor-pointer shrink-0"
+                                data-testid="collapse-right-inspector-btn"
+                                title="Collapse Rig Inspector to maximize 3D viewport"
+                                onClick={() => setInspectorCollapsed(true)}
+                                className="px-1.5 py-0.5 bg-[#262626] hover:bg-[#3a3a3a] text-[#a3a3a3] hover:text-[#e5e5e5] border border-[#444444] rounded-[2px] text-[9px] font-display font-bold uppercase cursor-pointer"
                               >
-                                RESET
+                                HIDE ▶
                               </button>
-                            )}
+                            </div>
                           </div>
                           <div className="text-[9px] font-mono-num text-[#a3a3a3] bg-[#141414] border-2 border-[#444444] rounded-[2px] px-2 py-1">
                             <strong>Right-Click</strong> 1 part, <strong>Shift+Click</strong> to multi-select, <strong>Drag LMB on empty space</strong> to box-select, or click a part group below.
@@ -11350,6 +13046,57 @@ export default function App() {
                                     {preset.label}
                                   </button>
                                 ))}
+                              </div>
+
+                              {/* Toggle Mode (Same Key On/Off) vs Hold Mode */}
+                              <div className="flex items-center justify-between gap-2 pt-1 border-t border-[#2a2a2a]">
+                                <span className="text-[9.5px] text-[#a3a3a3]">
+                                  Activation Mode:
+                                </span>
+                                <div className="flex items-center gap-1">
+                                  {(() => {
+                                    const isToggle =
+                                      activeModuleConfig.toggleMode ??
+                                      activeConfigSlotMeta.defaultConfig?.toggleMode ??
+                                      false;
+                                    return (
+                                      <>
+                                        <button
+                                          type="button"
+                                          data-testid="config-mode-toggle-btn"
+                                          onClick={() =>
+                                            handleUpdateModuleConfig({
+                                              toggleMode: true,
+                                            })
+                                          }
+                                          className={`px-2 py-0.5 rounded-[2px] text-[9px] font-display font-bold uppercase cursor-pointer border-2 ${
+                                            isToggle
+                                              ? 'bg-[#facc15] text-[#1a1a1a] border-[#e5e5e5]'
+                                              : 'bg-[#2a2a2a] text-[#a3a3a3] border-[#444444] hover:text-[#e5e5e5]'
+                                          }`}
+                                        >
+                                          Toggle (Same Key)
+                                        </button>
+                                        <button
+                                          type="button"
+                                          data-testid="config-mode-hold-btn"
+                                          onClick={() =>
+                                            handleUpdateModuleConfig({
+                                              toggleMode: false,
+                                            })
+                                          }
+                                          className={`px-2 py-0.5 rounded-[2px] text-[9px] font-display font-bold uppercase cursor-pointer border-2 ${
+                                            !isToggle
+                                              ? 'bg-[#facc15] text-[#1a1a1a] border-[#e5e5e5]'
+                                              : 'bg-[#2a2a2a] text-[#a3a3a3] border-[#444444] hover:text-[#e5e5e5]'
+                                          }`}
+                                        >
+                                          Hold
+                                        </button>
+                                      </>
+                                    );
+                                  })()}
+                                </div>
                               </div>
                             </div>
                           )}
@@ -12026,70 +13773,198 @@ export default function App() {
                   </div>
                 ) : null}
 
-                {/* THIN BOTTOM BRUSH SELECTION STRIP */}
+                {/* Active Sub-Assembly Stamp Banner (when Copy Stamp [Ctrl+C] or Arm Stamp is active) */}
+                {activeStampPrefab && (
+                  <div
+                    data-testid="active-stamp-banner"
+                    className="bg-[#1a1a1a]/95 border-2 border-[#22c55e] rounded-[2px] px-3 py-1 flex items-center justify-between gap-2 text-[10.5px] font-mono-num"
+                  >
+                    <div className="flex items-center gap-2">
+                      <span className="bg-[#22c55e] text-[#090d16] font-display font-extrabold text-[10px] px-1.5 py-0.5 rounded-[2px] uppercase">
+                        STAMP CLIPBOARD ACTIVE
+                      </span>
+                      <span className="text-[#e5e5e5] font-bold">
+                        {activeStampPrefab.name} ({activeStampPrefab.voxels.length} blocks · {activeStampPrefab.modules.length} parts)
+                      </span>
+                      <span className="text-[#a3a3a3]">
+                        Left-Click on vehicle to stamp sub-assembly
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      data-testid="cancel-stamp-prefab-btn"
+                      onClick={() => setActiveStampPrefab(null)}
+                      className="px-2 py-0.5 bg-[#dc2626] hover:bg-[#b91c1c] text-[#e5e5e5] border border-[#444444] rounded-[2px] font-display font-bold uppercase text-[9.5px] cursor-pointer"
+                    >
+                      CLEAR STAMP [ESC]
+                    </button>
+                  </div>
+                )}
+
+                {/* THIN BOTTOM 1PX SMART BRUSH & VOXEL STAMP DOCK (OPTION A + OPTION B) */}
                 <div
                   data-testid="bottom-brush-strip"
-                  className="bg-[#1a1a1a] border-2 border-[#444444] rounded-[2px] px-3 py-1.5 flex flex-wrap items-center justify-between gap-2"
+                  className="bg-[#1a1a1a] border-2 border-[#444444] rounded-[2px] px-3 py-1.5 flex flex-col gap-1.5"
                 >
-                  <div className="flex flex-wrap items-center gap-1">
-                    <span className="bg-[#fbbf24] text-[#1a1a1a] font-display font-extrabold text-[10px] px-1.5 py-0.5 rounded-[2px] uppercase mr-1">
-                      BRUSH [V]
-                    </span>
-                    {PLACEMENT_MODES.map((pm) => {
-                      const isActive = hud.placementMode === pm.id;
-                      return (
-                        <button
-                          key={pm.id}
-                          type="button"
-                          tabIndex={-1}
-                          data-testid={`place-mode-${pm.id}`}
-                          onClick={(e) => {
-                            e.currentTarget.blur();
-                            sim?.setPlacementMode(pm.id);
-                          }}
-                          title={pm.desc}
-                          className={`px-2 py-0.5 rounded-[2px] text-[10px] font-display font-bold uppercase transition cursor-pointer whitespace-nowrap border-2 ${
-                            isActive
-                              ? 'bg-[#facc15] text-[#1a1a1a] border-[#e5e5e5]'
-                              : 'bg-[#262626] text-[#e5e5e5] border-[#444444] hover:border-[#fbbf24]'
-                          }`}
+                  {/* Row 1: Smart Volume Brushes [V] + Option B (1PX FINE / 4PX BLOCK [ ]) + Optional Box/Extrude Depth */}
+                  <div className="flex flex-wrap items-center justify-between gap-1.5">
+                    <div className="flex flex-wrap items-center gap-1">
+                      <span className="bg-[#fbbf24] text-[#1a1a1a] font-display font-extrabold text-[10px] px-1.5 py-0.5 rounded-[2px] uppercase mr-0.5">
+                        BRUSH [V]
+                      </span>
+                      {PLACEMENT_MODES.map((pm) => {
+                        const isActive = hud.placementMode === pm.id;
+                        const isChisel = pm.id === 'CHISEL';
+                        return (
+                          <button
+                            key={pm.id}
+                            type="button"
+                            tabIndex={-1}
+                            data-testid={`place-mode-${pm.id}`}
+                            onClick={(e) => {
+                              e.currentTarget.blur();
+                              sim?.setPlacementMode(pm.id);
+                            }}
+                            title={pm.desc}
+                            className={`px-1.5 py-0.5 rounded-[2px] text-[9.5px] font-display font-bold uppercase transition cursor-pointer whitespace-nowrap border-2 ${
+                              isActive
+                                ? isChisel
+                                  ? 'bg-[#ef4444] text-[#ffffff] border-[#e5e5e5]'
+                                  : 'bg-[#facc15] text-[#1a1a1a] border-[#e5e5e5]'
+                                : isChisel
+                                  ? 'bg-[#262626] text-[#f87171] border-[#444444] hover:border-[#ef4444]'
+                                  : 'bg-[#262626] text-[#e5e5e5] border-[#444444] hover:border-[#fbbf24]'
+                            }`}
+                          >
+                            {pm.shortLabel}
+                          </button>
+                        );
+                      })}
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-1.5" data-testid="hull-stamp-mode-bar">
+                      <span className="bg-[#38bdf8] text-[#1a1a1a] font-display font-extrabold text-[10px] px-1.5 py-0.5 rounded-[2px] uppercase">
+                        VOXEL [ ]
+                      </span>
+                      {HULL_STAMP_MODES.map((mode) => {
+                        const isActive =
+                          mode.px === 1 ? hud.hullScalePx === 1 : hud.hullScalePx >= 4;
+                        return (
+                          <button
+                            key={mode.px}
+                            type="button"
+                            tabIndex={-1}
+                            data-testid={`hull-scale-${mode.px}`}
+                            onClick={(e) => {
+                              e.currentTarget.blur();
+                              sim?.setHullScalePx(mode.px);
+                            }}
+                            title={mode.desc}
+                            className={`px-2 py-0.5 rounded-[2px] text-[10px] font-mono-num font-bold transition cursor-pointer whitespace-nowrap border-2 ${
+                              isActive
+                                ? 'bg-[#38bdf8] text-[#1a1a1a] border-[#e5e5e5]'
+                                : 'bg-[#262626] text-[#e5e5e5] border-[#444444] hover:border-[#38bdf8]'
+                            }`}
+                          >
+                            {mode.shortLabel}
+                          </button>
+                        );
+                      })}
+
+                      {(hud.placementMode === 'BOX_FILL' ||
+                        hud.placementMode === 'FACE_EXTRUDE') && (
+                        <div
+                          className="flex items-center gap-1 ml-1 pl-1.5 border-l border-[#444444]"
+                          data-testid="box-depth-bar"
                         >
-                          {pm.label}
-                        </button>
-                      );
-                    })}
+                          <span className="text-[9.5px] font-display font-extrabold text-[#fbbf24] uppercase">
+                            DEPTH:
+                          </span>
+                          <button
+                            type="button"
+                            tabIndex={-1}
+                            data-testid="box-depth-dec"
+                            title="Decrease Slab/Extrude Depth [Alt + []"
+                            onClick={(e) => {
+                              e.currentTarget.blur();
+                              sim?.stepBoxDepthPx(-1);
+                            }}
+                            className="px-1.5 py-0.5 rounded-[2px] text-[10px] font-mono-num font-bold bg-[#262626] text-[#e5e5e5] border-2 border-[#444444] hover:border-[#fbbf24] cursor-pointer"
+                          >
+                            −
+                          </button>
+                          <span
+                            data-testid="box-depth-value"
+                            className="px-1.5 py-0.5 rounded-[2px] text-[10px] font-mono-num font-bold bg-[#262626] text-[#fbbf24] border border-[#444444]"
+                          >
+                            {hud.boxDepthPx}px
+                          </span>
+                          <button
+                            type="button"
+                            tabIndex={-1}
+                            data-testid="box-depth-inc"
+                            title="Increase Slab/Extrude Depth [Alt + ]]"
+                            onClick={(e) => {
+                              e.currentTarget.blur();
+                              sim?.stepBoxDepthPx(1);
+                            }}
+                            className="px-1.5 py-0.5 rounded-[2px] text-[10px] font-mono-num font-bold bg-[#262626] text-[#e5e5e5] border-2 border-[#444444] hover:border-[#fbbf24] cursor-pointer"
+                          >
+                            +
+                          </button>
+                        </div>
+                      )}
+                    </div>
                   </div>
 
-                  <div className="flex items-center gap-2 text-[10px] font-mono-num text-[#a3a3a3]">
-                    <span>
-                      PART:{' '}
-                      <strong style={{ color: selectedBuildSlotItem.color }}>
-                        {selectedBuildSlotItem.name}
-                      </strong>
-                    </span>
-                    {!hud.isObjectStudioMode && (
-                      <button
-                        type="button"
-                        data-testid="export-as-prop-btn"
-                        onClick={() => {
-                          sim?.saveCurrentBuildAsProp(hud.presetName, false);
-                        }}
-                        className="px-2 py-0.5 bg-[#262626] hover:bg-[#333333] text-[#fbbf24] border border-[#444444] font-display font-bold uppercase text-[9.5px] rounded-[2px] cursor-pointer whitespace-nowrap"
-                        title="Save current vehicle chassis as a placeable physics prop"
-                      >
-                        SAVE AS PROP
-                      </button>
-                    )}
-                    <span>·</span>
-                    <span>
-                      AIM:{' '}
-                      <strong className="text-[#facc15]">
-                        {hud.rayTarget}
-                      </strong>
-                    </span>
-                    <span className="hidden md:inline text-[#a3a3a3]">
-                      · Drag Empty Space = Box Select · Shift+Click = Select Same / Multi
-                    </span>
+                  {/* Row 2: Active Part + Live Ghost Dimensions/Mass Badge + Aim Telemetry */}
+                  <div className="flex flex-wrap items-center justify-between gap-2 text-[10px] font-mono-num text-[#a3a3a3] border-t border-[#333333] pt-1">
+                    <div className="flex items-center gap-2">
+                      <span>
+                        PART:{' '}
+                        <strong style={{ color: selectedBuildSlotItem.color }}>
+                          {selectedBuildSlotItem.name}
+                        </strong>
+                      </span>
+                      {hud.ghostSummary && (
+                        <span
+                          data-testid="ghost-dimensions-badge"
+                          className={`px-1.5 py-0.2 rounded-[2px] border font-bold ${
+                            hud.placementMode === 'CHISEL' || hud.ghostSummary.massDeltaKg < 0
+                              ? 'bg-[#2a1215] border-[#ef4444] text-[#f87171]'
+                              : 'bg-[#14222e] border-[#38bdf8] text-[#38bdf8]'
+                          }`}
+                        >
+                          GHOST: {hud.ghostSummary.dimsLabel} · {hud.ghostSummary.count} blk (
+                          {hud.ghostSummary.massDeltaKg >= 0 ? '+' : ''}
+                          {hud.ghostSummary.massDeltaKg}kg)
+                        </span>
+                      )}
+                      {!hud.isObjectStudioMode && (
+                        <button
+                          type="button"
+                          data-testid="export-as-prop-btn"
+                          onClick={() => {
+                            sim?.saveCurrentBuildAsProp(hud.presetName, false);
+                          }}
+                          className="px-2 py-0.5 bg-[#262626] hover:bg-[#333333] text-[#fbbf24] border border-[#444444] font-display font-bold uppercase text-[9.5px] rounded-[2px] cursor-pointer whitespace-nowrap"
+                          title="Save current vehicle chassis as a placeable physics prop"
+                        >
+                          SAVE AS PROP
+                        </button>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span>
+                        AIM:{' '}
+                        <strong className="text-[#facc15]">
+                          <LiveHudField select={selectRayTarget} />
+                        </strong>
+                      </span>
+                      <span className="hidden lg:inline text-[#a3a3a3]">
+                        · [Alt+Click] Pick · [X] X-Ray · [Tab] Hide Catalog
+                      </span>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -12135,7 +14010,7 @@ export default function App() {
                     data-testid="fps-counter"
                     className="text-[11px] font-mono-num font-bold text-[#facc15] bg-[#141414] border-2 border-[#444444] px-2 py-0.5 rounded-[2px] whitespace-nowrap min-w-[110px] text-center inline-block tabular-nums"
                   >
-                    {hud.fps} FPS · {hud.frameMs}ms
+                    <LiveHudField select={selectFpsFrameMs} />
                   </span>
 
                   {/* Collapsible Studio & World Tools Dropdown */}
@@ -12585,6 +14460,85 @@ export default function App() {
                         ? 'DRIVE [E]'
                         : 'SEAT BROKEN [E]'}
                   </button>
+
+                  {/* Optical Spyglass Zoom Toggle Button [Z] (Full LOD0 Focus) */}
+                  {!hud.isBuildMode && (
+                    <button
+                      type="button"
+                      tabIndex={-1}
+                      data-testid="toggle-zoom-btn"
+                      onClick={(e) => {
+                        e.currentTarget.blur();
+                        simRef.current?.toggleZoom();
+                      }}
+                      title="Toggle Optical Spyglass Zoom (Streams Full LOD0 at Target) [Z] — Scroll Wheel for 2× / 4× / 8×"
+                      className={`px-2 py-0.5 rounded-[2px] text-[10.5px] font-mono-num font-bold uppercase cursor-pointer whitespace-nowrap border-2 transition ${
+                        hud.isZoomed
+                          ? 'bg-[#38bdf8] text-[#111827] border-[#e5e5e5]'
+                          : 'bg-[#262626] hover:bg-[#333333] text-[#e5e5e5] border-[#444444]'
+                      }`}
+                    >
+                      {hud.isZoomed
+                        ? `ZOOM ${hud.zoomMagnification}× [Z]`
+                        : 'ZOOM [Z]'}
+                    </button>
+                  )}
+
+                  {hud.isZoomed && !hud.isBuildMode && (
+                    <div
+                      data-testid="optical-zoom-hud-badge"
+                      className="flex items-center gap-1 px-1.5 py-0.5 rounded-[2px] bg-[#0c1928]/95 border-2 border-[#38bdf8] text-[10px] font-mono-num font-bold text-[#e0f2fe] whitespace-nowrap"
+                    >
+                      <button
+                        type="button"
+                        tabIndex={-1}
+                        data-testid="zoom-step-out-btn"
+                        title="Decrease Zoom Magnification (÷2)"
+                        onClick={(e) => {
+                          e.currentTarget.blur();
+                          simRef.current?.stepZoomMagnification(-1);
+                        }}
+                        className="px-1 py-0 rounded-[1px] text-[10px] font-mono-num font-bold bg-[#1e293b] text-[#7dd3fc] hover:text-white cursor-pointer"
+                      >
+                        −
+                      </button>
+                      {([2, 4, 8, 32, 128] as const).map((mag) => (
+                        <button
+                          key={mag}
+                          type="button"
+                          tabIndex={-1}
+                          data-testid={`zoom-mag-${mag}x-btn`}
+                          onClick={(e) => {
+                            e.currentTarget.blur();
+                            simRef.current?.setZoomMagnification(mag);
+                          }}
+                          className={`px-1 py-0 rounded-[1px] text-[9.5px] font-mono-num font-bold cursor-pointer ${
+                            hud.zoomMagnification === mag
+                              ? 'bg-[#38bdf8] text-[#0c1928]'
+                              : 'bg-transparent text-[#7dd3fc] hover:text-white'
+                          }`}
+                        >
+                          {mag}×
+                        </button>
+                      ))}
+                      <button
+                        type="button"
+                        tabIndex={-1}
+                        data-testid="zoom-step-in-btn"
+                        title="Increase Zoom Magnification (×2 — Unlimited!)"
+                        onClick={(e) => {
+                          e.currentTarget.blur();
+                          simRef.current?.stepZoomMagnification(1);
+                        }}
+                        className="px-1 py-0 rounded-[1px] text-[10px] font-mono-num font-bold bg-[#1e293b] text-[#7dd3fc] hover:text-white cursor-pointer"
+                      >
+                        +
+                      </button>
+                      <span className="text-[#38bdf8] mx-0.5">•</span>
+                      <span>{hud.zoomFocusDistMeters}M</span>
+                      <span className="text-[#34d399] ml-0.5">FULL LOD0</span>
+                    </div>
+                  )}
 
                   {/* Minimal / Full HUD Toggle Button [TAB] */}
                   <button
@@ -13215,9 +15169,9 @@ export default function App() {
                     {/* Top Digital Compass & Tactical Systems Bar */}
                     <div className="bg-[#090d16]/85 border border-[#38bdf8]/60 px-4 py-1 rounded-[2px] flex items-center gap-4 text-[10px] font-mono-num text-[#38bdf8] pointer-events-auto">
                       <span>COCKPIT HUD</span>
-                      <span>PITCH: {hud.pitchDeg}°</span>
-                      <span>ROLL: {hud.rollDeg}°</span>
-                      <span>ALT: {hud.altitudeMeters}</span>
+                      <span>PITCH: <LiveHudField select={selectPitchDeg} />°</span>
+                      <span>ROLL: <LiveHudField select={selectRollDeg} />°</span>
+                      <span>ALT: <LiveHudField select={selectAltitude} /></span>
                       <button
                         type="button"
                         onClick={() => setCockpitHudEnabled(false)}
@@ -13229,102 +15183,19 @@ export default function App() {
 
                     {/* Central Artificial Horizon & Aim Reticle */}
                     <div className="relative w-56 h-56 flex items-center justify-center">
-                      <svg
-                        width="220"
-                        height="220"
-                        viewBox="0 0 220 220"
-                        className="overflow-visible"
-                      >
-                        <circle
-                          cx="110"
-                          cy="110"
-                          r="82"
-                          fill="none"
-                          stroke="#38bdf8"
-                          strokeWidth="1.2"
-                          strokeDasharray="6 4"
-                          opacity="0.55"
-                        />
-                        <g
-                          transform={`translate(110, ${
-                            110 + Math.max(-40, Math.min(40, hud.pitchDeg * 1.1))
-                          }) rotate(${-hud.rollDeg})`}
-                        >
-                          <line
-                            x1="-52"
-                            y1="0"
-                            x2="-16"
-                            y2="0"
-                            stroke="#4ade80"
-                            strokeWidth="2"
-                          />
-                          <line
-                            x1="16"
-                            y1="0"
-                            x2="52"
-                            y2="0"
-                            stroke="#4ade80"
-                            strokeWidth="2"
-                          />
-                          <line
-                            x1="-28"
-                            y1="-18"
-                            x2="-12"
-                            y2="-18"
-                            stroke="#4ade80"
-                            strokeWidth="1.2"
-                            opacity="0.7"
-                          />
-                          <line
-                            x1="12"
-                            y1="-18"
-                            x2="28"
-                            y2="-18"
-                            stroke="#4ade80"
-                            strokeWidth="1.2"
-                            opacity="0.7"
-                          />
-                          <line
-                            x1="-28"
-                            y1="18"
-                            x2="-12"
-                            y2="18"
-                            stroke="#4ade80"
-                            strokeWidth="1.2"
-                            opacity="0.7"
-                          />
-                          <line
-                            x1="12"
-                            y1="18"
-                            x2="28"
-                            y2="18"
-                            stroke="#4ade80"
-                            strokeWidth="1.2"
-                            opacity="0.7"
-                          />
-                        </g>
-                        {/* Center Bore-Sight Crosshair */}
-                        <circle
-                          cx="110"
-                          cy="110"
-                          r="4"
-                          fill="none"
-                          stroke="#facc15"
-                          strokeWidth="1.8"
-                        />
-                      </svg>
+                      <LiveCockpitHorizonSvg />
                     </div>
 
                     {/* Bottom Cockpit Tactical Readout Strip */}
                     <div className="bg-[#090d16]/85 border border-[#38bdf8]/60 px-4 py-1.5 rounded-[2px] flex flex-wrap items-center gap-3 text-[10px] font-mono-num text-[#e5e5e5]">
                       <span className="text-[#facc15] font-bold">
-                        SPD {hud.speedKmh} KM/H
+                        SPD <LiveHudField select={selectSpeedKmh} /> KM/H
                       </span>
                       <span className="text-[#38bdf8]">
-                        RPM {hud.engineRpm}
+                        RPM <LiveHudField select={selectEngineRpm} />
                       </span>
                       <span className="text-[#4ade80]">
-                        HULL {hud.structuralIntegrityPct}%
+                        HULL <LiveHudField select={selectHullPct} />%
                       </span>
                       {sim?.activeVehicle && sim.activeVehicle.magnetCouplerCount > 0 && (
                         <span className="px-1.5 py-0.2 bg-[#1e293b] border border-[#38bdf8] text-[#38bdf8] rounded-[2px]">
@@ -13778,7 +15649,7 @@ export default function App() {
                           <span>
                             TARGET:{' '}
                             <strong className="text-[#facc15]">
-                              {hud.rayTarget}
+                              <LiveHudField select={selectRayTarget} />
                             </strong>
                           </span>
                           <span>
@@ -14200,8 +16071,7 @@ export default function App() {
                         )}
                         className="pointer-events-auto"
                       >
-                        <SpeedometerGauge
-                          speedKmh={hud.speedKmh}
+                        <LiveSpeedometerGauge
                           scale={1}
                         />
                       </div>
@@ -14254,8 +16124,7 @@ export default function App() {
                           ) ?? {}),
                         }}
                       >
-                        <SpeedometerGauge
-                          speedKmh={hud.speedKmh}
+                        <LiveSpeedometerGauge
                           compactMobile={true}
                           scale={1}
                         />
@@ -16171,7 +18040,7 @@ export default function App() {
                   <span>⊞ EDIT HUD</span>
                 </button>
                 <span className="text-[10.5px] font-mono-num text-[#fbbf24] bg-[#222222] px-2 py-0.5 rounded-[2px] border border-[#444444]">
-                  {hud.fps} FPS
+                  <LiveHudField select={selectFpsOnly} />
                 </span>
                 <button
                   type="button"
@@ -17531,70 +19400,205 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* 15. Voxel Draw Distance / Uncapped Chunk LOD */}
-                  <div
-                    data-testid="gfx-card-drawdist"
-                    className="bg-[#222222] border-2 border-[#444444] rounded-[2px] p-2.5 space-y-1.5 sm:col-span-2"
-                  >
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <div>
-                        <div className="text-[11px] font-mono-num font-bold text-[#fbbf24]">
-                          15. Voxel Draw Distance ({graphicsState.voxelDrawDistance} Chunks · {graphicsState.voxelDrawDistance * 32}m Span) &amp; Uncapped Chunk LOD
-                        </div>
-                        <div className="text-[9px] text-[#a3a3a3]">
-                          {hud.lodSummary} · Uncapped mode forces 100% LOD0 full 0.25m micro-voxel detail across all chunks
-                        </div>
-                      </div>
-                      <div className="flex flex-wrap items-center gap-1.5">
-                        <button
-                          type="button"
-                          data-testid="gfx-toggle-fog"
-                          onClick={() =>
-                            sim?.updateGraphicsSettings({
-                              fog: !graphicsState.fog,
-                            })
-                          }
-                          className={`px-2.5 py-1 rounded-[2px] text-[10px] font-mono-num font-bold cursor-pointer border-2 ${
-                            graphicsState.fog
-                              ? 'bg-[#facc15] text-[#1a1a1a] border-[#fbbf24]'
-                              : 'bg-[#6b7280] text-[#e5e5e5] border-[#444444]'
-                          }`}
-                        >
-                          DISTANCE FOG: {graphicsState.fog ? 'ON' : 'OFF'}
-                        </button>
-                        <button
-                          type="button"
-                          data-testid="gfx-toggle-uncapped-lod"
-                          onClick={() =>
-                            sim?.updateGraphicsSettings({
-                              uncappedChunkLod: !graphicsState.uncappedChunkLod,
-                            })
-                          }
-                          className={`px-2.5 py-1 rounded-[2px] text-[10px] font-mono-num font-bold cursor-pointer border-2 ${
-                            graphicsState.uncappedChunkLod
-                              ? 'bg-[#facc15] text-[#1a1a1a] border-[#fbbf24]'
-                              : 'bg-[#6b7280] text-[#e5e5e5] border-[#444444]'
-                          }`}
-                        >
-                          UNCAPPED 100% LOD0: {graphicsState.uncappedChunkLod ? 'ON' : 'OFF'}
-                        </button>
-                      </div>
-                    </div>
-                    <input
-                      type="range"
-                      data-testid="gfx-slider-drawdist"
-                      min={2}
-                      max={16}
-                      step={1}
-                      value={graphicsState.voxelDrawDistance}
-                      onChange={(e) =>
-                        sim?.updateGraphicsSettings({
-                          voxelDrawDistance: Number(e.target.value),
-                        })
+                  {/* 15. Voxel Draw Distance / Dynamic Distant Horizons LOD (up to 10^31 + 1 km) */}
+                  {(() => {
+                    const drawDistBig = getVoxelDrawDistanceBigInt(graphicsState);
+                    const lodPlanPreview = computeDynamicLodPlan({
+                      renderDistanceChunks: drawDistBig,
+                      lodSpacing: graphicsState.lodSpacing,
+                      uncappedChunkLod: graphicsState.uncappedChunkLod,
+                      supportsHorizonTiles: true,
+                    });
+                    const radiusMetersBig = drawDistBig * CHUNK_SIZE_METERS_BIGINT;
+                    const radiusLabel = formatHorizonDistanceBigInt(radiusMetersBig);
+                    const chunksLabel = formatChunksBigInt(drawDistBig);
+                    const commitCustomInput = () => {
+                      const parsed = parseRenderDistanceInputToChunksBigInt(customRenderDistInput);
+                      if (parsed === null) {
+                        setCustomRenderDistInput(drawDistBig.toString());
+                        return;
                       }
-                      className="w-full accent-[#fbbf24] cursor-pointer"
-                    />
-                  </div>
+                      setCustomRenderDistInput(parsed.toString());
+                      sim?.setRenderDistance(parsed);
+                    };
+                    return (
+                      <div
+                        data-testid="gfx-card-drawdist"
+                        className="bg-[#222222] border-2 border-[#444444] rounded-[2px] p-2.5 space-y-2.5 sm:col-span-2"
+                      >
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div>
+                            <div className="text-[11px] font-mono-num font-bold text-[#fbbf24]">
+                              15. Voxel Draw Distance ({chunksLabel} Chunks · {radiusLabel} Radius) &amp; Dynamic Horizon LOD
+                            </div>
+                            <div className="text-[9px] text-[#a3a3a3]">
+                              <LiveHudField select={selectLodSummary} /> · {lodPlanPreview.totalLodLayers} Active LOD Layers · {lodPlanPreview.activeScaleBands} Scale Band{lodPlanPreview.activeScaleBands > 1 ? 's' : ''} (LOD0 Bubble: ~{lodPlanPreview.realChunkRadiusMeters}m)
+                            </div>
+                          </div>
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <button
+                              type="button"
+                              data-testid="gfx-toggle-fog"
+                              onClick={() =>
+                                sim?.updateGraphicsSettings({
+                                  fog: !graphicsState.fog,
+                                })
+                              }
+                              className={`px-2.5 py-1 rounded-[2px] text-[10px] font-mono-num font-bold cursor-pointer border-2 ${
+                                graphicsState.fog
+                                  ? 'bg-[#facc15] text-[#1a1a1a] border-[#fbbf24]'
+                                  : 'bg-[#6b7280] text-[#e5e5e5] border-[#444444]'
+                              }`}
+                            >
+                              DISTANCE FOG: {graphicsState.fog ? 'ON' : 'OFF'}
+                            </button>
+                            <button
+                              type="button"
+                              data-testid="gfx-toggle-planet-curvature"
+                              onClick={() =>
+                                sim?.updateGraphicsSettings({
+                                  planetCurvatureEnabled: !graphicsState.planetCurvatureEnabled,
+                                })
+                              }
+                              className={`px-2.5 py-1 rounded-[2px] text-[10px] font-mono-num font-bold cursor-pointer border-2 ${
+                                graphicsState.planetCurvatureEnabled
+                                  ? 'bg-[#facc15] text-[#1a1a1a] border-[#fbbf24]'
+                                  : 'bg-[#6b7280] text-[#e5e5e5] border-[#444444]'
+                              }`}
+                            >
+                              PLANET CURVATURE: {graphicsState.planetCurvatureEnabled ? 'ON' : 'OFF'}
+                            </button>
+                            <button
+                              type="button"
+                              data-testid="gfx-toggle-uncapped-lod"
+                              onClick={() =>
+                                sim?.updateGraphicsSettings({
+                                  uncappedChunkLod: !graphicsState.uncappedChunkLod,
+                                })
+                              }
+                              className={`px-2.5 py-1 rounded-[2px] text-[10px] font-mono-num font-bold cursor-pointer border-2 ${
+                                graphicsState.uncappedChunkLod
+                                  ? 'bg-[#facc15] text-[#1a1a1a] border-[#fbbf24]'
+                                  : 'bg-[#6b7280] text-[#e5e5e5] border-[#444444]'
+                              }`}
+                            >
+                              MAX LOD0 BUBBLE: {graphicsState.uncappedChunkLod ? 'ON' : 'OFF'}
+                            </button>
+                          </div>
+                        </div>
+
+                        {/* Slider (2..64) + Positive-Only BigInt Custom Input (chunks or "... km" up to 10^31 + 1 km) */}
+                        <div className="flex flex-wrap items-center gap-2">
+                          <input
+                            type="range"
+                            data-testid="gfx-slider-drawdist"
+                            min={MIN_RENDER_DISTANCE_CHUNKS}
+                            max={SLIDER_MAX_RENDER_DISTANCE_CHUNKS}
+                            step={1}
+                            value={Math.min(
+                              SLIDER_MAX_RENDER_DISTANCE_CHUNKS,
+                              graphicsState.voxelDrawDistance,
+                            )}
+                            onChange={(e) => {
+                              const nextVal = Number(e.target.value);
+                              setCustomRenderDistInput(String(nextVal));
+                              sim?.setRenderDistance(nextVal);
+                            }}
+                            className="flex-1 min-w-[140px] accent-[#fbbf24] cursor-pointer"
+                          />
+                          <div className="flex items-center gap-1 shrink-0">
+                            <span className="text-[9px] font-mono-num text-[#a3a3a3] uppercase">
+                              Custom (+):
+                            </span>
+                            <input
+                              type="text"
+                              data-testid="gfx-input-drawdist-custom"
+                              aria-label="Custom Render Distance in Chunks or km"
+                              value={customRenderDistInput}
+                              onKeyDown={(e) => {
+                                if (e.key === '-') {
+                                  e.preventDefault();
+                                } else if (e.key === 'Enter') {
+                                  e.preventDefault();
+                                  commitCustomInput();
+                                }
+                              }}
+                              onChange={(e) => {
+                                const clean = e.target.value.replace(/[^0-9a-zA-Z^.+ ]/g, '').slice(0, 42);
+                                setCustomRenderDistInput(clean);
+                              }}
+                              onBlur={commitCustomInput}
+                              placeholder="chunks or ... km (max 10^31 km)"
+                              className="w-44 sm:w-56 px-1.5 py-0.5 text-[11px] font-mono-num font-bold text-[#fbbf24] bg-[#1a1a1a] border-2 border-[#444444] focus:border-[#fbbf24] rounded-[2px] outline-none text-right"
+                            />
+                            <button
+                              type="button"
+                              data-testid="gfx-apply-drawdist-custom"
+                              onClick={commitCustomInput}
+                              className="px-2 py-0.5 text-[10px] font-mono-num font-bold bg-[#1a1a1a] hover:border-[#fbbf24] text-[#e5e5e5] border-2 border-[#444444] rounded-[2px] cursor-pointer"
+                            >
+                              SET
+                            </button>
+                          </div>
+                        </div>
+
+                        {/* Quick Horizon Presets (up to 10^31 + 1 km!) */}
+                        <div className="grid grid-cols-3 sm:grid-cols-6 gap-1">
+                          {[
+                            { c: 8n, id: '8', label: '8 (128m)' },
+                            { c: 64n, id: '64', label: '64 (1 km)' },
+                            { c: 512n, id: '512', label: '512 (8 km)' },
+                            { c: 62500n, id: '62500', label: '62.5k (1,000 km)' },
+                            { c: 62500000000000n, id: '1e12km', label: '10^12 km' },
+                            { c: MAX_RENDER_DISTANCE_CHUNKS_BIGINT, id: '1e31km', label: '10^31 + 1 km' },
+                          ].map((preset) => (
+                            <button
+                              key={preset.id}
+                              type="button"
+                              data-testid={`gfx-drawdist-preset-${preset.id}`}
+                              onClick={() => {
+                                setCustomRenderDistInput(preset.c.toString());
+                                sim?.setRenderDistance(preset.c);
+                              }}
+                              className={`py-1 px-1 rounded-[2px] text-[9px] font-mono-num font-bold transition cursor-pointer border-2 ${
+                                drawDistBig === preset.c
+                                  ? 'bg-[#facc15] text-[#1a1a1a] border-[#fbbf24]'
+                                  : 'bg-[#1a1a1a] text-[#e5e5e5] border-[#444444] hover:border-[#fbbf24]'
+                              }`}
+                            >
+                              {preset.label}
+                            </button>
+                          ))}
+                        </div>
+
+                        {/* Configurable LOD Transition Spacing */}
+                        <div className="pt-1.5 border-t border-[#333333]">
+                          <div className="flex items-center justify-between text-[10px] font-mono-num mb-1">
+                            <span className="text-[#e5e5e5] font-bold">
+                              LOD TRANSITION SPACING: {graphicsState.lodSpacing.toFixed(2)}×
+                            </span>
+                            <span className="text-[#a3a3a3]">
+                              LOD0: ~{lodPlanPreview.realChunkRadiusMeters}m · {lodPlanPreview.rings.length} Outer Mega-Tile Rings (Higher = sharper distant detail)
+                            </span>
+                          </div>
+                          <input
+                            type="range"
+                            data-testid="gfx-slider-lod-spacing"
+                            min={MIN_LOD_SPACING}
+                            max={MAX_LOD_SPACING}
+                            step={0.05}
+                            value={graphicsState.lodSpacing}
+                            onChange={(e) =>
+                              sim?.updateGraphicsSettings({
+                                lodSpacing: Number(e.target.value),
+                              })
+                            }
+                            className="w-full accent-[#fbbf24] cursor-pointer"
+                          />
+                        </div>
+                      </div>
+                    );
+                  })()}
                 </div>
               </div>
             )}
@@ -17725,58 +19729,193 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Chunk Render Distance & 3-Tier LOD Horizon Tuning */}
-                <div
-                  data-testid="pause-render-distance-section"
-                  className="bg-[#222222] border-2 border-[#444444] rounded-[2px] p-3.5"
-                >
-                  <div className="flex items-center justify-between mb-1">
-                    <div>
-                      <span className="text-xs font-mono-num font-bold text-[#fbbf24]">
-                        CHUNK RENDER DISTANCE: {renderDistChunks} CHUNKS ({renderDistChunks * 32}m RADIUS)
-                      </span>
-                      <div className="text-[10px] font-mono-num text-[#a3a3a3]">
-                        Horizon Span: {renderDistChunks * 64}m × {renderDistChunks * 64}m · Dynamic Fog &amp; 3-Tier LOD Scaling [F3]
+                {/* Dynamic Distant Horizons Render Distance & LOD Spacing (up to 10^31 + 1 km) */}
+                {(() => {
+                  const settingsDrawBig = getVoxelDrawDistanceBigInt(graphicsState);
+                  const settingsLodPlan = computeDynamicLodPlan({
+                    renderDistanceChunks: settingsDrawBig,
+                    lodSpacing: graphicsState.lodSpacing,
+                    uncappedChunkLod: graphicsState.uncappedChunkLod,
+                    supportsHorizonTiles: true,
+                  });
+                  const radiusMetersBig = settingsDrawBig * CHUNK_SIZE_METERS_BIGINT;
+                  const diameterMetersBig = radiusMetersBig * 2n;
+                  const radiusStr = formatHorizonDistanceBigInt(radiusMetersBig);
+                  const spanStr = formatHorizonDistanceBigInt(diameterMetersBig);
+                  const chunksStr = formatChunksBigInt(settingsDrawBig);
+                  const commitSettingsCustomDist = () => {
+                    const parsed = parseRenderDistanceInputToChunksBigInt(customRenderDistInput);
+                    if (parsed === null) {
+                      setCustomRenderDistInput(settingsDrawBig.toString());
+                      return;
+                    }
+                    setCustomRenderDistInput(parsed.toString());
+                    sim?.setRenderDistance(parsed);
+                  };
+                  return (
+                    <div
+                      data-testid="pause-render-distance-section"
+                      className="bg-[#222222] border-2 border-[#444444] rounded-[2px] p-3.5 space-y-2.5"
+                    >
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div>
+                          <span className="text-xs font-mono-num font-bold text-[#fbbf24]">
+                            RENDER DISTANCE: {chunksStr} CHUNKS ({radiusStr} RADIUS)
+                          </span>
+                          <div className="text-[10px] font-mono-num text-[#a3a3a3]">
+                            Horizon Span: {spanStr} × {spanStr} · {settingsLodPlan.totalLodLayers} Dynamic LOD Layers · {settingsLodPlan.activeScaleBands} Scale Band{settingsLodPlan.activeScaleBands > 1 ? 's' : ''} [F3]
+                          </div>
+                        </div>
+                        <span className="text-[10px] font-mono-num font-bold text-[#fbbf24] bg-[#1a1a1a] border border-[#444444] px-2 py-0.5 rounded-[2px]">
+                          <LiveHudField select={selectLodSummary} />
+                        </span>
+                      </div>
+
+                      {/* Slider (2..64) + Positive-Only BigInt Custom Input (chunks or "... km" up to 10^31 + 1 km) */}
+                      <div className="flex flex-wrap items-center gap-2">
+                        <input
+                          type="range"
+                          data-testid="render-distance-slider"
+                          min={MIN_RENDER_DISTANCE_CHUNKS}
+                          max={SLIDER_MAX_RENDER_DISTANCE_CHUNKS}
+                          step={1}
+                          value={Math.min(
+                            SLIDER_MAX_RENDER_DISTANCE_CHUNKS,
+                            renderDistChunks,
+                          )}
+                          onChange={(e) => {
+                            const val = Number(e.target.value);
+                            setCustomRenderDistInput(String(val));
+                            sim?.setRenderDistance(val);
+                          }}
+                          className="flex-1 min-w-[140px] accent-[#fbbf24] cursor-pointer"
+                        />
+                        <div className="flex items-center gap-1 shrink-0">
+                          <span className="text-[10px] font-mono-num text-[#a3a3a3]">
+                            Custom (+):
+                          </span>
+                          <input
+                            type="text"
+                            data-testid="render-distance-custom-input"
+                            aria-label="Custom Render Distance Chunks or km"
+                            value={customRenderDistInput}
+                            onKeyDown={(e) => {
+                              if (e.key === '-') {
+                                e.preventDefault();
+                              } else if (e.key === 'Enter') {
+                                e.preventDefault();
+                                commitSettingsCustomDist();
+                              }
+                            }}
+                            onChange={(e) => {
+                              const clean = e.target.value.replace(/[^0-9a-zA-Z^.+ ]/g, '').slice(0, 42);
+                              setCustomRenderDistInput(clean);
+                            }}
+                            onBlur={commitSettingsCustomDist}
+                            placeholder="chunks or ... km (max 10^31 km)"
+                            className="w-44 sm:w-56 px-1.5 py-0.5 text-xs font-mono-num font-bold text-[#fbbf24] bg-[#1a1a1a] border-2 border-[#444444] focus:border-[#fbbf24] rounded-[2px] outline-none text-right"
+                          />
+                          <button
+                            type="button"
+                            data-testid="render-distance-custom-apply"
+                            onClick={commitSettingsCustomDist}
+                            className="px-2 py-0.5 text-[10px] font-mono-num font-bold bg-[#1a1a1a] hover:border-[#fbbf24] text-[#e5e5e5] border-2 border-[#444444] rounded-[2px] cursor-pointer"
+                          >
+                            SET
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-3 sm:grid-cols-6 gap-1.5">
+                        {[
+                          { c: 8n, id: '8', label: '8 (128m)' },
+                          { c: 64n, id: '64', label: '64 (1 km)' },
+                          { c: 512n, id: '512', label: '512 (8 km)' },
+                          { c: 62500n, id: '62500', label: '62.5k (1,000 km)' },
+                          { c: 62500000000000n, id: '1e12km', label: '10^12 km' },
+                          { c: MAX_RENDER_DISTANCE_CHUNKS_BIGINT, id: '1e31km', label: '10^31 + 1 km' },
+                        ].map((preset) => (
+                          <button
+                            key={preset.id}
+                            type="button"
+                            data-testid={`render-dist-preset-${preset.id}`}
+                            onClick={() => {
+                              setCustomRenderDistInput(preset.c.toString());
+                              sim?.setRenderDistance(preset.c);
+                            }}
+                            className={`py-1 px-1 rounded-[2px] text-[9px] font-mono-num font-bold transition cursor-pointer border-2 ${
+                              settingsDrawBig === preset.c
+                                ? 'bg-[#facc15] text-[#1a1a1a] border-[#fbbf24]'
+                                : 'bg-[#1a1a1a] text-[#e5e5e5] border-[#444444] hover:border-[#fbbf24]'
+                            }`}
+                          >
+                            {preset.label}
+                          </button>
+                        ))}
+                      </div>
+
+                      {/* LOD Transition Spacing Slider + Planet Curvature Toggle */}
+                      <div className="pt-2 border-t border-[#333333] space-y-2">
+                        <div>
+                          <div className="flex flex-wrap items-center justify-between gap-1 text-[10px] font-mono-num mb-1">
+                            <span className="font-bold text-[#fbbf24]">
+                              LOD TRANSITION SPACING: {graphicsState.lodSpacing.toFixed(2)}×
+                            </span>
+                            <span className="text-[#a3a3a3]">
+                              Crisp LOD0: ~{settingsLodPlan.realChunkRadiusMeters}m · {settingsLodPlan.rings.length} Horizon Rings
+                            </span>
+                          </div>
+                          <input
+                            type="range"
+                            data-testid="lod-spacing-slider"
+                            min={MIN_LOD_SPACING}
+                            max={MAX_LOD_SPACING}
+                            step={0.05}
+                            value={graphicsState.lodSpacing}
+                            onChange={(e) =>
+                              sim?.updateGraphicsSettings({
+                                lodSpacing: Number(e.target.value),
+                              })
+                            }
+                            className="w-full accent-[#fbbf24] cursor-pointer"
+                          />
+                          <div className="flex justify-between text-[9px] font-mono-num text-[#888888]">
+                            <span>0.5× (Tight / Fast)</span>
+                            <span>1.0× (Balanced)</span>
+                            <span>2.5× (Ultra Detail / High-End PC)</span>
+                          </div>
+                        </div>
+
+                        <div className="flex items-center justify-between gap-2 pt-1.5 border-t border-[#333333]">
+                          <div>
+                            <div className="text-[10px] font-mono-num font-bold text-[#e5e5e5]">
+                              PLANET CURVATURE (HORIZON BEND)
+                            </div>
+                            <div className="text-[9px] font-mono-num text-[#a3a3a3]">
+                              Curves distant continents gently over a 1,600 km planetary horizon
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            data-testid="settings-toggle-planet-curvature"
+                            onClick={() =>
+                              sim?.updateGraphicsSettings({
+                                planetCurvatureEnabled: !graphicsState.planetCurvatureEnabled,
+                              })
+                            }
+                            className={`px-3 py-1 rounded-[2px] text-[10px] font-mono-num font-bold cursor-pointer border-2 shrink-0 ${
+                              graphicsState.planetCurvatureEnabled
+                                ? 'bg-[#facc15] text-[#1a1a1a] border-[#fbbf24]'
+                                : 'bg-[#6b7280] text-[#e5e5e5] border-[#444444]'
+                            }`}
+                          >
+                            {graphicsState.planetCurvatureEnabled ? 'ON' : 'OFF'}
+                          </button>
+                        </div>
                       </div>
                     </div>
-                    <span className="text-[10px] font-mono-num font-bold text-[#fbbf24] bg-[#1a1a1a] border border-[#444444] px-2 py-0.5 rounded-[2px]">
-                      {hud.lodSummary}
-                    </span>
-                  </div>
-                  <input
-                    type="range"
-                    data-testid="render-distance-slider"
-                    min={2}
-                    max={16}
-                    step={1}
-                    value={renderDistChunks}
-                    onChange={(e) => sim?.setRenderDistance(Number(e.target.value))}
-                    className="w-full accent-[#fbbf24] cursor-pointer my-1.5"
-                  />
-                  <div className="grid grid-cols-5 gap-1.5 mt-1">
-                    {[
-                      { c: 2, label: '2 (64m)' },
-                      { c: 3, label: '3 (96m)' },
-                      { c: 4, label: '4 (128m)' },
-                      { c: 6, label: '6 (192m)' },
-                      { c: 8, label: '8 (256m)' },
-                    ].map((preset) => (
-                      <button
-                        key={preset.c}
-                        type="button"
-                        data-testid={`render-dist-preset-${preset.c}`}
-                        onClick={() => sim?.setRenderDistance(preset.c)}
-                        className={`py-1 px-1.5 rounded-[2px] text-[10px] font-mono-num font-bold transition cursor-pointer border-2 ${
-                          renderDistChunks === preset.c
-                            ? 'bg-[#facc15] text-[#1a1a1a] border-[#fbbf24]'
-                            : 'bg-[#1a1a1a] text-[#e5e5e5] border-[#444444] hover:border-[#fbbf24]'
-                        }`}
-                      >
-                        {preset.label}
-                      </button>
-                    ))}
-                  </div>
-                </div>
+                  );
+                })()}
 
                 {/* 3D Internal Resolution Scale & Dynamic Shadows */}
                 <div className="bg-[#222222] border-2 border-[#444444] rounded-[2px] p-3.5">
@@ -18018,7 +20157,7 @@ export default function App() {
                       </div>
                     </div>
                     <span className="text-[10px] font-mono-num font-bold bg-[#1a1a1a] text-[#fbbf24] border border-[#444444] px-2 py-0.5 rounded-[2px] whitespace-nowrap">
-                      SPEED: {Math.round(hud.timeScale * 100)}%
+                      SPEED: <LiveHudField select={selectTimeScalePct} />
                     </span>
                   </div>
 
@@ -19585,13 +21724,17 @@ export default function App() {
             }
           }}
           onTeleportToNode={handleRequestTeleportToNode}
+          onTeleportToCoords={(x, y, z) => {
+            executeImmediateVehicleTeleport(x, y, z);
+            setShowFastTravelMap(false);
+          }}
           onDeleteTeleportNode={handleDeleteTeleportNode}
           onRemoveBeacon={handleDeleteTeleportNode}
         />
       )}
 
       {/* Mobile Touch Controls Overlay (Automatically paused whenever any modal or map is open so touch events never block modal buttons!) */}
-      <MobileTouchControls
+      <LiveMobileTouchControls
         sim={simRef.current}
         isBuildMode={hud.isBuildMode}
         isWorldEditMode={hud.isWorldEditMode}
@@ -19608,8 +21751,6 @@ export default function App() {
           !showMultiplayerModal &&
           !showEcuModal
         }
-        speedKmh={hud.speedKmh}
-        integrityPct={hud.structuralIntegrityPct}
         onOpenGarage={() => {
           setBlueprintNameInput(hud.presetName);
           setGarageFeedback('');
@@ -19635,9 +21776,12 @@ export default function App() {
         hudCustom={hudCustom}
         registerPreviewSlot={(itemKey, el) => {
           if (el) {
-            slotElementsRef.current.set(itemKey, el);
-          } else {
-            slotElementsRef.current.delete(itemKey);
+            let set = slotElementsRef.current.get(itemKey);
+            if (!set) {
+              set = new Set();
+              slotElementsRef.current.set(itemKey, set);
+            }
+            set.add(el);
           }
         }}
         getItemPreviewKey={(item) => previewRenderer.getItemKey(item)}
@@ -19676,14 +21820,16 @@ export default function App() {
         onClose={() => setShowHudEditorModal(false)}
       />
 
-      {/* Step 1: Real-Time Performance Diagnostic Overlay (top-left, 250ms cadence) */}
-      <pre
-        ref={perfOverlayRef}
-        data-testid="perf-profiler-overlay"
-        className="fixed top-2 left-2 z-[9999] pointer-events-none select-none m-0 px-2.5 py-2 rounded bg-black/80 text-emerald-400 border border-white/15 font-mono text-[11px] leading-[1.35] whitespace-pre shadow-lg"
-      >
-        PERF PROFILER — waiting for frames...
-      </pre>
+      {/* Real-Time Performance Diagnostic Overlay (only visible when ?debug=1 is passed) */}
+      {typeof window !== 'undefined' && window.location.search.includes('debug=1') && (
+        <pre
+          ref={perfOverlayRef}
+          data-testid="perf-profiler-overlay"
+          className="fixed top-2 left-2 z-[9999] pointer-events-none select-none m-0 px-2.5 py-2 rounded bg-black/80 text-emerald-400 border border-white/15 font-mono text-[11px] leading-[1.35] whitespace-pre shadow-lg"
+        >
+          PERF PROFILER — waiting for frames...
+        </pre>
+      )}
     </div>
   );
 }

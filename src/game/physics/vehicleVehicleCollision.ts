@@ -22,6 +22,10 @@ import {
   resolvePropVsPropCollision,
   type PropRigidBody,
 } from './propRigidBody.ts';
+import {
+  shouldCullCollisionPointByDirection,
+  unifiedEngineTelemetry,
+} from '../unifiedVoxelEngine.ts';
 
 export interface VehicleCollisionRuntimeTarget
   extends BroadphaseVehicleLike,
@@ -59,6 +63,8 @@ const _voxelCenterWorldB = new THREE.Vector3();
 const _stickyTargetWorld = new THREE.Vector3();
 const _stickyDelta = new THREE.Vector3();
 const _stickyForce = new THREE.Vector3();
+const _invQuatA = new THREE.Quaternion();
+const _dirToDefenderLocalA = new THREE.Vector3();
 
 /**
  * Checks if a world-space impact point is near any wheel on `vehicle` and applies hybrid wheel voxel damage (Step 2.7).
@@ -365,8 +371,45 @@ function runOneWayPointVsVoxelGrid(
     }
   }
 
+  // Compute direction from attacker CoM toward defender CoM in attacker's local frame for 6-bit exposed-face culling
+  _invQuatA.copy(attacker.rigidBody.quaternion).invert();
+  _dirToDefenderLocalA
+    .subVectors(defender.rigidBody.position, attacker.rigidBody.position)
+    .applyQuaternion(_invQuatA);
+  const centerDistSq = _dirToDefenderLocalA.lengthSq();
+  const canUseDirectionalHullCull = centerDistSq > 0.36; // > 0.6m CoM separation
+  if (canUseDirectionalHullCull) {
+    _dirToDefenderLocalA.divideScalar(Math.sqrt(centerDistSq));
+  }
+
   for (let i = 0; i < snapshotPoints.length; i++) {
-    const pt = snapshotPoints[i];
+    const pt = snapshotPoints[i] as {
+      localPos: THREE.Vector3;
+      exposedFaceMask?: number;
+      localOutwardNormal?: { x: number; y: number; z: number };
+    } & (typeof snapshotPoints)[number];
+
+    // Fast 6-bit exposed-face back-face cull: if point sits on the far side of attacker away from defender
+    // and its exposed faces all point away from defender, skip transforming & probing defender's voxel grid
+    if (
+      canUseDirectionalHullCull &&
+      pt.exposedFaceMask !== undefined &&
+      pt.localOutwardNormal !== undefined &&
+      pt.localPos.dot(_dirToDefenderLocalA) < -0.35 &&
+      shouldCullCollisionPointByDirection(
+        pt.exposedFaceMask,
+        pt.localOutwardNormal.x,
+        pt.localOutwardNormal.y,
+        pt.localOutwardNormal.z,
+        _dirToDefenderLocalA.x,
+        _dirToDefenderLocalA.y,
+        _dirToDefenderLocalA.z,
+        -0.5,
+      )
+    ) {
+      unifiedEngineTelemetry.cullSkippedCollisionPoints++;
+      continue;
+    }
 
     // 1a. Transform P.localPos to world space using attacker's position + quaternion
     _relPos.copy(pt.localPos).applyQuaternion(attacker.rigidBody.quaternion);

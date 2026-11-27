@@ -49,6 +49,7 @@ export interface ProgramParameters {
   numHemiLights: number;
   numPointLights: number;
   sizeAttenuation: boolean;
+  logarithmicDepthBuffer?: boolean;
   customProgramCacheKey: string;
 }
 
@@ -142,6 +143,7 @@ function getBuiltinDefines(params: ProgramParameters): string {
     params.emissiveMap ? '#define USE_EMISSIVEMAP' : '',
     params.fog ? '#define USE_FOG' : '',
     params.fog && params.fogExp2 ? '#define FOG_EXP2' : '',
+    params.logarithmicDepthBuffer ? '#define USE_LOGARITHMIC_DEPTH_BUFFER' : '',
   ]
     .filter(Boolean)
     .join('\n');
@@ -179,11 +181,23 @@ export function buildBuiltinShaderChunks(params: ProgramParameters): Record<stri
       ? `vec4 mvPosition = vec4(transformed, 1.0);
   ${instancingPos}
   mvPosition = modelViewMatrix * mvPosition;
+  if (uPlanetCurvatureInv2R > 0.0) {
+    vec3 _relW = mvPosition.xyz * mat3(viewMatrix);
+    float _h2 = _relW.x * _relW.x + _relW.z * _relW.z;
+    float _drop = min(_h2 * uPlanetCurvatureInv2R, 650000.0);
+    mvPosition.xyz -= viewMatrix[1].xyz * _drop;
+  }
   vViewPosition = -mvPosition.xyz;
   gl_Position = projectionMatrix * mvPosition;`
       : `vec4 mvPosition = vec4(transformed, 1.0);
   ${instancingPos}
   mvPosition = modelViewMatrix * mvPosition;
+  if (uPlanetCurvatureInv2R > 0.0) {
+    vec3 _relW = mvPosition.xyz * mat3(viewMatrix);
+    float _h2 = _relW.x * _relW.x + _relW.z * _relW.z;
+    float _drop = min(_h2 * uPlanetCurvatureInv2R, 650000.0);
+    mvPosition.xyz -= viewMatrix[1].xyz * _drop;
+  }
   gl_Position = projectionMatrix * mvPosition;`,
     worldpos_vertex: `vec4 worldPosition = vec4(transformed, 1.0);
   ${instancingWorldPos}
@@ -195,6 +209,30 @@ export function buildBuiltinShaderChunks(params: ProgramParameters): Record<stri
     encodings_fragment: 'gl_FragColor = linearToOutputTexel(gl_FragColor);',
     fog_fragment: fogFrag,
     dithering_fragment: '',
+    logdepthbuf_pars_vertex: params.logarithmicDepthBuffer
+      ? `#ifdef USE_LOGARITHMIC_DEPTH_BUFFER
+  varying float vFragDepth;
+  varying float vIsPerspective;
+#endif`
+      : '',
+    logdepthbuf_vertex: params.logarithmicDepthBuffer
+      ? `#ifdef USE_LOGARITHMIC_DEPTH_BUFFER
+  vFragDepth = 1.0 + gl_Position.w;
+  vIsPerspective = projectionMatrix[2][3] == -1.0 ? 1.0 : 0.0;
+#endif`
+      : '',
+    logdepthbuf_pars_fragment: params.logarithmicDepthBuffer
+      ? `#ifdef USE_LOGARITHMIC_DEPTH_BUFFER
+  uniform float logDepthBufFC;
+  varying float vFragDepth;
+  varying float vIsPerspective;
+#endif`
+      : '',
+    logdepthbuf_fragment: params.logarithmicDepthBuffer
+      ? `#ifdef USE_LOGARITHMIC_DEPTH_BUFFER
+  gl_FragDepth = vIsPerspective == 0.0 ? gl_FragCoord.z : log2(max(1e-6, vFragDepth)) * logDepthBufFC * 0.5;
+#endif`
+      : '',
   };
 }
 
@@ -229,6 +267,7 @@ uniform mat4 modelViewMatrix;
 uniform mat4 projectionMatrix;
 uniform mat4 viewMatrix;
 uniform vec3 cameraPosition;
+uniform float uPlanetCurvatureInv2R;
 attribute vec3 position;
 ${params.map || params.alphaMap ? 'attribute vec2 uv;\nvarying vec2 vUv;' : ''}
 ${params.vertexColors ? 'attribute vec3 color;\nvarying vec3 vColor;' : ''}
@@ -238,10 +277,12 @@ ${params.instancing ? 'attribute mat4 instanceMatrix;' : ''}
 ${params.instancingColor ? 'attribute vec3 instanceColor;\nvarying vec3 vInstanceColor;' : ''}
 ${params.fog ? 'varying float vFogDepth;' : ''}
 #include <common>
+#include <logdepthbuf_pars_vertex>
 
 void main() {
   #include <begin_vertex>
   #include <project_vertex>
+  #include <logdepthbuf_vertex>
   #include <worldpos_vertex>
   ${params.map || params.alphaMap ? 'vUv = uv;' : ''}
   ${params.vertexColors ? 'vColor = color;' : ''}
@@ -269,8 +310,10 @@ ${params.alphaTest > 0 ? 'uniform float alphaTest;' : ''}
 ${toneGLSL}
 ${outGLSL}
 #include <common>
+#include <logdepthbuf_pars_fragment>
 
 void main() {
+  #include <logdepthbuf_fragment>
   vec4 diffuseColor = vec4(diffuse, opacity);
   ${params.map ? 'diffuseColor *= texture2D(map, vUv);' : ''}
   ${params.alphaMap ? 'diffuseColor.a *= texture2D(alphaMap, vUv).g;' : ''}
@@ -298,16 +341,19 @@ uniform mat4 modelViewMatrix;
 uniform mat4 projectionMatrix;
 uniform mat4 viewMatrix;
 uniform vec3 cameraPosition;
+uniform float uPlanetCurvatureInv2R;
 uniform float size;
 uniform float scale;
 attribute vec3 position;
 ${params.vertexColors ? 'attribute vec3 color;\nvarying vec3 vColor;' : ''}
 ${params.fog ? 'varying float vFogDepth;' : ''}
 #include <common>
+#include <logdepthbuf_pars_vertex>
 
 void main() {
   #include <begin_vertex>
   #include <project_vertex>
+  #include <logdepthbuf_vertex>
   #include <worldpos_vertex>
   gl_PointSize = size${params.sizeAttenuation ? ' * (scale / max(-mvPosition.z, 0.001))' : ''};
   ${params.vertexColors ? 'vColor = color;' : ''}
@@ -331,8 +377,10 @@ ${params.alphaTest > 0 ? 'uniform float alphaTest;' : ''}
 ${toneGLSL}
 ${outGLSL}
 #include <common>
+#include <logdepthbuf_pars_fragment>
 
 void main() {
+  #include <logdepthbuf_fragment>
   vec4 diffuseColor = vec4(diffuse, opacity);
   ${params.map ? 'diffuseColor *= texture2D(map, gl_PointCoord);' : ''}
   ${params.alphaMap ? 'diffuseColor.a *= texture2D(alphaMap, gl_PointCoord).g;' : ''}
@@ -363,6 +411,7 @@ uniform mat4 projectionMatrix;
 uniform mat4 viewMatrix;
 uniform mat3 normalMatrix;
 uniform vec3 cameraPosition;
+uniform float uPlanetCurvatureInv2R;
 attribute vec3 position;
 attribute vec3 normal;
 ${params.map || params.alphaMap || params.emissiveMap ? 'attribute vec2 uv;\nvarying vec2 vUv;' : ''}
@@ -375,12 +424,14 @@ varying vec3 vViewNormal;
 varying vec3 vViewPosition;
 ${params.fog ? 'varying float vFogDepth;' : ''}
 #include <common>
+#include <logdepthbuf_pars_vertex>
 
 void main() {
   #include <beginnormal_vertex>
   #include <defaultnormal_vertex>
   #include <begin_vertex>
   #include <project_vertex>
+  #include <logdepthbuf_vertex>
   #include <worldpos_vertex>
   ${params.map || params.alphaMap || params.emissiveMap ? 'vUv = uv;' : ''}
   ${params.vertexColors ? 'vColor = color;' : ''}
@@ -434,8 +485,10 @@ ${params.alphaTest > 0 ? 'uniform float alphaTest;' : ''}
 ${toneGLSL}
 ${outGLSL}
 #include <common>
+#include <logdepthbuf_pars_fragment>
 
 void main() {
+  #include <logdepthbuf_fragment>
   vec4 diffuseColor = vec4(diffuse, opacity);
   ${params.map ? 'diffuseColor *= texture2D(map, vUv);' : ''}
   ${params.alphaMap ? 'diffuseColor.a *= texture2D(alphaMap, vUv).g;' : ''}
@@ -533,6 +586,7 @@ export function buildCustomShaderSources(params: ProgramParameters): { vertex: s
     params.flatShading ? '#define FLAT_SHADED' : '',
     params.fog ? '#define USE_FOG' : '',
     params.fog && params.fogExp2 ? '#define FOG_EXP2' : '',
+    params.logarithmicDepthBuffer ? '#define USE_LOGARITHMIC_DEPTH_BUFFER' : '',
   ].filter(Boolean);
 
   const vertexPrefix = [
@@ -548,6 +602,7 @@ export function buildCustomShaderSources(params: ProgramParameters): { vertex: s
     'uniform mat4 viewMatrix;',
     'uniform mat3 normalMatrix;',
     'uniform vec3 cameraPosition;',
+    'uniform float uPlanetCurvatureInv2R;',
     params.vertexSpawnPop ? 'uniform float uCurrentTime;' : '',
     params.instancing ? `${attrKeyword} mat4 instanceMatrix;` : '',
     params.instancingColor ? `${attrKeyword} vec3 instanceColor;` : '',
@@ -575,10 +630,45 @@ export function buildCustomShaderSources(params: ProgramParameters): { vertex: s
     .filter(Boolean)
     .join('\n');
 
+  const chunks = buildBuiltinShaderChunks(params);
   return {
-    vertex: `${vertexPrefix}\n${params.vertexShader}`,
-    fragment: `${fragmentPrefix}\n${params.fragmentShader}`,
+    vertex: resolveShaderIncludes(`${vertexPrefix}\n${params.vertexShader}`, chunks),
+    fragment: resolveShaderIncludes(`${fragmentPrefix}\n${params.fragmentShader}`, chunks),
   };
+}
+
+/**
+ * Upgrades a GLSL ES 1.00 shader pair to GLSL ES 3.00 (`#version 300 es`) so WebGL2
+ * shaders can write native `gl_FragDepth` for logarithmic depth buffer precision.
+ */
+function upgradeShaderPairToGLSL3(
+  vertexSource: string,
+  fragmentSource: string,
+): { vertex: string; fragment: string } {
+  const vTrim = vertexSource.trimStart();
+  const fTrim = fragmentSource.trimStart();
+  if (vTrim.startsWith('#version') || fTrim.startsWith('#version')) {
+    return { vertex: vertexSource, fragment: fragmentSource };
+  }
+
+  const vertex =
+    '#version 300 es\n' +
+    vTrim
+      .replace(/\battribute\s+/g, 'in ')
+      .replace(/\bvarying\s+/g, 'out ')
+      .replace(/\btexture2D\s*\(/g, 'texture(');
+
+  const fragment =
+    '#version 300 es\n' +
+    'precision highp float;\n' +
+    'precision highp int;\n' +
+    'out vec4 _engineFragColor;\n' +
+    '#define gl_FragColor _engineFragColor\n' +
+    fTrim
+      .replace(/\bvarying\s+/g, 'in ')
+      .replace(/\btexture2D\s*\(/g, 'texture(');
+
+  return { vertex, fragment };
 }
 
 export class WebGLProgram {
@@ -602,12 +692,16 @@ export class WebGLProgram {
     this.name = parameters.shaderName;
     this.cacheKey = cacheKey;
 
-    const sources =
+    let sources =
       parameters.compiledVertexShader !== undefined && parameters.compiledFragmentShader !== undefined
         ? { vertex: parameters.compiledVertexShader, fragment: parameters.compiledFragmentShader }
         : parameters.shaderID === 'custom'
           ? buildCustomShaderSources(parameters)
           : buildBuiltinShaders(parameters);
+
+    if (parameters.logarithmicDepthBuffer && sources.fragment.includes('gl_FragDepth')) {
+      sources = upgradeShaderPairToGLSL3(sources.vertex, sources.fragment);
+    }
 
     const glVertexShader = createWebGLShader(gl, gl.VERTEX_SHADER, sources.vertex);
     const glFragmentShader = createWebGLShader(gl, gl.FRAGMENT_SHADER, sources.fragment);

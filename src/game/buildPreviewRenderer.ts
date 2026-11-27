@@ -126,30 +126,42 @@ export class BuildPreviewRenderer {
     }
   }
 
+  public registerSlotItems(slots: BuildSlotItem[]): void {
+    for (const slot of slots) {
+      const key = this.getItemKey(slot);
+      this.slotItemLookup.set(key, slot);
+    }
+  }
+
   /**
    * Retrieves or builds the 3D stylized low-poly model for a given item key,
    * centered strictly at (0, 0, 0) with its Box3 bounding sphere radius computed
    * so the camera auto-fits every part to ~75% of the preview slot.
    */
   public getOrCreatePreviewMesh(key: string, item?: BuildSlotItem): THREE.Group {
+    if (item) {
+      this.slotItemLookup.set(key, item);
+    }
     let group = this.itemMeshes.get(key);
     if (group) return group;
 
     let slotItem = item || this.slotItemLookup.get(key);
     if (!slotItem && key.startsWith('vox_')) {
       const parsedMat = parseInt(key.slice(4), 10);
-      if (!isNaN(parsedMat) && MAT_INFO[parsedMat]) {
+      const info = !isNaN(parsedMat) ? MAT_INFO[parsedMat] : undefined;
+      if (!isNaN(parsedMat)) {
+        const hexColor = info ? info.color : 0x38bdf8;
         slotItem = {
           slot: 0,
           key: '',
           type: 'voxel',
-          name: MAT_INFO[parsedMat].name,
+          name: info ? info.name : `Voxel #${parsedMat}`,
           tag: 'VOXEL',
           category: 'CHASSIS',
           mat: parsedMat,
-          massKg: MAT_INFO[parsedMat].mass,
+          massKg: info ? info.mass : 10,
           powerCores: 0,
-          color: `#${MAT_INFO[parsedMat].color.toString(16).padStart(6, '0')}`,
+          color: `#${hexColor.toString(16).padStart(6, '0')}`,
         };
       }
     } else if (!slotItem && key.startsWith('mod_')) {
@@ -172,7 +184,13 @@ export class BuildPreviewRenderer {
 
     if (slotItem?.type === 'voxel' && slotItem.mat !== undefined) {
       // 3D Beveled Voxel Cube Preview with Edge Accents
-      const matSpec = MAT_INFO[slotItem.mat] || { color: 0x38bdf8, emissive: false };
+      const fallbackHex = slotItem.color
+        ? parseInt(slotItem.color.replace('#', ''), 16) || 0x38bdf8
+        : 0x38bdf8;
+      const matSpec = MAT_INFO[slotItem.mat] || {
+        color: fallbackHex,
+        emissive: false,
+      };
       const boxGeo = new THREE.BoxGeometry(0.84, 0.84, 0.84);
       const boxMat = matSpec.emissive
         ? getEmissiveNeonMat(matSpec.color, 2.0)
@@ -209,6 +227,19 @@ export class BuildPreviewRenderer {
       };
 
       const detailedMesh = createDetailedModuleMesh(mockMod, false);
+      if (slotItem.kind === 'PARACHUTE_AIRBRAKE' && mockMod.spinMesh) {
+        mockMod.spinMesh.scale.set(0.85, 0.72, 0.85);
+        mockMod.spinMesh.updateMatrix();
+      } else if (slotItem.kind === 'PISTON' && mockMod.spinMesh) {
+        mockMod.spinMesh.position.y = -0.32;
+        mockMod.spinMesh.updateMatrix();
+      } else if (slotItem.kind === 'OUTRIGGER_JACK' && mockMod.spinMesh) {
+        mockMod.spinMesh.position.y = -0.25;
+        mockMod.spinMesh.updateMatrix();
+      }
+      detailedMesh.traverse((child) => {
+        child.frustumCulled = false;
+      });
       detailedMesh.updateMatrixWorld(true);
 
       // Compute exact bounding box and center geometry cleanly around (0, 0, 0)
@@ -216,6 +247,7 @@ export class BuildPreviewRenderer {
       const center = new THREE.Vector3();
       bbox.getCenter(center);
       detailedMesh.position.sub(center);
+      detailedMesh.updateMatrix();
       detailedMesh.updateMatrixWorld(true);
 
       const centeredBox = new THREE.Box3().setFromObject(detailedMesh);
@@ -223,7 +255,10 @@ export class BuildPreviewRenderer {
       centeredBox.getBoundingSphere(sphere);
 
       group.add(detailedMesh);
-      group.userData.boundingRadius = Math.max(sphere.radius, 0.25);
+      group.userData.boundingRadius = Math.max(
+        Number.isFinite(sphere.radius) ? sphere.radius : 0.65,
+        0.25,
+      );
     } else {
       // Fallback mechanical block
       const fallbackGeo = new THREE.BoxGeometry(0.84, 0.84, 0.84);
@@ -302,8 +337,10 @@ export class BuildPreviewRenderer {
       let rect: DOMRect;
       if (
         cachedEntry &&
+        cachedEntry.rect.width > 0 &&
+        cachedEntry.rect.height > 0 &&
         nowMs > 0 &&
-        nowMs - cachedEntry.ts < 120 &&
+        nowMs - cachedEntry.ts < 32 &&
         cachedEntry.scrollTop === curScrollTop &&
         cachedEntry.scrollLeft === curScrollLeft &&
         cachedEntry.canvasW === canvasRect.width &&
@@ -312,7 +349,7 @@ export class BuildPreviewRenderer {
         rect = cachedEntry.rect;
       } else {
         rect = el.getBoundingClientRect();
-        if (nowMs > 0) {
+        if (nowMs > 0 && rect.width > 0 && rect.height > 0) {
           if (!cachedEntry) {
             cachedEntry = {
               rect,

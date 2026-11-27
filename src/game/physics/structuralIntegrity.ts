@@ -86,6 +86,10 @@ export interface StructuralVehicleTarget {
     health?: number;
   }>;
   coreVoxelKeys?: Set<number>;
+  microHull?: {
+    size: number;
+    getOccupiedCoarseCoords: () => Array<[number, number, number]>;
+  };
   fallingOffVoxels?: Map<number, FallingOffVoxelEntry>;
   connectivityCache?: VehicleConnectivityCache | null;
   rigidBody: CustomRigidBody;
@@ -169,12 +173,31 @@ export function invalidateConnectivityCache(
 function isCoreModuleKind(kind: string): boolean {
   return (
     isSeatModuleKind(kind as any) ||
+    kind === 'V8_ENGINE' ||
     kind === 'ENGINE_V8' ||
+    kind === 'ENGINE_BULLDAWG' ||
+    kind === 'ENGINE_DRAGON' ||
+    kind === 'ENGINE_RAW' ||
     kind === 'ENGINE_DIESEL' ||
     kind === 'ENGINE_ELECTRIC' ||
     kind === 'ENGINE_TURBO' ||
-    kind === 'GYRO'
+    kind === 'GYRO' ||
+    kind === 'GYRO_REACTION' ||
+    kind === 'MICROBIT_ECU'
   );
+}
+
+function addBidirectionalConnectivityEdge(
+  neighborsByKey: Map<number, number[]>,
+  keyA: number,
+  keyB: number,
+): void {
+  if (keyA === keyB) return;
+  const listA = neighborsByKey.get(keyA);
+  const listB = neighborsByKey.get(keyB);
+  if (!listA || !listB) return;
+  if (!listA.includes(keyB)) listA.push(keyB);
+  if (!listB.includes(keyA)) listB.push(keyA);
 }
 
 /**
@@ -216,6 +239,7 @@ export function ensureConnectivityCache(
   }
 
   // 2. Identify core voxels from explicit coreVoxelKeys + cockpit/seat/engine modules
+  //    AND structurally bridge all voxels attached to any intact module (PISTON, SUSPENSION, HINGE, SERVO, etc.)
   if (vehicle.coreVoxelKeys && vehicle.coreVoxelKeys.size > 0) {
     for (const k of vehicle.coreVoxelKeys) {
       if (cache.neighborsByKey.has(k)) {
@@ -225,18 +249,137 @@ export function ensureConnectivityCache(
   }
 
   if (vehicle.modules && vehicle.modules.length > 0) {
+    const intactModules: Array<{
+      vx: number;
+      vy: number;
+      vz: number;
+      isCore: boolean;
+      attachedKeys: number[];
+    }> = [];
+
     for (let i = 0; i < vehicle.modules.length; i++) {
       const m = vehicle.modules[i];
-      if ((m.health ?? 1.0) <= 0 || !isCoreModuleKind(m.kind)) {
+      if ((m.health ?? 1.0) <= 0) {
         continue;
       }
+      const isCore = isCoreModuleKind(m.kind);
+      const attachedKeys: number[] = [];
       for (let dz = -2; dz <= 2; dz++) {
         for (let dy = -2; dy <= 2; dy++) {
           for (let dx = -2; dx <= 2; dx++) {
             const k = packVoxelKey(m.vx + dx, m.vy + dy, m.vz + dz);
             if (cache.neighborsByKey.has(k)) {
-              cache.coreVoxelKeys.add(k);
+              attachedKeys.push(k);
+              if (isCore) {
+                cache.coreVoxelKeys.add(k);
+              }
             }
+          }
+        }
+      }
+      // Bridge all voxels attached directly to this module
+      if (attachedKeys.length > 1) {
+        const anchorKey = attachedKeys[0];
+        for (let a = 1; a < attachedKeys.length; a++) {
+          addBidirectionalConnectivityEdge(cache.neighborsByKey, anchorKey, attachedKeys[a]);
+        }
+      }
+      intactModules.push({
+        vx: m.vx,
+        vy: m.vy,
+        vz: m.vz,
+        isCore,
+        attachedKeys,
+      });
+    }
+
+    // Also bridge touching module chains (two 3x3x3 modules touch when |dx|<=3, |dy|<=3, |dz|<=3)
+    if (intactModules.length > 1) {
+      const visitedMods = new Uint8Array(intactModules.length);
+      for (let i = 0; i < intactModules.length; i++) {
+        if (visitedMods[i]) continue;
+        visitedMods[i] = 1;
+        const groupIndices = [i];
+        let head = 0;
+        let groupHasCore = intactModules[i].isCore;
+        while (head < groupIndices.length) {
+          const curIdx = groupIndices[head++];
+          const cur = intactModules[curIdx];
+          for (let j = 0; j < intactModules.length; j++) {
+            if (visitedMods[j]) continue;
+            const other = intactModules[j];
+            if (
+              Math.abs(cur.vx - other.vx) <= 3 &&
+              Math.abs(cur.vy - other.vy) <= 3 &&
+              Math.abs(cur.vz - other.vz) <= 3
+            ) {
+              visitedMods[j] = 1;
+              groupIndices.push(j);
+              if (other.isCore) groupHasCore = true;
+            }
+          }
+        }
+        if (groupIndices.length > 1) {
+          let groupAnchorKey = -1;
+          for (const gIdx of groupIndices) {
+            const modEntry = intactModules[gIdx];
+            for (const k of modEntry.attachedKeys) {
+              if (groupHasCore) {
+                cache.coreVoxelKeys.add(k);
+              }
+              if (groupAnchorKey === -1) {
+                groupAnchorKey = k;
+              } else {
+                addBidirectionalConnectivityEdge(cache.neighborsByKey, groupAnchorKey, k);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // 2b. Bridge coarse voxels connected through 1px microHull cells so fine-detail bridges never flag false disconnections
+  if (vehicle.microHull && vehicle.microHull.size > 0) {
+    const coarseCoords = vehicle.microHull.getOccupiedCoarseCoords();
+    if (coarseCoords.length > 0) {
+      const microCellMap = new Map<number, [number, number, number]>();
+      for (let i = 0; i < coarseCoords.length; i++) {
+        const [vx, vy, vz] = coarseCoords[i];
+        microCellMap.set(packVoxelKey(vx, vy, vz), [vx, vy, vz]);
+      }
+      const visitedMicro = new Set<number>();
+      for (const [startKey, startCoord] of microCellMap.entries()) {
+        if (visitedMicro.has(startKey)) continue;
+        visitedMicro.add(startKey);
+        const queue: Array<[number, number, number]> = [startCoord];
+        const adjacentCoarseKeys: number[] = [];
+        let head = 0;
+        while (head < queue.length) {
+          const [cx, cy, cz] = queue[head++];
+          const selfKey = packVoxelKey(cx, cy, cz);
+          if (cache.neighborsByKey.has(selfKey)) {
+            adjacentCoarseKeys.push(selfKey);
+          }
+          for (let d = 0; d < TEN_NEIGHBOR_OFFSETS.length; d++) {
+            const [dx, dy, dz] = TEN_NEIGHBOR_OFFSETS[d];
+            const nx = cx + dx;
+            const ny = cy + dy;
+            const nz = cz + dz;
+            const nk = packVoxelKey(nx, ny, nz);
+            if (cache.neighborsByKey.has(nk)) {
+              adjacentCoarseKeys.push(nk);
+            }
+            if (!visitedMicro.has(nk) && microCellMap.has(nk)) {
+              visitedMicro.add(nk);
+              queue.push([nx, ny, nz]);
+            }
+          }
+        }
+        if (adjacentCoarseKeys.length > 1) {
+          const anchor = adjacentCoarseKeys[0];
+          for (let a = 1; a < adjacentCoarseKeys.length; a++) {
+            addBidirectionalConnectivityEdge(cache.neighborsByKey, anchor, adjacentCoarseKeys[a]);
           }
         }
       }

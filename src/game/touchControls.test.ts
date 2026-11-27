@@ -8,6 +8,7 @@ import {
   computeTouchOrbitCameraState,
   computeRenderDistanceTuning,
   computeTacticalMapRenderRadiusChunks,
+  resolveChunkTargetLod,
   MOBILE_BUILD_QUICK_ACTIONS,
 } from './touchControls.ts';
 import {
@@ -179,8 +180,70 @@ test('computeRenderDistanceTuning scales LOD rings, cameraFar, and fog density w
   assert.equal(low.clampedChunks, 2);
   assert.equal(high.clampedChunks, 8);
   assert.ok(high.lod0MaxMeters > low.lod0MaxMeters);
+  assert.ok(high.lod1MaxMeters > high.lod0MaxMeters);
+  assert.ok(high.lod2MaxMeters > high.lod1MaxMeters);
   assert.ok(high.cameraFar > low.cameraFar);
   assert.ok(high.baseFogDensity < low.baseFogDensity);
+});
+
+test('resolveChunkTargetLod keeps immediate 3x3 ring at LOD0 even in Low-End mode and applies +/-3m hysteresis across 4 tiers', () => {
+  const tuning = computeRenderDistanceTuning(8);
+  // 1. Immediate 3x3 ring (chebDist <= 1) MUST remain LOD0 even in Low-End / Pentium mode
+  assert.equal(
+    resolveChunkTargetLod({
+      chebDist: 1,
+      distMeters: 22.6,
+      prevLod: 2,
+      tuning,
+      isLowEndMode: true,
+      isMapFastLoad: false,
+    }),
+    0,
+  );
+
+  // 2. Low-End / Pentium mode progresses smoothly 0 -> 1 -> 2 -> 3 at wider distances
+  assert.equal(
+    resolveChunkTargetLod({ chebDist: 2, distMeters: 28, prevLod: -1, tuning, isLowEndMode: true, isMapFastLoad: false }),
+    0,
+  );
+  assert.equal(
+    resolveChunkTargetLod({ chebDist: 2, distMeters: 40, prevLod: -1, tuning, isLowEndMode: true, isMapFastLoad: false }),
+    1,
+  );
+  assert.equal(
+    resolveChunkTargetLod({ chebDist: 4, distMeters: 64, prevLod: -1, tuning, isLowEndMode: true, isMapFastLoad: false }),
+    2,
+  );
+  assert.equal(
+    resolveChunkTargetLod({ chebDist: 6, distMeters: 90, prevLod: -1, tuning, isLowEndMode: true, isMapFastLoad: false }),
+    3,
+  );
+
+  // 3. Standard mode hysteresis (+/-3m): crossing just past lod0MaxMeters while already LOD0 stays LOD0;
+  // approaching just below lod0MaxMeters while already LOD1 stays LOD1 until crossing (lod0MaxMeters - 3)
+  const d0 = tuning.lod0MaxMeters;
+  assert.equal(
+    resolveChunkTargetLod({ chebDist: 5, distMeters: d0 + 2.0, prevLod: 0, tuning, isLowEndMode: false, isMapFastLoad: false }),
+    0,
+  );
+  assert.equal(
+    resolveChunkTargetLod({ chebDist: 5, distMeters: d0 + 3.5, prevLod: 0, tuning, isLowEndMode: false, isMapFastLoad: false }),
+    1,
+  );
+  assert.equal(
+    resolveChunkTargetLod({ chebDist: 5, distMeters: d0 - 2.0, prevLod: 1, tuning, isLowEndMode: false, isMapFastLoad: false }),
+    1,
+  );
+  assert.equal(
+    resolveChunkTargetLod({ chebDist: 5, distMeters: d0 - 3.5, prevLod: 1, tuning, isLowEndMode: false, isMapFastLoad: false }),
+    0,
+  );
+
+  // 4. Distant horizon hits LOD3 beyond lod2MaxMeters
+  assert.equal(
+    resolveChunkTargetLod({ chebDist: 10, distMeters: tuning.lod2MaxMeters + 10, prevLod: 2, tuning, isLowEndMode: false, isMapFastLoad: false }),
+    3,
+  );
 });
 
 test('computeTacticalMapRenderRadiusChunks dynamically increases chunk render radius as map zooms out', () => {

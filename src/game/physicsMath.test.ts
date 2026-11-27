@@ -2508,6 +2508,109 @@ test('Phase 1 Item 5: baked voxel AO (0.70..1.0), ±5% per-voxel color jitter on
   assert.ok(dmgSingle.voxelCenters && Math.abs(dmgSingle.voxelCenters[0] - 0.125) < 1e-5);
 });
 
+test('buildAllLodPayloadsForChunk builds 4-tier LOD3 (2.00m XZ, exact Y), supports lod12Only without re-meshing LOD0, and skips dead transLod1/2', async () => {
+  const { buildAllLodPayloadsForChunk } = await import('./meshWorker.ts');
+  const { CHUNK_X, CHUNK_Y, CHUNK_Z, VOXEL_SIZE } = await import('./constants.ts');
+
+  const vox = new Uint8Array(CHUNK_X * CHUNK_Y * CHUNK_Z);
+  for (let lz = 0; lz < CHUNK_Z; lz++) {
+    for (let lx = 0; lx < CHUNK_X; lx++) {
+      // Stair-step terrain + water pocket so all 4 LOD tiers emit distinct geometry
+      const h = 8 + ((lx >> 2) % 3) + ((lz >> 3) % 2);
+      for (let ly = 1; ly <= h; ly++) {
+        vox[lx + CHUNK_X * (ly + CHUNK_Y * lz)] = ly === h ? MAT.GRASS : MAT.ROCK;
+      }
+      if (lx < 8 && lz < 8) {
+        vox[lx + CHUNK_X * (h + 1 + CHUNK_Y * lz)] = MAT.WATER_VOX;
+      }
+    }
+  }
+
+  const full = buildAllLodPayloadsForChunk({
+    jobId: 301,
+    cx: 0,
+    cz: 0,
+    minY: 1,
+    maxY: 14,
+    originX: 0,
+    originZ: 0,
+    voxels: vox,
+    hasTranslucent: true,
+    transMinY: 8,
+    transMaxY: 14,
+  });
+
+  assert.ok(full.lod0.mergedQuads > 0);
+  assert.ok(full.lod1.mergedQuads > 0);
+  assert.ok(full.lod2.mergedQuads > 0);
+  assert.ok(full.lod3.mergedQuads > 0);
+  assert.ok(full.lod0.mergedQuads >= full.lod1.mergedQuads);
+  assert.ok(full.lod1.mergedQuads >= full.lod2.mergedQuads);
+  assert.ok(full.lod2.mergedQuads >= full.lod3.mergedQuads);
+  // Dead transLod1/transLod2 must remain empty while transLod0 carries full-res water
+  assert.ok(full.transLod0.mergedQuads > 0);
+  assert.equal(full.transLod1.vertCount, 0);
+  assert.equal(full.transLod2.vertCount, 0);
+
+  // Exact Y quantization preserved on LOD3 (every Y coordinate is an exact multiple of 0.25m VOXEL_SIZE)
+  for (let i = 1; i < full.lod3.positions.length; i += 3) {
+    const ySteps = full.lod3.positions[i] / VOXEL_SIZE;
+    assert.ok(Math.abs(ySteps - Math.round(ySteps)) < 1e-4, `LOD3 Y=${full.lod3.positions[i]} not aligned to 0.25m`);
+  }
+
+  // Phase-2 lod12Only job must skip LOD0 & transLod0 and only build LOD1, LOD2, LOD3
+  const phase2 = buildAllLodPayloadsForChunk({
+    jobId: 302,
+    cx: 0,
+    cz: 0,
+    minY: 1,
+    maxY: 14,
+    originX: 0,
+    originZ: 0,
+    voxels: vox,
+    hasTranslucent: true,
+    transMinY: 8,
+    transMaxY: 14,
+    lod12Only: true,
+  });
+
+  assert.equal(phase2.lod12Only, true);
+  assert.equal(phase2.lod0.vertCount, 0);
+  assert.equal(phase2.transLod0.vertCount, 0);
+  assert.equal(phase2.lod1.mergedQuads, full.lod1.mergedQuads);
+  assert.equal(phase2.lod2.mergedQuads, full.lod2.mergedQuads);
+  assert.equal(phase2.lod3.mergedQuads, full.lod3.mergedQuads);
+
+  // Surface-only path also produces LOD3 and respects lod12Only
+  const surfVoxels = new Uint8Array(CHUNK_X * 4 * CHUNK_Z);
+  const surfH = new Uint16Array(CHUNK_X * CHUNK_Z);
+  for (let lz = 0; lz < CHUNK_Z; lz++) {
+    for (let lx = 0; lx < CHUNK_X; lx++) {
+      surfH[lx + (lz << 6)] = 40 + ((lx >> 3) % 2);
+      surfVoxels[lx + CHUNK_X * 4 * lz] = MAT.GRASS;
+    }
+  }
+  const surfRes = buildAllLodPayloadsForChunk({
+    jobId: 303,
+    cx: 0,
+    cz: 0,
+    minY: 38,
+    maxY: 43,
+    originX: 0,
+    originZ: 0,
+    voxels: surfVoxels,
+    isSurfaceOnly: true,
+    surfaceHeightMap: surfH,
+    hasTranslucent: false,
+    lod12Only: true,
+  });
+  assert.equal(surfRes.lod0.vertCount, 0);
+  assert.ok(surfRes.lod1.mergedQuads > 0);
+  assert.ok(surfRes.lod2.mergedQuads > 0);
+  assert.ok(surfRes.lod3.mergedQuads > 0);
+});
+
+
 
 
 
